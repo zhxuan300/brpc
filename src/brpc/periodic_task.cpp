@@ -1,18 +1,20 @@
-// Copyright (c) 2018 brpc authors.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <bthread/bthread.h>
 #include <bthread/unstable.h>
@@ -28,16 +30,18 @@ static void* PeriodicTaskThread(void* arg) {
     timespec abstime;
     if (!task->OnTriggeringTask(&abstime)) { // end
         task->OnDestroyingTask();
-        return NULL;
+        return nullptr;
     }
     PeriodicTaskManager::StartTaskAt(task, abstime);
-    return NULL;
+    return nullptr;
 }
 
 static void RunPeriodicTaskThread(void* arg) {
     bthread_t th = 0;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "PeriodicTaskThread");
     int rc = bthread_start_background(
-        &th, &BTHREAD_ATTR_NORMAL, PeriodicTaskThread, arg);
+        &th, &attr, PeriodicTaskThread, arg);
     if (rc != 0) {
         LOG(ERROR) << "Fail to start PeriodicTaskThread";
         static_cast<PeriodicTask*>(arg)->OnDestroyingTask();
@@ -46,7 +50,7 @@ static void RunPeriodicTaskThread(void* arg) {
 }
 
 void PeriodicTaskManager::StartTaskAt(PeriodicTask* task, const timespec& abstime) {
-    if (task == NULL) {
+    if (task == nullptr) {
         LOG(ERROR) << "Param[task] is NULL";
         return;
     }

@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef  BRPC_METHOD_STATUS_H
 #define  BRPC_METHOD_STATUS_H
@@ -35,8 +37,8 @@ public:
 
     // Call this function when the method is about to be called.
     // Returns false when the method is overloaded. If rejected_cc is not
-    // NULL, it's set with the rejected concurrency.
-    bool OnRequested(int* rejected_cc = NULL);
+    // nullptr, it's set with the rejected concurrency.
+    bool OnRequested(int* rejected_cc = nullptr, Controller* cntl = nullptr);
 
     // Call this when the method just finished.
     // `error_code' : The error code obtained from the controller. Equal to 
@@ -51,7 +53,7 @@ public:
     int Expose(const butil::StringPiece& prefix);
 
     // Describe internal vars, used by /status
-    void Describe(std::ostream &os, const DescribeOptions&) const;
+    void Describe(std::ostream &os, const DescribeOptions&) const override;
 
     // Current max_concurrency of the method.
     int MaxConcurrency() const { return _cl ? _cl->MaxConcurrency() : 0; }
@@ -73,23 +75,28 @@ friend class Server;
     bvar::PassiveStatus<int32_t> _max_concurrency_bvar;
 };
 
+struct ResponseWriteInfo {
+    int64_t sent_us{0};
+};
+
+int HandleResponseWritten(bthread_id_t id, void* data, int error_code);
+
 class ConcurrencyRemover {
 public:
     ConcurrencyRemover(MethodStatus* status, Controller* c, int64_t received_us)
-        : _status(status) 
-        , _c(c)
-        , _received_us(received_us) {}
+        : _status(status) , _c(c) , _received_us(received_us) {}
     ~ConcurrencyRemover();
+
 private:
     DISALLOW_COPY_AND_ASSIGN(ConcurrencyRemover);
     MethodStatus* _status;
     Controller* _c;
-    uint64_t _received_us;
+    int64_t _received_us;
 };
 
-inline bool MethodStatus::OnRequested(int* rejected_cc) {
+inline bool MethodStatus::OnRequested(int* rejected_cc, Controller* cntl) {
     const int cc = _nconcurrency.fetch_add(1, butil::memory_order_relaxed) + 1;
-    if (NULL == _cl || _cl->OnRequested(cc)) {
+    if (nullptr == _cl || _cl->OnRequested(cc, cntl)) {
         return true;
     } 
     if (rejected_cc) {
@@ -105,7 +112,7 @@ inline void MethodStatus::OnResponded(int error_code, int64_t latency) {
     } else {
         _nerror_bvar << 1;
     }
-    if (NULL != _cl) {
+    if (nullptr != _cl) {
         _cl->OnResponded(error_code, latency);
     }
 }

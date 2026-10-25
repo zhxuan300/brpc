@@ -1,24 +1,25 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
 
-#include "butil/time.h" 
-#include "butil/iobuf.h"                         // butil::IOBuf
+#include "brpc/nshead_pb_service_adaptor.h"
 
 #include "brpc/controller.h"               // Controller
 #include "brpc/socket.h"                   // Socket
@@ -26,8 +27,11 @@
 #include "brpc/span.h"
 #include "brpc/details/server_private_accessor.h"
 #include "brpc/details/controller_private_accessor.h"
-#include "brpc/nshead_pb_service_adaptor.h"
 #include "brpc/policy/most_common_message.h"
+
+#include "butil/iobuf.h"                         // butil::IOBuf
+#include "butil/strings/string_util.h"
+#include "butil/time.h"
 
 
 namespace brpc {
@@ -62,7 +66,7 @@ SendNsheadPbResponse::SendNsheadPbResponse(
     , cntl(cntl2)
     , ns_res(ns_res2)
     , done(done2)
-    , status(NULL) {
+    , status(nullptr) {
 }
 
 void SendNsheadPbResponse::Run() {
@@ -110,21 +114,25 @@ void NsheadPbServiceAdaptor::ProcessNsheadRequest(
         }
 
         ServerPrivateAccessor server_accessor(&server);
-        const Server::MethodProperty *sp = server_accessor
+        const Server::MethodProperty* mp = server_accessor
             .FindMethodPropertyByFullName(meta->full_method_name());
-        if (NULL == sp ||
-            sp->service->GetDescriptor() == BadMethodService::descriptor()) {
+        if (nullptr == mp ||
+            mp->service->GetDescriptor() == BadMethodService::descriptor()) {
             controller->SetFailed(ENOMETHOD, "Fail to find method=%s", 
                                   meta->full_method_name().c_str());
             break;
         }
-        pbdone->status = sp->status;
-        sp->status->OnRequested();
+        if (RejectBuiltinAccess(controller, server, mp) ||
+            RejectNonBuiltinAccessFromInternalPort(controller, server, mp)) {
+            break;
+        }
+        pbdone->status = mp->status;
+        mp->status->OnRequested();
 
-        google::protobuf::Service* svc = sp->service;
-        const google::protobuf::MethodDescriptor* method = sp->method;
+        google::protobuf::Service* svc = mp->service;
+        const google::protobuf::MethodDescriptor* method = mp->method;
         ControllerPrivateAccessor(controller).set_method(method);
-        done->SetMethodName(method->full_name());
+        done->SetMethodName(butil::EnsureString(method->full_name()));
         pbdone->pbreq.reset(svc->GetRequestPrototype(method).New());
         pbdone->pbres.reset(svc->GetResponsePrototype(method).New());
 

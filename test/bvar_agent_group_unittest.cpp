@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author Zhangyi Chen (chenzhangyi01@baidu.com)
-// Date 2014/09/26 12:43:49
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <pthread.h>                                // pthread_*
 
@@ -36,9 +49,9 @@ protected:
     static void *thread_counter(void *arg) {
         int id = (int)((long)arg);
         agent_type *item = AgentGroup<agent_type>::get_or_create_tls_agent(id);
-        if (item == NULL) {
+        if (item == nullptr) {
             EXPECT_TRUE(false);
-            return NULL;
+            return nullptr;
         }
         butil::Timer timer;
         timer.start();
@@ -64,7 +77,7 @@ TEST_F(AgentGroupTest, test_sanity) {
     int id = AgentGroup<agent_type>::create_new_agent();
     ASSERT_TRUE(id >= 0) << id;
     agent_type *element = AgentGroup<agent_type>::get_or_create_tls_agent(id);
-    ASSERT_TRUE(element != NULL);
+    ASSERT_TRUE(element != nullptr);
     AgentGroup<agent_type>::destroy_agent(id);
 }
 
@@ -94,7 +107,7 @@ TEST_F(AgentGroupTest, test_perf) {
         for (size_t j = 0; j < id_num; ++j) {
             agent_type *agent =
                 AgentGroup<agent_type>::get_or_create_tls_agent(ids[j]);
-            ASSERT_TRUE(agent != NULL) << ids[j];
+            ASSERT_TRUE(agent != nullptr) << ids[j];
         }
     }
     timer.stop();
@@ -111,7 +124,7 @@ TEST_F(AgentGroupTest, test_all_perf) {
     ASSERT_TRUE(id >= 0) << id;
     pthread_t threads[24];
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_create(&threads[i], NULL, &thread_counter, (void *)id);
+        pthread_create(&threads[i], nullptr, &thread_counter, (void *)id);
     }
     long totol_time = 0;
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
@@ -124,7 +137,7 @@ TEST_F(AgentGroupTest, test_all_perf) {
     totol_time = 0;
     g_counter.store(0, butil::memory_order_relaxed);
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_create(&threads[i], NULL, global_add, (void *)id);
+        pthread_create(&threads[i], nullptr, global_add, (void *)id);
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
         void *ret; 

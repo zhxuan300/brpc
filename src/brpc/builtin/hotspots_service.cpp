@@ -1,25 +1,29 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <stdio.h>
+#include <thread>
 #include <gflags/gflags.h>
 #include "butil/files/file_enumerator.h"
 #include "butil/file_util.h"                     // butil::FilePath
 #include "butil/popen.h"                         // butil::read_command_output
 #include "butil/fd_guard.h"                      // butil::fd_guard
+#include "butil/iobuf_profiler.h"
 #include "brpc/log.h"
 #include "brpc/controller.h"
 #include "brpc/server.h"
@@ -29,8 +33,8 @@
 #include "brpc/details/tcmalloc_extension.h"
 
 extern "C" {
-int __attribute__((weak)) ProfilerStart(const char* fname);
-void __attribute__((weak)) ProfilerStop();
+int BAIDU_WEAK ProfilerStart(const char* fname);
+void BAIDU_WEAK ProfilerStop();
 }
 
 namespace bthread {
@@ -38,17 +42,76 @@ bool ContentionProfilerStart(const char* filename);
 void ContentionProfilerStop();
 }
 
-
 namespace brpc {
+enum class DisplayType{
+    kUnknown,
+    kDot,
+#if defined(OS_LINUX)
+    kFlameGraph,
+#endif
+    kText
+};
+
+static const char* DisplayTypeToString(DisplayType type) {
+    switch (type) {
+        case DisplayType::kDot: return "dot";
+#if defined(OS_LINUX)
+        case DisplayType::kFlameGraph: return "flame";
+#endif
+        case DisplayType::kText: return "text";
+        default: return "unknown";
+    }
+}
+
+static DisplayType StringToDisplayType(const std::string& val) {
+    static butil::CaseIgnoredFlatMap<DisplayType>* display_type_map;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        display_type_map = new butil::CaseIgnoredFlatMap<DisplayType>;
+        (*display_type_map)["dot"] = DisplayType::kDot;
+#if defined(OS_LINUX)
+        (*display_type_map)["flame"] = DisplayType::kFlameGraph;
+#endif
+        (*display_type_map)["text"] = DisplayType::kText;
+    });
+    auto type = display_type_map->seek(val);
+    if (type == nullptr) {
+      return DisplayType::kUnknown;
+    }
+    return *type;
+}
+
+static std::string DisplayTypeToPProfArgument(DisplayType type) {
+    switch (type) {
+#if defined(OS_LINUX)
+        case DisplayType::kDot: return " --dot ";
+        case DisplayType::kFlameGraph: return " --collapsed ";
+        case DisplayType::kText: return " --text ";
+#elif defined(OS_MACOSX)
+        case DisplayType::kDot: return " -dot ";
+        case DisplayType::kText: return " -text ";
+#endif
+        default: return " unknown type ";
+    }
+}
+
+static std::string GeneratePerlScriptPath(const std::string& filename) {
+    std::string path;
+    path.reserve(FLAGS_rpc_profiling_dir.size() + 1 + filename.size());
+    path += FLAGS_rpc_profiling_dir;
+    path.push_back('/');
+    path += filename;
+    return path;
+}
 
 extern bool cpu_profiler_enabled;
-
-DEFINE_int32(max_profiling_seconds, 300, "upper limit of running time of profilers");
-BRPC_VALIDATE_GFLAG(max_profiling_seconds, NonNegativeInteger);
 
 DEFINE_int32(max_profiles_kept, 32,
              "max profiles kept for cpu/heap/growth/contention respectively");
 BRPC_VALIDATE_GFLAG(max_profiles_kept, PassValidate);
+
+DEFINE_int32(max_flame_graph_width, 1200, "max width of flame graph image");
+BRPC_VALIDATE_GFLAG(max_flame_graph_width, PositiveInteger);
 
 static const char* const PPROF_FILENAME = "pprof.pl";
 static int DEFAULT_PROFILING_SECONDS = 10;
@@ -88,11 +151,12 @@ struct ProfilingEnvironment {
 };
 
 // Different ProfilingType have different env.
-static ProfilingEnvironment g_env[4] = {
-    { PTHREAD_MUTEX_INITIALIZER, 0, NULL, NULL, NULL },
-    { PTHREAD_MUTEX_INITIALIZER, 0, NULL, NULL, NULL },
-    { PTHREAD_MUTEX_INITIALIZER, 0, NULL, NULL, NULL },
-    { PTHREAD_MUTEX_INITIALIZER, 0, NULL, NULL, NULL }
+static ProfilingEnvironment g_env[5] = {
+    { PTHREAD_MUTEX_INITIALIZER, 0, nullptr, nullptr, nullptr },
+    { PTHREAD_MUTEX_INITIALIZER, 0, nullptr, nullptr, nullptr },
+    { PTHREAD_MUTEX_INITIALIZER, 0, nullptr, nullptr, nullptr },
+    { PTHREAD_MUTEX_INITIALIZER, 0, nullptr, nullptr, nullptr },
+    { PTHREAD_MUTEX_INITIALIZER, 0, nullptr, nullptr, nullptr }
 };
 
 // The `content' should be small so that it can be written into file in one
@@ -108,7 +172,7 @@ static bool WriteSmallFile(const char* filepath_in,
         return false;
     }
     FILE* fp = fopen(path.value().c_str(), "w");
-    if (NULL == fp) {
+    if (nullptr == fp) {
         LOG(ERROR) << "Fail to open `" << path.value() << '\'';
         return false;
     }
@@ -132,12 +196,12 @@ static bool WriteSmallFile(const char* filepath_in,
         return false;
     }
     FILE* fp = fopen(path.value().c_str(), "w");
-    if (NULL == fp) {
+    if (nullptr == fp) {
         LOG(ERROR) << "Fail to open `" << path.value() << '\'';
         return false;
     }
     butil::IOBufAsZeroCopyInputStream iter(content);
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (iter.Next(&data, &size)) {
         if (fwrite(data, size, 1UL, fp) != 1UL) {
@@ -154,8 +218,8 @@ static int ReadSeconds(const Controller* cntl) {
     int seconds = DEFAULT_PROFILING_SECONDS;
     const std::string* param =
         cntl->http_request().uri().GetQuery("seconds");
-    if (param != NULL) {
-        char* endptr = NULL;
+    if (param != nullptr) {
+        char* endptr = nullptr;
         const long sec = strtol(param->c_str(), &endptr, 10);
         if (endptr == param->c_str() + param->length()) {
             seconds = sec;
@@ -168,8 +232,8 @@ static int ReadSeconds(const Controller* cntl) {
 }
 
 static const char* GetBaseName(const std::string* full_base_name) {
-    if (full_base_name == NULL) {
-        return NULL;
+    if (full_base_name == nullptr) {
+        return nullptr;
     }
     size_t offset = full_base_name->find_last_of('/');
     if (offset == std::string::npos) {
@@ -225,16 +289,16 @@ static bool ValidProfilePath(const butil::StringPiece& path) {
 static int MakeCacheName(char* cache_name, size_t len,
                          const char* prof_name,
                          const char* base_name,
-                         bool use_text,
+                         DisplayType display_type,
                          bool show_ccount) {
     if (base_name) {
-        return snprintf(cache_name, len, "%s.cache/base_%s%s%s", prof_name,
+        return snprintf(cache_name, len, "%s.cache/base_%s.%s%s", prof_name,
                         base_name,
-                        (use_text ? ".text" : ".dot"),
+                        DisplayTypeToString(display_type),
                         (show_ccount ? ".ccount" : ""));
     } else {
         return snprintf(cache_name, len, "%s.cache/%s%s", prof_name,
-                        (use_text ? "text" : "dot"),
+                        DisplayTypeToString(display_type),
                         (show_ccount ? ".ccount" : ""));
 
     }
@@ -271,10 +335,10 @@ static void ConsumeWaiters(ProfilingType type, const Controller* cur_cntl,
     ProfilingEnvironment& env = g_env[type];
     if (env.client) {
         BAIDU_SCOPED_LOCK(env.mutex);
-        if (env.client == NULL) {
+        if (env.client == nullptr) {
             return;
         }
-        if (env.cached_result == NULL) {
+        if (env.cached_result == nullptr) {
             env.cached_result = new ProfilingResult;
         }
         env.cached_result->id = env.client->id;
@@ -283,7 +347,7 @@ static void ConsumeWaiters(ProfilingType type, const Controller* cur_cntl,
         env.cached_result->result = cur_cntl->response_attachment();
 
         delete env.client;
-        env.client = NULL;
+        env.client = nullptr;
         if (env.waiters) {
             env.waiters->swap(*waiters);
         }
@@ -293,7 +357,7 @@ static void ConsumeWaiters(ProfilingType type, const Controller* cur_cntl,
 // This function is always called with g_env[type].mutex UNLOCKED.
 static void NotifyWaiters(ProfilingType type, const Controller* cur_cntl,
                           const std::string* view) {
-    if (view != NULL) {
+    if (view != nullptr) {
         return;
     }
     std::vector<ProfilingWaiter> saved_waiters;
@@ -310,15 +374,17 @@ static void NotifyWaiters(ProfilingType type, const Controller* cur_cntl,
 }
 
 #if defined(OS_MACOSX)
+static const char* s_pprof_binary_path = nullptr;
 static bool check_GOOGLE_PPROF_BINARY_PATH() {
     char* str = getenv("GOOGLE_PPROF_BINARY_PATH");
-    if (str == NULL) {
+    if (str == nullptr) {
         return false;
     }
     butil::fd_guard fd(open(str, O_RDONLY));
     if (fd < 0) {
         return false;
     }
+    s_pprof_binary_path = strdup(str);
     return true;
 }
 
@@ -331,7 +397,8 @@ static bool has_GOOGLE_PPROF_BINARY_PATH() {
 static void DisplayResult(Controller* cntl,
                           google::protobuf::Closure* done,
                           const char* prof_name,
-                          const butil::IOBuf& result_prefix) {
+                          const butil::IOBuf& result_prefix,
+                          ProfilingType type) {
     ClosureGuard done_guard(done);
     butil::IOBuf prof_result;
     if (cntl->IsCanceled()) {
@@ -341,10 +408,27 @@ static void DisplayResult(Controller* cntl,
     }
     butil::IOBuf& resp = cntl->response_attachment();
     const bool use_html = UseHTML(cntl->http_request());
-    const bool use_text = cntl->http_request().uri().GetQuery("text");
     const bool show_ccount = cntl->http_request().uri().GetQuery("ccount");
     const std::string* base_name = cntl->http_request().uri().GetQuery("base");
-    if (base_name != NULL) {
+    const std::string* display_type_query = cntl->http_request().uri().GetQuery("display_type");
+    DisplayType display_type = DisplayType::kDot;
+#if defined(OS_LINUX)
+    const char* flamegraph_tool = getenv("FLAMEGRAPH_PL_PATH");
+#endif
+    if (display_type_query) {
+        display_type = StringToDisplayType(*display_type_query);
+        if (display_type == DisplayType::kUnknown) {
+            return cntl->SetFailed(EINVAL, "Invalid display_type=%s", display_type_query->c_str());
+        }
+#if defined(OS_LINUX)
+        if (display_type == DisplayType::kFlameGraph && !flamegraph_tool) {
+            return cntl->SetFailed(EINVAL, "Failed to find environment variable "
+                "FLAMEGRAPH_PL_PATH, please read cpu_profiler doc"
+                "(https://github.com/apache/brpc/blob/master/docs/cn/cpu_profiler.md)");
+        }
+#endif
+    }
+    if (base_name != nullptr) {
         if (!ValidProfilePath(*base_name)) {
             return cntl->SetFailed(EINVAL, "Invalid query `base'");
         }
@@ -358,10 +442,10 @@ static void DisplayResult(Controller* cntl,
     char expected_result_name[256];
     MakeCacheName(expected_result_name, sizeof(expected_result_name),
                   prof_name, GetBaseName(base_name),
-                  use_text, show_ccount);
+                  display_type, show_ccount);
     // Try to read cache first.
     FILE* fp = fopen(expected_result_name, "r");
-    if (fp != NULL) {
+    if (fp != nullptr) {
         bool succ = false;
         char buffer[1024];
         while (1) {
@@ -397,28 +481,34 @@ static void DisplayResult(Controller* cntl,
     }
     
     std::ostringstream cmd_builder;
-    std::string pprof_tool;
-    pprof_tool.reserve(FLAGS_rpc_profiling_dir.size() + 1 + strlen(PPROF_FILENAME));
-    pprof_tool += FLAGS_rpc_profiling_dir;
-    pprof_tool.push_back('/');
-    pprof_tool += PPROF_FILENAME;
-    
+
+    std::string pprof_tool{GeneratePerlScriptPath(PPROF_FILENAME)};
+
 #if defined(OS_LINUX)
     cmd_builder << "perl " << pprof_tool
-                << (use_text ? " --text " : " --dot ")
-                << (show_ccount ? " --contention " : "");
+                << DisplayTypeToPProfArgument(display_type)
+                << ((show_ccount || type == PROFILING_IOBUF) ? " --contention " : "");
     if (base_name) {
         cmd_builder << "--base " << *base_name << ' ';
     }
-    cmd_builder << GetProgramName() << " " << prof_name << " 2>&1 ";
+
+    cmd_builder << GetProgramPath() << " " << prof_name;
+
+    if (display_type == DisplayType::kFlameGraph) {
+        // For flamegraph, we don't care about pprof error msg, 
+        // which will cause confusing messages in the final result.
+        cmd_builder << " 2>/dev/null  | perl " <<  flamegraph_tool << " --width "
+                    << (FLAGS_max_flame_graph_width > 0 ? FLAGS_max_flame_graph_width : 1200);
+    }
+    cmd_builder << " 2>&1 ";
 #elif defined(OS_MACOSX)
-    cmd_builder << getenv("GOOGLE_PPROF_BINARY_PATH") << " "
-                << (use_text ? " -text " : " -dot ")
-                << (show_ccount ? " -contentions " : "");
+    cmd_builder << s_pprof_binary_path << " "
+                << DisplayTypeToPProfArgument(display_type)
+                << ((show_ccount || type == PROFILING_IOBUF) ? " --contention " : "");
     if (base_name) {
         cmd_builder << "-base " << *base_name << ' ';
     }
-    cmd_builder << prof_name << " 2>&1 ";
+    cmd_builder << GetProgramPath() << " " << prof_name << " 2>&1 ";
 #endif
 
     const std::string cmd = cmd_builder.str();
@@ -437,14 +527,15 @@ static void DisplayResult(Controller* cntl,
         errno = 0; // read_command_output may not set errno, clear it to make sure if
                    // we see non-zero errno, it's real error.
         butil::IOBufBuilder pprof_output;
+        RPC_VLOG << "Running cmd=" << cmd;
         const int rc = butil::read_command_output(pprof_output, cmd.c_str());
         if (rc != 0) {
-            butil::FilePath path(pprof_tool);
-            if (!butil::PathExists(path)) {
+            butil::FilePath pprof_path(pprof_tool);
+            if (!butil::PathExists(pprof_path)) {
                 // Write the script again.
                 g_written_pprof_perl = false;
                 // tell user.
-                os << path.value() << " was removed, recreate ...\n\n";
+                os << pprof_path.value() << " was removed, recreate ...\n\n";
                 continue;
             }
             if (rc < 0) {
@@ -461,13 +552,13 @@ static void DisplayResult(Controller* cntl,
         // Cache result in file.
         char result_name[256];
         MakeCacheName(result_name, sizeof(result_name), prof_name,
-                      GetBaseName(base_name), use_text, show_ccount);
+                      GetBaseName(base_name), display_type, show_ccount);
 
         // Append the profile name as the visual reminder for what
         // current profile is.
         butil::IOBuf before_label;
         butil::IOBuf tmp;
-        if (cntl->http_request().uri().GetQuery("view") == NULL) {
+        if (cntl->http_request().uri().GetQuery("view") == nullptr) {
             tmp.append(prof_name);
             tmp.append("[addToProfEnd]");
         }
@@ -501,7 +592,6 @@ static void DisplayResult(Controller* cntl,
         }
         break;
     }
-    CHECK(!use_html);
     // NOTE: not send prof_result to os first which does copying.
     os.move_to(resp);
     if (use_html) {
@@ -546,7 +636,7 @@ static void DoProfiling(ProfilingType type,
             return cntl->SetFailed(
                 EINVAL, "The profile denoted by `view' does not exist");
         }
-        DisplayResult(cntl, done_guard.release(), view->c_str(), os.buf());
+        DisplayResult(cntl, done_guard.release(), view->c_str(), os.buf(), type);
         return;
     }
 
@@ -577,8 +667,8 @@ static void DoProfiling(ProfilingType type,
     int64_t prof_id = 0;
     const std::string* prof_id_str =
         cntl->http_request().uri().GetQuery("profiling_id");
-    if (prof_id_str != NULL) {
-        char* endptr = NULL;
+    if (prof_id_str != nullptr) {
+        char* endptr = nullptr;
         prof_id = strtoll(prof_id_str->c_str(), &endptr, 10);
         LOG_IF(ERROR, *endptr != '\0') << "Invalid profiling_id=" << prof_id;
     }
@@ -586,7 +676,7 @@ static void DoProfiling(ProfilingType type,
     {
         BAIDU_SCOPED_LOCK(g_env[type].mutex);
         if (g_env[type].client) {
-            if (NULL == g_env[type].waiters) {
+            if (nullptr == g_env[type].waiters) {
                 g_env[type].waiters = new std::vector<ProfilingWaiter>;
             }
             ProfilingWaiter waiter = { cntl, done_guard.release() };
@@ -594,7 +684,7 @@ static void DoProfiling(ProfilingType type,
             RPC_VLOG << "Queue request from " << cntl->remote_side();
             return;
         }
-        if (g_env[type].cached_result != NULL &&
+        if (g_env[type].cached_result != nullptr &&
             g_env[type].cached_result->id == prof_id) {
             cntl->http_response().set_status_code(
                 g_env[type].cached_result->status_code);
@@ -603,7 +693,7 @@ static void DoProfiling(ProfilingType type,
             RPC_VLOG << "Hit cached result, id=" << prof_id;
             return;
         }
-        CHECK(NULL == g_env[type].client);
+        CHECK(nullptr == g_env[type].client);
         g_env[type].client = new ProfilingClient;
         g_env[type].client->end_us = butil::cpuwide_time_us() + seconds * 1000000L;
         g_env[type].client->seconds = seconds;
@@ -643,7 +733,7 @@ static void DoProfiling(ProfilingType type,
     }
 #endif
     if (type == PROFILING_CPU) {
-        if ((void*)ProfilerStart == NULL || (void*)ProfilerStop == NULL) {
+        if ((void*)ProfilerStart == nullptr || (void*)ProfilerStop == nullptr) {
             os << "CPU profiler is not enabled"
                << (use_html ? "</body></html>" : "\n");
             os.move_to(resp);
@@ -683,11 +773,20 @@ static void DoProfiling(ProfilingType type,
             PLOG(WARNING) << "Profiling has been interrupted";
         }
         bthread::ContentionProfilerStop();
+    } else if (type == PROFILING_IOBUF) {
+        if (!butil::IsIOBufProfilerEnabled()) {
+            os << "IOBuf profiler is not enabled"
+               << (use_html ? "</body></html>" : "\n");
+            os.move_to(resp);
+            cntl->http_response().set_status_code(HTTP_STATUS_FORBIDDEN);
+            return NotifyWaiters(type, cntl, view);
+        }
+        butil::IOBufProfilerFlush(prof_name);
     } else if (type == PROFILING_HEAP) {
         MallocExtension* malloc_ext = MallocExtension::instance();
-        if (malloc_ext == NULL || !has_TCMALLOC_SAMPLE_PARAMETER()) {
+        if (malloc_ext == nullptr || !has_TCMALLOC_SAMPLE_PARAMETER()) {
             os << "Heap profiler is not enabled";
-            if (malloc_ext != NULL) {
+            if (malloc_ext != nullptr) {
                 os << " (no TCMALLOC_SAMPLE_PARAMETER in env)";
             }
             os << '.' << (use_html ? "</body></html>" : "\n");
@@ -707,7 +806,7 @@ static void DoProfiling(ProfilingType type,
         }
     } else if (type == PROFILING_GROWTH) {
         MallocExtension* malloc_ext = MallocExtension::instance();
-        if (malloc_ext == NULL) {
+        if (malloc_ext == nullptr) {
             os << "Growth profiler is not enabled."
                << (use_html ? "</body></html>" : "\n");
             os.move_to(resp);
@@ -736,11 +835,11 @@ static void DoProfiling(ProfilingType type,
     std::vector<ProfilingWaiter> waiters;
     // NOTE: Must be called before DisplayResult which calls done->Run() and
     // deletes cntl.
-    ConsumeWaiters(type, cntl, &waiters);    
-    DisplayResult(cntl, done_guard.release(), prof_name, os.buf());
+    ConsumeWaiters(type, cntl, &waiters);
+    DisplayResult(cntl, done_guard.release(), prof_name, os.buf(), type);
 
     for (size_t i = 0; i < waiters.size(); ++i) {
-        DisplayResult(waiters[i].cntl, waiters[i].done, prof_name, os.buf());
+        DisplayResult(waiters[i].cntl, waiters[i].done, prof_name, os.buf(), type);
     }
 }
 
@@ -754,12 +853,16 @@ static void StartProfiling(ProfilingType type,
     butil::IOBufBuilder os;
     bool enabled = false;
     const char* extra_desc = "";
-
     if (type == PROFILING_CPU) {
         enabled = cpu_profiler_enabled;
     } else if (type == PROFILING_CONTENTION) {
         enabled = true;
-    } else if (type == PROFILING_HEAP) {
+    } else if (type == PROFILING_IOBUF) {
+        enabled = butil::IsIOBufProfilerEnabled();
+        if (!enabled) {
+            extra_desc = " (no ENABLE_IOBUF_PROFILER=1 in env or no link tcmalloc )";
+        }
+    }  else if (type == PROFILING_HEAP) {
         enabled = IsHeapProfilerEnabled();
         if (enabled && !has_TCMALLOC_SAMPLE_PARAMETER()) {
             enabled = false;
@@ -793,14 +896,38 @@ static void StartProfiling(ProfilingType type,
 
     const int seconds = ReadSeconds(cntl);
     const std::string* view = cntl->http_request().uri().GetQuery("view");
-    const bool use_text = cntl->http_request().uri().GetQuery("text");
     const bool show_ccount = cntl->http_request().uri().GetQuery("ccount");
     const std::string* base_name = cntl->http_request().uri().GetQuery("base");
+    const std::string* display_type_query = cntl->http_request().uri().GetQuery("display_type");
+    DisplayType display_type = DisplayType::kDot;
+    if (display_type_query) {
+        display_type = StringToDisplayType(*display_type_query);
+        if (display_type == DisplayType::kUnknown) {
+            return cntl->SetFailed(EINVAL, "Invalid display_type=%s", display_type_query->c_str());
+        }
+#if defined(OS_LINUX)
+        const char* flamegraph_tool = getenv("FLAMEGRAPH_PL_PATH");
+        if (display_type == DisplayType::kFlameGraph && !flamegraph_tool) {
+            return cntl->SetFailed(EINVAL, "Failed to find environment variable "
+                "FLAMEGRAPH_PL_PATH, please read cpu_profiler doc"
+                "(https://github.com/apache/brpc/blob/master/docs/cn/cpu_profiler.md)");
+        }
+#endif
+    }
+    // `view' and `base' are written into the page below and into the url of
+    // the request that page issues to *_non_responsive, which applies this
+    // same check before handing them to pprof.
+    if (view != nullptr && !ValidProfilePath(*view)) {
+        return cntl->SetFailed(EINVAL, "Invalid query `view'");
+    }
+    if (base_name != nullptr && !ValidProfilePath(*base_name)) {
+        return cntl->SetFailed(EINVAL, "Invalid query `base'");
+    }
 
     ProfilingClient profiling_client;
     size_t nwaiters = 0;
     ProfilingEnvironment & env = g_env[type];
-    if (view == NULL) {
+    if (view == nullptr) {
         BAIDU_SCOPED_LOCK(env.mutex);
         if (env.client) {
             profiling_client = *env.client;
@@ -820,57 +947,31 @@ static void StartProfiling(ProfilingType type,
         "<script type=\"text/javascript\">\n"
         "function generateURL() {\n"
         "  var past_prof = document.getElementById('view_prof').value;\n"
-        "  var base_prof = document.getElementById('base_prof').value;\n"
-        "  var use_text = document.getElementById('text_cb').checked;\n";
+          "  var base_prof_el = document.getElementById('base_prof');\n"
+          "  var base_prof = base_prof_el != null ? base_prof_el.value : '';\n"
+        "  var display_type = document.getElementById('display_type').value;\n";
     if (type == PROFILING_CONTENTION) {
         os << "  var show_ccount = document.getElementById('ccount_cb').checked;\n";
     }
     os << "  var targetURL = '/hotspots/" << type_str << "';\n"
-        "  var first = true;\n"
+        "  targetURL += '?display_type=' + display_type;\n"
         "  if (past_prof != '') {\n"
-        "    if (first) {\n"
-        "      targetURL += '?';\n"
-        "      first = false;\n"
-        "    } else {\n"
-        "      targetURL += '&';\n"
-        "    }\n"
-        "    targetURL += 'view=' + past_prof;\n"
+        "    targetURL += '&view=' + past_prof;\n"
         "  }\n"
         "  if (base_prof != '') {\n"
-        "    if (first) {\n"
-        "      targetURL += '?';\n"
-        "      first = false;\n"
-        "    } else {\n"
-        "      targetURL += '&';\n"
-        "    }\n"
-        "    targetURL += 'base=' + base_prof;\n"
-        "  }\n"
-        "  if (use_text) {\n"
-        "    if (first) {\n"
-        "      targetURL += '?';\n"
-        "      first = false;\n"
-        "    } else {\n"
-        "      targetURL += '&';\n"
-        "    }\n"
-        "    targetURL += 'text';\n"
+        "    targetURL += '&base=' + base_prof;\n"
         "  }\n";
     if (type == PROFILING_CONTENTION) {
         os <<
         "  if (show_ccount) {\n"
-        "    if (first) {\n"
-        "      targetURL += '?';\n"
-        "      first = false;\n"
-        "    } else {\n"
-        "      targetURL += '&';\n"
-        "    }\n"
-        "    targetURL += 'ccount';\n"
+        "    targetURL += '&ccount';\n"
         "  }\n";
     }
     os << "  return targetURL;\n"
         "}\n"
         "$(function() {\n"
         "  function onDataReceived(data) {\n";
-    if (view == NULL) {
+    if (view == nullptr) {
         os <<
         "    var selEnd = data.indexOf('[addToProfEnd]');\n"
         "    if (selEnd != -1) {\n"
@@ -901,6 +1002,7 @@ static void StartProfiling(ProfilingType type,
         "        data = data.substring(selEnd + '[addToProfEnd]'.length);\n"
         "      }\n"
         "      $(\"#profiling-result\").html('<pre>' + data + '</pre>');\n"
+        "      if (data.indexOf('FlameGraph') != -1) { init(); }"
         "    } else {\n"
         "      $(\"#profiling-result\").html('Plotting ...');\n"
         "      var svg = Viz(data.substring(index), \"svg\");\n"
@@ -918,9 +1020,7 @@ static void StartProfiling(ProfilingType type,
     if (profiling_client.id != 0) {
         os << "&profiling_id=" << profiling_client.id;
     }
-    if (use_text) {
-        os << "&text";
-    }
+    os << "&display_type=" << DisplayTypeToString(display_type);
     if (show_ccount) {
         os << "&ccount";
     }
@@ -996,47 +1096,52 @@ static void StartProfiling(ProfilingType type,
     os << "<option value=''>&lt;new profile&gt;</option>";
     for (size_t i = 0; i < past_profs.size(); ++i) {
         os << "<option value='" << past_profs[i] << "' ";
-        if (view != NULL && past_profs[i] == *view) {
+        if (view != nullptr && past_profs[i] == *view) {
             os << "selected";
         }
         os << '>' << GetBaseName(&past_profs[i]);
     }
-    os << "</select>"
-        "&nbsp;&nbsp;&nbsp;<label for='text_cb'>"
-        "<input id='text_cb' type='checkbox'"
-       << (use_text ? " checked=''" : "") <<
-        " onclick='onChangedCB(this);'>text</label>";
+    os << "</select>";
+    os << "<div><pre style='display:inline'>Display: </pre>"
+        "<select id='display_type' onchange='onSelectProf()'>"
+        "<option value=dot" << (display_type == DisplayType::kDot ? " selected" : "") << ">dot</option>"
+#if defined(OS_LINUX)
+        "<option value=flame" << (display_type == DisplayType::kFlameGraph ? " selected" : "") << ">flame</option>"
+#endif
+        "<option value=text" << (display_type == DisplayType::kText ? " selected" : "") << ">text</option></select>";
     if (type == PROFILING_CONTENTION) {
         os << "&nbsp;&nbsp;&nbsp;<label for='ccount_cb'>"
             "<input id='ccount_cb' type='checkbox'"
            << (show_ccount ? " checked=''" : "") <<
             " onclick='onChangedCB(this);'>count</label>";
     }
-    os << "<br><pre style='display:inline'>Diff: </pre>"
-        "<select id='base_prof' onchange='onSelectProf()'>"
-        "<option value=''>&lt;none&gt;</option>";
-    for (size_t i = 0; i < past_profs.size(); ++i) {
-        os << "<option value='" << past_profs[i] << "' ";
-        if (base_name != NULL && past_profs[i] == *base_name) {
-            os << "selected";
+    if (type != PROFILING_IOBUF) {
+        os << "</div><div><pre style='display:inline'>Diff: </pre>"
+              "<select id='base_prof' onchange='onSelectProf()'>"
+              "<option value=''>&lt;none&gt;</option>";
+        for (size_t i = 0; i<past_profs.size(); ++i) {
+            os << "<option value='" << past_profs[i] << "' ";
+            if (base_name!=nullptr && past_profs[i]==*base_name) {
+                os << "selected";
+            }
+            os << '>' << GetBaseName(&past_profs[i]);
         }
-        os << '>' << GetBaseName(&past_profs[i]);
+        os << "</select></div>";
     }
-    os << "</select>";
     
-    if (!enabled && view == NULL) {
+    if (!enabled && view == nullptr) {
         os << "<p><span style='color:red'>Error:</span> "
            << type_str << " profiler is not enabled." << extra_desc << "</p>"
             "<p>To enable all profilers, link tcmalloc and define macros BRPC_ENABLE_CPU_PROFILER"
-            "</p><p>Or read docs: <a href='https://github.com/brpc/brpc/blob/master/docs/cn/cpu_profiler.md'>cpu_profiler</a>"
-            " and <a href='https://github.com/brpc/brpc/blob/master/docs/cn/heap_profiler.md'>heap_profiler</a>"
+            "</p><p>Or read docs: <a href='https://github.com/apache/brpc/blob/master/docs/cn/cpu_profiler.md'>cpu_profiler</a>"
+            " and <a href='https://github.com/apache/brpc/blob/master/docs/cn/heap_profiler.md'>heap_profiler</a>"
             "</p></body></html>";
         os.move_to(cntl->response_attachment());
         cntl->http_response().set_status_code(HTTP_STATUS_FORBIDDEN);
         return;
     }
 
-    if ((type == PROFILING_CPU || type == PROFILING_CONTENTION) && view == NULL) {
+    if ((type == PROFILING_CPU || type == PROFILING_CONTENTION) && view == nullptr) {
         if (seconds < 0) {
             os << "Invalid seconds</body></html>";
             os.move_to(cntl->response_attachment());
@@ -1064,7 +1169,7 @@ static void StartProfiling(ProfilingType type,
             os << ", showing in about " << wait_seconds << " seconds ...";
         }
     } else {
-        if ((type == PROFILING_CPU || type == PROFILING_CONTENTION) && view == NULL) {
+        if ((type == PROFILING_CPU || type == PROFILING_CONTENTION) && view == nullptr) {
             os << "Profiling " << ProfilingType2String(type) << " for "
                << seconds << " seconds ...";
         } else {
@@ -1073,7 +1178,7 @@ static void StartProfiling(ProfilingType type,
     }
     os << "</div><pre class='logo'><span class='logo_text'>" << logo()
        << "</span></pre></body>\n";
-    if (!use_text) {
+    if (display_type == DisplayType::kDot) {
         // don't need viz.js in text mode.
         os << "<script language=\"javascript\" type=\"text/javascript\""
             " src=\"/js/viz_min\"></script>\n";
@@ -1114,6 +1219,14 @@ void HotspotsService::contention(
     return StartProfiling(PROFILING_CONTENTION, cntl_base, done);
 }
 
+void HotspotsService::iobuf(::google::protobuf::RpcController* cntl_base,
+    const ::brpc::HotspotsRequest* request,
+    ::brpc::HotspotsResponse* response,
+    ::google::protobuf::Closure* done) {
+    return StartProfiling(PROFILING_IOBUF, cntl_base, done);
+}
+
+
 void HotspotsService::cpu_non_responsive(
     ::google::protobuf::RpcController* cntl_base,
     const ::brpc::HotspotsRequest*,
@@ -1146,19 +1259,33 @@ void HotspotsService::contention_non_responsive(
     return DoProfiling(PROFILING_CONTENTION, cntl_base, done);
 }
 
+void HotspotsService::iobuf_non_responsive(::google::protobuf::RpcController* cntl_base,
+    const ::brpc::HotspotsRequest* request,
+    ::brpc::HotspotsResponse* response,
+    ::google::protobuf::Closure* done) {
+    return DoProfiling(PROFILING_IOBUF, cntl_base, done);
+}
+
 void HotspotsService::GetTabInfo(TabInfoList* info_list) const {
     TabInfo* info = info_list->add();
     info->path = "/hotspots/cpu";
     info->tab_name = "cpu";
+
     info = info_list->add();
     info->path = "/hotspots/heap";
     info->tab_name = "heap";
+
     info = info_list->add();
     info->path = "/hotspots/growth";
     info->tab_name = "growth";
+
     info = info_list->add();
     info->path = "/hotspots/contention";
     info->tab_name = "contention";
+
+    info = info_list->add();
+    info->path = "/hotspots/iobuf";
+    info->tab_name = "iobuf";
 }
 
 } // namespace brpc

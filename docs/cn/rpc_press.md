@@ -5,6 +5,7 @@ rpc_press无需写代码就压测各种rpc server，目前支持的协议有：
 - sofa-pbrpc
 - public_pbrpc
 - nova_pbrpc
+- google_grpc
 
 # 获取工具
 
@@ -32,7 +33,7 @@ json也可以写在文件中，假如./input.json包含了上述两个请求，-
 可选参数:
 
 - -inc: 包含被import的proto文件的路径。rpc_press默认支持import目录下的其他proto文件，但如果proto文件在其他目录，就要通过这个参数指定，多个路径用分号(;)分隔。
-- -lb_policy: 指定负载均衡算法，默认为空，可选项为: rr random la c_murmurhash c_md5，具体见[负载均衡](client.md#负载均衡)。
+- -lb_policy: 指定负载均衡算法，默认为空，可选项为: rr random la p2c c_murmurhash c_md5，具体见[负载均衡](client.md#负载均衡)。
 - -timeout_ms: 设定超时,单位是毫秒(milliseconds),默认是1000(1秒)
 - -max_retry: 最大的重试次数,默认是3, 一般无需修改. brpc的重试行为具体请见[这里](client.md#重试).
 - -protocol: 连接server使用的协议，可选项见[协议](client.md#协议), 默认是baidu_std
@@ -60,9 +61,9 @@ json也可以写在文件中，假如./input.json包含了上述两个请求，-
 rpc_press启动后会默认在8888端口启动一个dummy server，用于观察rpc_press本身的运行情况：
 
 ```
-./rpc_press -proto=echo.proto -service=example.EchoService -method=Echo -server=0.0.0.0:8002 -input=./input.json -duration=0 -qps=100
+./rpc_press -proto=echo.proto -method=example.EchoService.Echo -server=0.0.0.0:8002 -input=./input.json -duration=0 -qps=100
 TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:733] Server[dummy_servers] is serving on port=8888.
-TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:742] Check out http://db-rpc-dev00.db01.baidu.com:8888 in your web browser.</code>
+TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:742] Check out http://xxx.com:8888 in your web browser.</code>
 ```
 
 dummy_server启动时会在终端打印日志，一般按住ctrl点击那个链接可以直接打开对应的内置服务页面，就像这样：

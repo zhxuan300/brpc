@@ -1,20 +1,24 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BAIDU_RPC_HTTP2_H
 #define BAIDU_RPC_HTTP2_H
 
+#include <cstdint>
 #include "brpc/http_status_code.h"
 
 // To baidu-rpc developers: This is a header included by user, don't depend
@@ -56,7 +60,12 @@ struct H2Settings {
     // for any limit that is exhausted with active streams. Servers SHOULD only
     // set a zero value for short durations; if a server does not wish to
     // accept requests, closing the connection is more appropriate.
-    // Default: unlimited
+    // The server enforces this limit: streams opened beyond it are rejected
+    // with RST_STREAM(REFUSED_STREAM). Set to
+    // std::numeric_limits<uint32_t>::max() explicitly to restore the old
+    // unlimited (unenforced) behavior.
+    // Default: 1024
+    static const uint32_t DEFAULT_MAX_CONCURRENT_STREAMS = 1024;
     uint32_t max_concurrent_streams;
 
     // Sender's initial window size (in octets) for stream-level flow control.
@@ -88,7 +97,14 @@ struct H2Settings {
     // and value in octets plus an overhead of 32 octets for each header field.
     // For any given request, a lower limit than what is advertised MAY be
     // enforced.
-    // Default: unlimited.
+    // brpc enforces this limit on received header blocks to bound per-stream
+    // memory: HPACK indexed references would otherwise let a small
+    // HEADERS/CONTINUATION frame expand into an unbounded header list
+    // ("HPACK bomb"). Set to std::numeric_limits<uint32_t>::max() to restore
+    // the old unlimited behavior (not recommended for servers exposed to
+    // untrusted peers).
+    // Default: 1MB
+    static const uint32_t DEFAULT_MAX_HEADER_LIST_SIZE = 1024 * 1024;
     uint32_t max_header_list_size;
 };
 

@@ -1,134 +1,39 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-
-#define INTERNAL_SUPPRESS_PROTOBUF_FIELD_DEPRECATION
-#include <algorithm>
-#include <google/protobuf/stubs/once.h>
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/wire_format_lite_inl.h>
-#include <google/protobuf/descriptor.h>
-#include <google/protobuf/reflection_ops.h>
-#include <google/protobuf/wire_format.h>
-#include "butil/string_printf.h"
-#include "butil/macros.h"
-#include "butil/sys_byteorder.h"
-#include "brpc/controller.h"
 #include "brpc/memcache.h"
-#include "brpc/policy/memcache_binary_header.h"
 
+#include <google/protobuf/io/coded_stream.h>
+#include "brpc/policy/memcache_binary_header.h"
+#include "brpc/proto_base.pb.h"
+#include "butil/logging.h"
+#include "butil/macros.h"
+#include "butil/string_printf.h"
+#include "butil/sys_byteorder.h"
 
 namespace brpc {
 
-// Internal implementation detail -- do not call these.
-void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_impl();
-void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-void protobuf_AssignDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto();
-
-namespace {
-
-const ::google::protobuf::Descriptor* MemcacheRequest_descriptor_ = NULL;
-const ::google::protobuf::Descriptor* MemcacheResponse_descriptor_ = NULL;
-
-}  // namespace
-
-void protobuf_AssignDesc_baidu_2frpc_2fmemcache_5fbase_2eproto() {
-    protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-    const ::google::protobuf::FileDescriptor* file =
-        ::google::protobuf::DescriptorPool::generated_pool()->FindFileByName(
-            "baidu/rpc/memcache_base.proto");
-    GOOGLE_CHECK(file != NULL);
-    MemcacheRequest_descriptor_ = file->message_type(0);
-    MemcacheResponse_descriptor_ = file->message_type(1);
-}
-
-namespace {
-
-GOOGLE_PROTOBUF_DECLARE_ONCE(protobuf_AssignDescriptors_once_);
-inline void protobuf_AssignDescriptorsOnce() {
-    ::google::protobuf::GoogleOnceInit(&protobuf_AssignDescriptors_once_,
-                                       &protobuf_AssignDesc_baidu_2frpc_2fmemcache_5fbase_2eproto);
-}
-
-void protobuf_RegisterTypes(const ::std::string&) {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::MessageFactory::InternalRegisterGeneratedMessage(
-        MemcacheRequest_descriptor_, &MemcacheRequest::default_instance());
-    ::google::protobuf::MessageFactory::InternalRegisterGeneratedMessage(
-        MemcacheResponse_descriptor_, &MemcacheResponse::default_instance());
-}
-
-}  // namespace
-
-void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto() {
-    delete MemcacheRequest::default_instance_;
-    delete MemcacheResponse::default_instance_;
-}
-
-void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_impl() {
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-
-#if GOOGLE_PROTOBUF_VERSION >= 3002000
-    ::google::protobuf::internal::InitProtobufDefaults();
-#else
-    ::google::protobuf::protobuf_AddDesc_google_2fprotobuf_2fdescriptor_2eproto();
-#endif
-    ::google::protobuf::DescriptorPool::InternalAddGeneratedFile(
-        "\n\035baidu/rpc/memcache_base.proto\022\tbaidu.r"
-        "pc\032 google/protobuf/descriptor.proto\"\021\n\017"
-        "MemcacheRequest\"\022\n\020MemcacheResponseB\003\200\001\001", 120);
-    ::google::protobuf::MessageFactory::InternalRegisterGeneratedFile(
-        "baidu/rpc/memcache_base.proto", &protobuf_RegisterTypes);
-    MemcacheRequest::default_instance_ = new MemcacheRequest();
-    MemcacheResponse::default_instance_ = new MemcacheResponse();
-    MemcacheRequest::default_instance_->InitAsDefaultInstance();
-    MemcacheResponse::default_instance_->InitAsDefaultInstance();
-    ::google::protobuf::internal::OnShutdown(&protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto);
-}
-
-GOOGLE_PROTOBUF_DECLARE_ONCE(protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_once);
-void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto() {
-    ::google::protobuf::GoogleOnceInit(
-        &protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_once,
-        &protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_impl);
-}
-
-// Force AddDescriptors() to be called at static initialization time.
-struct StaticDescriptorInitializer_baidu_2frpc_2fmemcache_5fbase_2eproto {
-    StaticDescriptorInitializer_baidu_2frpc_2fmemcache_5fbase_2eproto() {
-        protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-    }
-} static_descriptor_initializer_baidu_2frpc_2fmemcache_5fbase_2eproto_;
-
-
-// ===================================================================
-
-#ifndef _MSC_VER
-#endif  // !_MSC_VER
-
 MemcacheRequest::MemcacheRequest()
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<MemcacheRequest>() {
     SharedCtor();
 }
 
-void MemcacheRequest::InitAsDefaultInstance() {
-}
-
 MemcacheRequest::MemcacheRequest(const MemcacheRequest& from)
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<MemcacheRequest>(from) {
     SharedCtor();
     MergeFrom(from);
 }
@@ -143,31 +48,10 @@ MemcacheRequest::~MemcacheRequest() {
 }
 
 void MemcacheRequest::SharedDtor() {
-    if (this != default_instance_) {
-    }
 }
 
 void MemcacheRequest::SetCachedSize(int size) const {
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
     _cached_size_ = size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
-}
-const ::google::protobuf::Descriptor* MemcacheRequest::descriptor() {
-    protobuf_AssignDescriptorsOnce();
-    return MemcacheRequest_descriptor_;
-}
-
-const MemcacheRequest& MemcacheRequest::default_instance() {
-    if (default_instance_ == NULL) {
-        protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-    }
-    return *default_instance_;
-}
-
-MemcacheRequest* MemcacheRequest::default_instance_ = NULL;
-
-MemcacheRequest* MemcacheRequest::New() const {
-    return new MemcacheRequest;
 }
 
 void MemcacheRequest::Clear() {
@@ -181,7 +65,7 @@ bool MemcacheRequest::MergePartialFromCodedStream(
     
     // simple approach just making it work.
     butil::IOBuf tmp;
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (input->GetDirectBufferPointer(&data, &size)) {
         tmp.append(data, size);
@@ -193,7 +77,7 @@ bool MemcacheRequest::MergePartialFromCodedStream(
         char aux_buf[sizeof(policy::MemcacheRequestHeader)];
         const policy::MemcacheRequestHeader* header =
             (const policy::MemcacheRequestHeader*)tmp.fetch(aux_buf, sizeof(aux_buf));
-        if (header == NULL) {
+        if (header == nullptr) {
             return false;
         }
         if (header->magic != (uint8_t)policy::MC_MAGIC_REQUEST) {
@@ -216,53 +100,23 @@ void MemcacheRequest::SerializeWithCachedSizes(
 
     // simple approach just making it work.
     butil::IOBufAsZeroCopyInputStream wrapper(_buf);
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (wrapper.Next(&data, &size)) {
         output->WriteRaw(data, size);
     }
 }
 
-::google::protobuf::uint8* MemcacheRequest::SerializeWithCachedSizesToArray(
-    ::google::protobuf::uint8* target) const {
-    return target;
-}
-
-int MemcacheRequest::ByteSize() const {
-    int total_size =  _buf.size();
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
+size_t MemcacheRequest::ByteSizeLong() const {
+    int total_size =  static_cast<int>(_buf.size());
     _cached_size_ = total_size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
     return total_size;
 }
 
-void MemcacheRequest::MergeFrom(const ::google::protobuf::Message& from) {
-    GOOGLE_CHECK_NE(&from, this);
-    const MemcacheRequest* source =
-        ::google::protobuf::internal::dynamic_cast_if_available<const MemcacheRequest*>(&from);
-    if (source == NULL) {
-        ::google::protobuf::internal::ReflectionOps::Merge(from, this);
-    } else {
-        MergeFrom(*source);
-    }
-}
-
 void MemcacheRequest::MergeFrom(const MemcacheRequest& from) {
-    GOOGLE_CHECK_NE(&from, this);
+    CHECK_NE(&from, this);
     _buf.append(from._buf);
     _pipelined_count += from._pipelined_count;
-}
-
-void MemcacheRequest::CopyFrom(const ::google::protobuf::Message& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
-}
-
-void MemcacheRequest::CopyFrom(const MemcacheRequest& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
 }
 
 bool MemcacheRequest::IsInitialized() const {
@@ -278,28 +132,19 @@ void MemcacheRequest::Swap(MemcacheRequest* other) {
 }
 
 ::google::protobuf::Metadata MemcacheRequest::GetMetadata() const {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::Metadata metadata;
-    metadata.descriptor = MemcacheRequest_descriptor_;
-    metadata.reflection = NULL;
+    ::google::protobuf::Metadata metadata{};
+    metadata.descriptor = MemcacheRequestBase::descriptor();
+    metadata.reflection = nullptr;
     return metadata;
 }
 
-// ===================================================================
-
-#ifndef _MSC_VER
-#endif  // !_MSC_VER
-
 MemcacheResponse::MemcacheResponse()
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<MemcacheResponse>() {
     SharedCtor();
 }
 
-void MemcacheResponse::InitAsDefaultInstance() {
-}
-
 MemcacheResponse::MemcacheResponse(const MemcacheResponse& from)
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<MemcacheResponse>(from) {
     SharedCtor();
     MergeFrom(from);
 }
@@ -313,31 +158,10 @@ MemcacheResponse::~MemcacheResponse() {
 }
 
 void MemcacheResponse::SharedDtor() {
-    if (this != default_instance_) {
-    }
 }
 
 void MemcacheResponse::SetCachedSize(int size) const {
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
     _cached_size_ = size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
-}
-const ::google::protobuf::Descriptor* MemcacheResponse::descriptor() {
-    protobuf_AssignDescriptorsOnce();
-    return MemcacheResponse_descriptor_;
-}
-
-const MemcacheResponse& MemcacheResponse::default_instance() {
-    if (default_instance_ == NULL) {
-        protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-    }
-    return *default_instance_;
-}
-
-MemcacheResponse* MemcacheResponse::default_instance_ = NULL;
-
-MemcacheResponse* MemcacheResponse::New() const {
-    return new MemcacheResponse;
 }
 
 void MemcacheResponse::Clear() {
@@ -348,7 +172,7 @@ bool MemcacheResponse::MergePartialFromCodedStream(
     LOG(WARNING) << "You're not supposed to parse a MemcacheResponse";
 
     // simple approach just making it work.
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (input->GetDirectBufferPointer(&data, &size)) {
         _buf.append(data, size);
@@ -363,55 +187,25 @@ void MemcacheResponse::SerializeWithCachedSizes(
     
     // simple approach just making it work.
     butil::IOBufAsZeroCopyInputStream wrapper(_buf);
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (wrapper.Next(&data, &size)) {
         output->WriteRaw(data, size);
     }
 }
 
-::google::protobuf::uint8* MemcacheResponse::SerializeWithCachedSizesToArray(
-    ::google::protobuf::uint8* target) const {
-    return target;
-}
-
-int MemcacheResponse::ByteSize() const {
-    int total_size = _buf.size();
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
+size_t MemcacheResponse::ByteSizeLong() const {
+    int total_size = static_cast<int>(_buf.size());
     _cached_size_ = total_size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
     return total_size;
 }
 
-void MemcacheResponse::MergeFrom(const ::google::protobuf::Message& from) {
-    GOOGLE_CHECK_NE(&from, this);
-    const MemcacheResponse* source =
-        ::google::protobuf::internal::dynamic_cast_if_available<const MemcacheResponse*>(&from);
-    if (source == NULL) {
-        ::google::protobuf::internal::ReflectionOps::Merge(from, this);
-    } else {
-        MergeFrom(*source);
-    }
-}
-
 void MemcacheResponse::MergeFrom(const MemcacheResponse& from) {
-    GOOGLE_CHECK_NE(&from, this);
+    CHECK_NE(&from, this);
     _err = from._err;
     // responses of memcached according to their binary layout, should be
     // directly concatenatible.
     _buf.append(from._buf);
-}
-
-void MemcacheResponse::CopyFrom(const ::google::protobuf::Message& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
-}
-
-void MemcacheResponse::CopyFrom(const MemcacheResponse& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
 }
 
 bool MemcacheResponse::IsInitialized() const {
@@ -426,10 +220,9 @@ void MemcacheResponse::Swap(MemcacheResponse* other) {
 }
 
 ::google::protobuf::Metadata MemcacheResponse::GetMetadata() const {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::Metadata metadata;
-    metadata.descriptor = MemcacheResponse_descriptor_;
-    metadata.reflection = NULL;
+    ::google::protobuf::Metadata metadata{};
+    metadata.descriptor = MemcacheResponseBase::descriptor();
+    metadata.reflection = nullptr;
     return metadata;
 }
 
@@ -630,10 +423,10 @@ bool MemcacheResponse::PopGet(
 // MUST NOT have key
 // MUST NOT have value
 bool MemcacheResponse::PopDelete() {
-    return PopStore(policy::MC_BINARY_DELETE, NULL);
+    return PopStore(policy::MC_BINARY_DELETE, nullptr);
 }
 bool MemcacheResponse::PopFlush() {
-    return PopStore(policy::MC_BINARY_FLUSH, NULL);
+    return PopStore(policy::MC_BINARY_FLUSH, nullptr);
 }
 
 struct StoreHeaderWithExtras {
@@ -708,6 +501,13 @@ bool MemcacheResponse::PopStore(uint8_t command, uint64_t* cas_value) {
     LOG_IF(ERROR, header.key_length != 0) << "STORE response must not have key";
     int value_size = (int)header.total_body_length - (int)header.extras_length
         - (int)header.key_length;
+    if (value_size < 0) {
+        // extras_length + key_length overrun the declared body. Drop exactly the
+        // declared message so that following pipelined responses stay aligned.
+        _buf.pop_front(sizeof(header) + header.total_body_length);
+        butil::string_printf(&_err, "value_size=%d is negative", value_size);
+        return false;
+    }
     if (header.status != (uint16_t)STATUS_SUCCESS) {
         _buf.pop_front(sizeof(header) + header.extras_length + header.key_length);
         _err.clear();

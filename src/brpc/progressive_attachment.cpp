@@ -1,19 +1,20 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include "butil/logging.h"
 #include "bthread/bthread.h"   // INVALID_BTHREAD_ID before bthread r32748
@@ -149,7 +150,7 @@ int ProgressiveAttachment::Write(const butil::IOBuf& data) {
 }
 
 int ProgressiveAttachment::Write(const void* data, size_t n) {
-    if (data == NULL || n == 0) {
+    if (data == nullptr || n == 0) {
         LOG_EVERY_SECOND(WARNING)
             << "Write an empty chunk. To suppress this warning, check emptiness"
             " of the chunk before calling ProgressiveAttachment.Write()";
@@ -238,7 +239,7 @@ static int RunOnFailed(bthread_id_t id, void* data, int) {
 }
 
 void ProgressiveAttachment::NotifyOnStopped(google::protobuf::Closure* done) {
-    if (done == NULL) {
+    if (done == nullptr) {
         LOG(ERROR) << "Param[done] is NULL";
         return;
     }
@@ -246,7 +247,7 @@ void ProgressiveAttachment::NotifyOnStopped(google::protobuf::Closure* done) {
         LOG(ERROR) << "NotifyOnStopped() can only be called once";
         return done->Run();
     }
-    if (_httpsock == NULL) {
+    if (_httpsock == nullptr) {
         return done->Run();
     }
     const int rc = bthread_id_create(&_notify_id, done, RunOnFailed);

@@ -1,25 +1,30 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Thu Jul 30 17:44:54 CST 2015
 
 #include <unistd.h>                        // getpagesize
 #include <sys/types.h>
 #include <sys/resource.h>                  // getrusage
+#include <sys/utsname.h>                   // uname
 #include <dirent.h>                        // dirent
 #include <iomanip>                         // setw
+#include <stdio.h>
+#include <errno.h>
 #if defined(__APPLE__)
 #include <libproc.h>
 #include <sys/resource.h>
@@ -35,6 +40,7 @@
 #include "butil/process_util.h"            // ReadCommandLine
 #include "butil/popen.h"                   // read_command_output
 #include "bvar/passive_status.h"
+#include "bvar/default_variables.h"          // make_kernel_version_string
 
 namespace bvar {
 
@@ -76,8 +82,13 @@ static bool read_proc_status(ProcStat &stat) {
     // Read status from /proc/self/stat. Information from `man proc' is out of date,
     // see http://man7.org/linux/man-pages/man5/proc.5.html
     butil::ScopedFILE fp("/proc/self/stat", "r");
-    if (NULL == fp) {
-        PLOG_ONCE(WARNING) << "Fail to open /proc/self/stat";
+    if (nullptr == fp) {
+        static bool ever_printed_stat_err = false;
+        if (!ever_printed_stat_err) {
+            fprintf(stderr, "WARNING: Fail to open /proc/self/stat, errno=%d. "
+                            "Process status related bvars will be unavailable.\n", errno);
+            ever_printed_stat_err = true;
+        }
         return false;
     }
     if (fscanf(fp, "%d %*s %c "
@@ -90,7 +101,8 @@ static bool read_proc_status(ProcStat &stat) {
                &stat.flags, &stat.minflt, &stat.cminflt, &stat.majflt,
                &stat.cmajflt, &stat.utime, &stat.stime, &stat.cutime, &stat.cstime,
                &stat.priority, &stat.nice, &stat.num_threads) != 19) {
-        PLOG(WARNING) << "Fail to fscanf";
+        fprintf(stderr, "WARNING: Fail to fscanf /proc/self/stat, errno=%d. "
+                        "Process status related bvars will be unavailable.\n", errno);
         return false;
     }
     return true;
@@ -105,7 +117,7 @@ static bool read_proc_status(ProcStat &stat) {
             ",tpgid,flags,pri,nice | tail -n1", (long)pid);
     if (butil::read_command_output(oss, cmdbuf) != 0) {
         LOG(ERROR) << "Fail to read stat";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "%d %d %d %d"
@@ -125,8 +137,8 @@ static bool read_proc_status(ProcStat &stat) {
 template <typename T>
 class CachedReader {
 public:
-    CachedReader() : _mtime_us(0) {
-        CHECK_EQ(0, pthread_mutex_init(&_mutex, NULL));
+    CachedReader() : _mtime_us(0), _cached{} {
+        CHECK_EQ(0, pthread_mutex_init(&_mutex, nullptr));
     }
     ~CachedReader() {
         pthread_mutex_destroy(&_mutex);
@@ -140,7 +152,7 @@ public:
     template <typename ReadFn>
     static const T& get_value(const ReadFn& fn) {
         CachedReader* p = butil::get_leaky_singleton<CachedReader>();
-        const int64_t now = butil::gettimeofday_us();
+        const int64_t now = butil::cpuwide_time_us();
         if (now > p->_mtime_us + CACHED_INTERVAL_US) {
             pthread_mutex_lock(&p->_mutex);
             if (now > p->_mtime_us + CACHED_INTERVAL_US) {
@@ -148,7 +160,7 @@ public:
                 pthread_mutex_unlock(&p->_mutex);
                 // don't run fn inside lock otherwise a slow fn may
                 // block all concurrent bvar dumppers. (e.g. /vars)
-                T result;
+                T result{};
                 if (fn(&result)) {
                     pthread_mutex_lock(&p->_mutex);
                     p->_cached = result;
@@ -182,13 +194,13 @@ public:
 #define BVAR_DEFINE_PROC_STAT_FIELD(field)                              \
     PassiveStatus<BVAR_MEMBER_TYPE(&ProcStat::field)> g_##field(        \
         ProcStatReader::get_field<BVAR_MEMBER_TYPE(&ProcStat::field),   \
-        offsetof(ProcStat, field)>, NULL);
+        offsetof(ProcStat, field)>, nullptr);
 
 #define BVAR_DEFINE_PROC_STAT_FIELD2(field, name)                       \
     PassiveStatus<BVAR_MEMBER_TYPE(&ProcStat::field)> g_##field(        \
         name,                                                           \
         ProcStatReader::get_field<BVAR_MEMBER_TYPE(&ProcStat::field),   \
-        offsetof(ProcStat, field)>, NULL);
+        offsetof(ProcStat, field)>, nullptr);
 
 // ==================================================
 
@@ -207,7 +219,7 @@ static bool read_proc_memory(ProcMemory &m) {
     errno = 0;
 #if defined(OS_LINUX)
     butil::ScopedFILE fp("/proc/self/statm", "r");
-    if (NULL == fp) {
+    if (nullptr == fp) {
         PLOG_ONCE(WARNING) << "Fail to open /proc/self/statm";
         return false;
     }
@@ -228,7 +240,7 @@ static bool read_proc_memory(ProcMemory &m) {
     snprintf(cmdbuf, sizeof(cmdbuf), "ps -p %ld -o rss=,vsz=", (long)pid);
     if (butil::read_command_output(oss, cmdbuf) != 0) {
         LOG(ERROR) << "Fail to read memory state";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "%ld %ld", &m.resident, &m.size) != 2) {
@@ -261,7 +273,7 @@ public:
     PassiveStatus<BVAR_MEMBER_TYPE(&ProcMemory::field)> g_##field(      \
         name,                                                           \
         ProcMemoryReader::get_field<BVAR_MEMBER_TYPE(&ProcMemory::field), \
-        offsetof(ProcMemory, field)>, NULL);
+        offsetof(ProcMemory, field)>, nullptr);
 
 // ==================================================
 
@@ -274,7 +286,7 @@ struct LoadAverage {
 static bool read_load_average(LoadAverage &m) {
 #if defined(OS_LINUX)
     butil::ScopedFILE fp("/proc/loadavg", "r");
-    if (NULL == fp) {
+    if (nullptr == fp) {
         PLOG_ONCE(WARNING) << "Fail to open /proc/loadavg";
         return false;
     }
@@ -290,7 +302,7 @@ static bool read_load_average(LoadAverage &m) {
     std::ostringstream oss;
     if (butil::read_command_output(oss, "sysctl -n vm.loadavg") != 0) {
         LOG(ERROR) << "Fail to read loadavg";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "{ %lf %lf %lf }",
@@ -321,7 +333,7 @@ public:
     PassiveStatus<BVAR_MEMBER_TYPE(&LoadAverage::field)> g_##field(     \
         name,                                                           \
         LoadAverageReader::get_field<BVAR_MEMBER_TYPE(&LoadAverage::field), \
-        offsetof(LoadAverage, field)>, NULL);
+        offsetof(LoadAverage, field)>, nullptr);
 
 // ==================================================
 
@@ -427,8 +439,13 @@ struct ProcIO {
 static bool read_proc_io(ProcIO* s) {
 #if defined(OS_LINUX)
     butil::ScopedFILE fp("/proc/self/io", "r");
-    if (NULL == fp) {
-        PLOG_ONCE(WARNING) << "Fail to open /proc/self/io";
+    if (nullptr == fp) {
+        static bool ever_printed_io_err = false;
+        if (!ever_printed_io_err) {
+            fprintf(stderr, "WARNING: Fail to open /proc/self/io, errno=%d. "
+                            "I/O related bvars will be unavailable.\n", errno);
+            ever_printed_io_err = true;
+        }
         return false;
     }
     errno = 0;
@@ -473,7 +490,7 @@ public:
 #define BVAR_DEFINE_PROC_IO_FIELD(field)                                \
     PassiveStatus<BVAR_MEMBER_TYPE(&ProcIO::field)> g_##field(          \
         ProcIOReader::get_field<BVAR_MEMBER_TYPE(&ProcIO::field),       \
-        offsetof(ProcIO, field)>, NULL);
+        offsetof(ProcIO, field)>, nullptr);
 
 // ==================================================
 // Refs:
@@ -535,7 +552,7 @@ struct DiskStat {
 static bool read_disk_stat(DiskStat* s) {
 #if defined(OS_LINUX)
     butil::ScopedFILE fp("/proc/diskstats", "r");
-    if (NULL == fp) {
+    if (nullptr == fp) {
         PLOG_ONCE(WARNING) << "Fail to open /proc/diskstats";
         return false;
     }
@@ -583,7 +600,7 @@ public:
 #define BVAR_DEFINE_DISK_STAT_FIELD(field)                              \
     PassiveStatus<BVAR_MEMBER_TYPE(&DiskStat::field)> g_##field(        \
         DiskStatReader::get_field<BVAR_MEMBER_TYPE(&DiskStat::field),   \
-        offsetof(DiskStat, field)>, NULL);
+        offsetof(DiskStat, field)>, nullptr);
 
 // =====================================
 
@@ -602,12 +619,14 @@ static void get_cmdline(std::ostream& os, void*) {
 struct ReadVersion {
     std::string content;
     ReadVersion() {
-        std::ostringstream oss;
-        if (butil::read_command_output(oss, "uname -ap") != 0) {
-            LOG(ERROR) << "Fail to read kernel version";
+        struct utsname buf;
+        if (uname(&buf) != 0) {
+            const int saved_errno = errno;
+            LOG(ERROR) << "Failed to read kernel version, errno=" << saved_errno
+                        << " (" << berror(saved_errno) << ")";
             return;
         }
-        content.append(oss.str());
+        content.append(make_kernel_version_string(buf));
     }
 };
 static void get_kernel_version(std::ostream& os, void*) {
@@ -616,10 +635,10 @@ static void get_kernel_version(std::ostream& os, void*) {
 
 // ======================================
 
-static int64_t g_starting_time = butil::gettimeofday_us();
+static int64_t g_starting_time = butil::cpuwide_time_us();
 
 static timeval get_uptime(void*) {
-    int64_t uptime_us = butil::gettimeofday_us() - g_starting_time;
+    int64_t uptime_us = butil::cpuwide_time_us() - g_starting_time;
     timeval tm;
     tm.tv_sec = uptime_us / 1000000L;
     tm.tv_usec = uptime_us - tm.tv_sec * 1000000L;
@@ -648,13 +667,13 @@ public:
 #define BVAR_DEFINE_RUSAGE_FIELD(field)                                 \
     PassiveStatus<BVAR_MEMBER_TYPE(&rusage::field)> g_##field(          \
         RUsageReader::get_field<BVAR_MEMBER_TYPE(&rusage::field),       \
-        offsetof(rusage, field)>, NULL);                                \
+        offsetof(rusage, field)>, nullptr);                                \
     
 #define BVAR_DEFINE_RUSAGE_FIELD2(field, name)                          \
     PassiveStatus<BVAR_MEMBER_TYPE(&rusage::field)> g_##field(          \
         name,                                                           \
         RUsageReader::get_field<BVAR_MEMBER_TYPE(&rusage::field),       \
-        offsetof(rusage, field)>, NULL);                                \
+        offsetof(rusage, field)>, nullptr);                                \
 
 // ======================================
 
@@ -673,7 +692,7 @@ static void get_username(std::ostream& os, void*) {
 }
 
 PassiveStatus<std::string> g_username(
-    "process_username", get_username, NULL);
+    "process_username", get_username, nullptr);
 
 BVAR_DEFINE_PROC_STAT_FIELD(minflt);
 PerSecond<PassiveStatus<unsigned long> > g_minflt_second(
@@ -684,7 +703,7 @@ BVAR_DEFINE_PROC_STAT_FIELD2(priority, "process_priority");
 BVAR_DEFINE_PROC_STAT_FIELD2(nice, "process_nice");
 
 BVAR_DEFINE_PROC_STAT_FIELD2(num_threads, "process_thread_count");
-PassiveStatus<int> g_fd_num("process_fd_count", print_fd_count, NULL);
+PassiveStatus<int> g_fd_num("process_fd_count", print_fd_count, nullptr);
 
 BVAR_DEFINE_PROC_MEMORY_FIELD(size, "process_memory_virtual");
 BVAR_DEFINE_PROC_MEMORY_FIELD(resident, "process_memory_resident");
@@ -719,12 +738,12 @@ PerSecond<PassiveStatus<size_t> > g_disk_write_second(
 
 BVAR_DEFINE_RUSAGE_FIELD(ru_utime);
 BVAR_DEFINE_RUSAGE_FIELD(ru_stime);
-PassiveStatus<timeval> g_uptime("process_uptime", get_uptime, NULL);
+PassiveStatus<timeval> g_uptime("process_uptime", get_uptime, nullptr);
 
 static int get_core_num(void*) {
     return sysconf(_SC_NPROCESSORS_ONLN);
 }
-PassiveStatus<int> g_core_num("system_core_count", get_core_num, NULL);
+PassiveStatus<int> g_core_num("system_core_count", get_core_num, nullptr);
 
 struct TimePercent {
     int64_t time_us;
@@ -754,7 +773,7 @@ static TimePercent get_cputime_percent(void*) {
                        butil::timeval_to_microseconds(g_uptime.get_value()) };
     return tp;
 }
-PassiveStatus<TimePercent> g_cputime_percent(get_cputime_percent, NULL);
+PassiveStatus<TimePercent> g_cputime_percent(get_cputime_percent, nullptr);
 Window<PassiveStatus<TimePercent>, SERIES_IN_SECOND> g_cputime_percent_second(
     "process_cpu_usage", &g_cputime_percent, FLAGS_bvar_dump_interval);
 
@@ -763,7 +782,7 @@ static TimePercent get_stime_percent(void*) {
                        butil::timeval_to_microseconds(g_uptime.get_value()) };
     return tp;
 }
-PassiveStatus<TimePercent> g_stime_percent(get_stime_percent, NULL);
+PassiveStatus<TimePercent> g_stime_percent(get_stime_percent, nullptr);
 Window<PassiveStatus<TimePercent>, SERIES_IN_SECOND> g_stime_percent_second(
     "process_cpu_usage_system", &g_stime_percent, FLAGS_bvar_dump_interval);
 
@@ -772,7 +791,7 @@ static TimePercent get_utime_percent(void*) {
                        butil::timeval_to_microseconds(g_uptime.get_value()) };
     return tp;
 }
-PassiveStatus<TimePercent> g_utime_percent(get_utime_percent, NULL);
+PassiveStatus<TimePercent> g_utime_percent(get_utime_percent, nullptr);
 Window<PassiveStatus<TimePercent>, SERIES_IN_SECOND> g_utime_percent_second(
     "process_cpu_usage_user", &g_utime_percent, FLAGS_bvar_dump_interval);
 
@@ -796,11 +815,11 @@ PerSecond<PassiveStatus<long> > cs_vol_second(
 PerSecond<PassiveStatus<long> > cs_invol_second(
     "process_context_switches_involuntary_second", &g_ru_nivcsw);
 
-PassiveStatus<std::string> g_cmdline("process_cmdline", get_cmdline, NULL);
+PassiveStatus<std::string> g_cmdline("process_cmdline", get_cmdline, nullptr);
 PassiveStatus<std::string> g_kernel_version(
-    "kernel_version", get_kernel_version, NULL);
+    "kernel_version", get_kernel_version, nullptr);
 
-static std::string* s_gcc_version = NULL;
+static std::string* s_gcc_version = nullptr;
 pthread_once_t g_gen_gcc_version_once = PTHREAD_ONCE_INIT;
 
 void gen_gcc_version() {
@@ -851,7 +870,7 @@ void get_gcc_version(std::ostream& os, void*) {
 }
 
 // =============================================
-PassiveStatus<std::string> g_gcc_version("gcc_version", get_gcc_version, NULL);
+PassiveStatus<std::string> g_gcc_version("gcc_version", get_gcc_version, nullptr);
 
 void get_work_dir(std::ostream& os, void*) {
     butil::FilePath path;
@@ -859,7 +878,7 @@ void get_work_dir(std::ostream& os, void*) {
     LOG_IF(WARNING, !rc) << "Fail to GetCurrentDirectory";
     os << path.value();
 }
-PassiveStatus<std::string> g_work_dir("process_work_dir", get_work_dir, NULL);
+PassiveStatus<std::string> g_work_dir("process_work_dir", get_work_dir, nullptr);
 
 #undef BVAR_MEMBER_TYPE
 #undef BVAR_DEFINE_PROC_STAT_FIELD

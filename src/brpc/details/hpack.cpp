@@ -1,18 +1,20 @@
-// Copyright (c) 2017 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include "brpc/details/hpack.h"
 
@@ -36,7 +38,7 @@ struct IndexTableOptions {
     IndexTableOptions()
         : max_size(0)
         , start_index(0)
-        , static_table(NULL)
+        , static_table(nullptr)
         , static_table_size(0)
         , need_indexes(false)
     {}
@@ -81,7 +83,7 @@ public:
 
     const Header* HeaderAt(int index) const {
         if (BAIDU_UNLIKELY(index < _start_index)) {
-            return NULL;
+            return nullptr;
         }
         return _header_queue.bottom(index - _start_index);
     };
@@ -175,8 +177,6 @@ public:
     }
 
     void ResetMaxSize(size_t new_max_size) {
-        LOG(INFO) << this << ".size=" << _size << " new_max_size=" << new_max_size
-                  << " max_size=" << _max_size;
         if (new_max_size > _max_size) {
             //LOG(ERROR) << "Invalid new_max_size=" << new_max_size;
             //return -1;
@@ -221,10 +221,22 @@ int IndexTable::Init(const IndexTableOptions& options) {
         num_headers = options.static_table_size;
         _max_size = UINT_MAX;
     } else {
-        num_headers = options.max_size / (32 + 2);
+        num_headers = options.max_size / (32 + 1);
         //                                     ^
-        // name and value both have at least one byte in.
+        // AddHeader() only requires a non-empty name; the value may be empty,
+        // so the smallest possible entry is name(1) + value(0) + 32 = 33 bytes
+        // (rfc7541 section 4.1). Sizing the queue for 34-byte entries under-
+        // provisions it and lets a peer sending many 33-byte entries fill the
+        // queue before eviction triggers, tripping CHECK(!full()) in AddHeader.
         _max_size = options.max_size;
+    }
+    // A dynamic table smaller than the 33-byte minimum entry (including the
+    // valid max_size == 0 case that disables it) yields num_headers == 0.
+    // malloc(0) may return NULL and make Init fail on some platforms, so keep
+    // at least one slot. No entry can actually be stored since entry_size >
+    // _max_size still holds in AddHeader().
+    if (num_headers == 0) {
+        num_headers = 1;
     }
     void *header_queue_storage = malloc(num_headers * sizeof(Header));
     if (!header_queue_storage) {
@@ -239,12 +251,10 @@ int IndexTable::Init(const IndexTableOptions& options) {
     _need_indexes = options.need_indexes;
     if (_need_indexes) {
         if (_name_index.init(num_headers * 2) != 0) {
-            LOG(ERROR) << "Fail to init _name_index";
-            return -1;
+            LOG(WARNING) << "Fail to init _name_index";
         }
         if (_header_index.init(num_headers * 2) != 0) {
-            LOG(ERROR) << "Fail to init _name_index";
-            return -1;
+            LOG(WARNING) << "Fail to init _name_index";
         }
     }
     if (options.static_table_size > 0) {
@@ -319,10 +329,10 @@ public:
 
     const HuffmanNode* node(NodeId id) const {
         if (id == 0u) {
-            return NULL;
+            return nullptr;
         }
         if (id > _node_memory.size()) {
-            return NULL;
+            return nullptr;
         }
         return &_node_memory[id - 1];
     }
@@ -386,7 +396,7 @@ public:
         _out->push_back(_partial_byte);
         _partial_byte = 0;
         _remain_bit = 0;
-        _out = NULL;
+        _out = nullptr;
         ++_out_bytes;
     }
 
@@ -487,8 +497,7 @@ inline void EncodeInteger(butil::IOBufAppender* out, uint8_t msb,
     value -= max_prefix_value;
     msb |= max_prefix_value;
     out->push_back(msb);
-    size_t out_bytes = 1;
-    for (; value >= 128; ++out_bytes) {
+    for (; value >= 128; ) {
         const uint8_t c = (value & 0x7f) | 0x80;
         value >>= 7;
         out->push_back(c);
@@ -497,8 +506,8 @@ inline void EncodeInteger(butil::IOBufAppender* out, uint8_t msb,
 }
 
 // Static variables
-static HuffmanTree* s_huffman_tree = NULL;
-static IndexTable* s_static_table = NULL;
+static HuffmanTree* s_huffman_tree = nullptr;
+static IndexTable* s_static_table = nullptr;
 static pthread_once_t s_create_once = PTHREAD_ONCE_INIT;
 
 static void CreateStaticTableOrDie() {
@@ -531,7 +540,7 @@ static const size_t MAX_HPACK_INTEGER = 10 * 1024 * 1024ul;
 
 inline ssize_t DecodeInteger(butil::IOBufBytesIterator& iter,
                              uint8_t prefix_size, uint32_t* value) {
-    if (iter == NULL) {
+    if (iter == nullptr) {
         return 0; // No enough data
     }
     uint8_t first_byte = *iter;
@@ -547,6 +556,17 @@ inline ssize_t DecodeInteger(butil::IOBufBytesIterator& iter,
     do {
         if (!iter) {
             return 0;
+        }
+        // A well-formed integer below MAX_HPACK_INTEGER fits in a few
+        // continuation octets. A run of 0x80 octets (continuation bit set,
+        // payload bits zero) leaves tmp unchanged, so the `tmp <
+        // MAX_HPACK_INTEGER` guard below never trips while m keeps growing;
+        // once m reaches 64 the `<< m` shift is undefined behavior. Refuse the
+        // over-long encoding before that happens.
+        if (m >= 32) {
+            LOG_EVERY_SECOND(ERROR) << "Over-long HPACK integer encoding, "
+                                       "continuation octets would overflow the shift";
+            return -1;
         }
         cur_byte = *iter;
         in_bytes++;
@@ -605,7 +625,7 @@ inline void EncodeString(butil::IOBufAppender* out, const std::string& s,
 }
 
 inline ssize_t DecodeString(butil::IOBufBytesIterator& iter, std::string* out) {
-    if (iter == NULL) {
+    if (iter == nullptr) {
         return 0;
     }
     const bool huffman = *iter & 0x80;
@@ -624,7 +644,7 @@ inline ssize_t DecodeString(butil::IOBufBytesIterator& iter, std::string* out) {
         return in_bytes;
     }
     HuffmanDecoder d(out, s_huffman_tree);
-    for (; iter != NULL && length; ++iter, --length) {
+    for (; iter != nullptr && length; ++iter, --length) {
         if (d.Decode(*iter) != 0) {
             return -1;
         }
@@ -636,25 +656,27 @@ inline ssize_t DecodeString(butil::IOBufBytesIterator& iter, std::string* out) {
 }
 
 HPacker::HPacker()
-    : _encode_table(NULL)
-    , _decode_table(NULL) {
+    : _encode_table(nullptr)
+    , _decode_table(nullptr)
+    , _max_table_size(0) {
     CreateStaticTableOnceOrDie();
 }
 
 HPacker::~HPacker() {
     if (_encode_table) {
         delete _encode_table;
-        _encode_table = NULL;
+        _encode_table = nullptr;
     }
     if (_decode_table) {
         delete _decode_table;
-        _decode_table = NULL;
+        _decode_table = nullptr;
     }
 }
 
 int HPacker::Init(size_t max_table_size) {
     CHECK(!_encode_table);
     CHECK(!_decode_table);
+    _max_table_size = max_table_size;
     IndexTableOptions encode_table_options;
     encode_table_options.max_size = max_table_size;
     encode_table_options.start_index = s_static_table->end_index();
@@ -742,7 +764,7 @@ inline ssize_t HPacker::DecodeWithKnownPrefix(
     }
     if (index != 0) {
         const Header* indexed_header = HeaderAt(index);
-        if (indexed_header == NULL) {
+        if (indexed_header == nullptr) {
             LOG(ERROR) << "No header at index=" << index;
             return -1;
         }
@@ -764,7 +786,9 @@ inline ssize_t HPacker::DecodeWithKnownPrefix(
 }
 
 ssize_t HPacker::Decode(butil::IOBufBytesIterator& iter, Header* h) {
-    if (iter == NULL) {
+    ssize_t skipped_bytes = 0;
+decode_next:
+    if (iter == nullptr) {
         return 0;
     }
     const uint8_t first_byte = *iter;
@@ -787,12 +811,12 @@ ssize_t HPacker::Decode(butil::IOBufBytesIterator& iter, Header* h) {
                 return index_bytes;
             }
             const Header* indexed_header = HeaderAt(index);
-            if (indexed_header == NULL) {
+            if (indexed_header == nullptr) {
                 LOG(ERROR) << "No header at index=" << index;
                 return -1;
             }
             *h = *indexed_header;
-            return index_bytes;
+            return skipped_bytes + index_bytes;
         }
         break;
     case 7:
@@ -807,7 +831,7 @@ ssize_t HPacker::Decode(butil::IOBufBytesIterator& iter, Header* h) {
                 return -1;
             }
             _decode_table->AddHeader(*h);
-            return bytes_consumed;
+            return skipped_bytes + bytes_consumed;
         }
         break;
     case 3:
@@ -820,22 +844,35 @@ ssize_t HPacker::Decode(butil::IOBufBytesIterator& iter, Header* h) {
             if (read_bytes <= 0) {
                 return read_bytes;
             }
-            if (max_size > H2Settings::DEFAULT_HEADER_TABLE_SIZE) {
+            if (max_size > _max_table_size) {
+                // RFC 7541 section 6.3: the new maximum size MUST be lower
+                // than or equal to the limit determined by the protocol using
+                // HPACK, i.e. the SETTINGS_HEADER_TABLE_SIZE this decoder
+                // advertised (what Init() was called with), not the protocol
+                // default. Growing past the Init-time size would also desync
+                // the fixed-capacity header queue from the byte accounting.
                 LOG(ERROR) << "Invalid max_size=" << max_size;
                 return -1;
             }
             _decode_table->ResetMaxSize(max_size);
-            return Decode(iter, h);
+            skipped_bytes += read_bytes;
+            goto decode_next;
         }
     case 1:
         // (0001) Literal Header Field Never Indexed
         // https://tools.ietf.org/html/rfc7541#section-6.2.3
-        return DecodeWithKnownPrefix(iter, h, 4);
+        {
+            const ssize_t bytes_consumed = DecodeWithKnownPrefix(iter, h, 4);
+            return bytes_consumed > 0 ? skipped_bytes + bytes_consumed : bytes_consumed;
+        }
         // TODO: Expose NeverIndex to the caller.
     case 0:
         // (0000) Literal Header Field without Indexing
         // https://tools.ietf.org/html/rfc7541#section-6.2.1
-        return DecodeWithKnownPrefix(iter, h, 4);
+        {
+            const ssize_t bytes_consumed = DecodeWithKnownPrefix(iter, h, 4);
+            return bytes_consumed > 0 ? skipped_bytes + bytes_consumed : bytes_consumed;
+        }
         // TODO: Expose NeverIndex to the caller.
     default:
         CHECK(false) << "Can't reach here";

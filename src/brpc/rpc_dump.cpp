@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <gflags/gflags.h>
 #include <fcntl.h>                    // O_CREAT
@@ -30,7 +32,6 @@
 namespace bvar {
 std::string read_command_name();
 }
-
 
 namespace brpc {
 
@@ -115,7 +116,7 @@ private:
 };
 
 bvar::CollectorSpeedLimit g_rpc_dump_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
-static RpcDumpContext* g_rpc_dump_ctx = NULL;
+static RpcDumpContext* g_rpc_dump_ctx = nullptr;
 
 void SampledRequest::dump_and_destroy(size_t round) {
     static bvar::DisplaySamplingRatio sampling_ratio_var(
@@ -123,7 +124,7 @@ void SampledRequest::dump_and_destroy(size_t round) {
     
     // Safe to modify g_rpc_dump_ctx w/o locking.
     RpcDumpContext* rpc_dump_ctx = g_rpc_dump_ctx;
-    if (rpc_dump_ctx == NULL) {
+    if (rpc_dump_ctx == nullptr) {
         rpc_dump_ctx = new RpcDumpContext;
         g_rpc_dump_ctx = rpc_dump_ctx;
     }
@@ -138,7 +139,7 @@ void SampledRequest::destroy() {
 // Save gflags which could be reloaded at anytime.
 void RpcDumpContext::SaveFlags() {
     std::string dir;
-    CHECK(GFLAGS_NS::GetCommandLineOption("rpc_dump_dir", &dir));
+    CHECK(GFLAGS_NAMESPACE::GetCommandLineOption("rpc_dump_dir", &dir));
     
     const size_t pos = dir.find("<app>");
     if (pos != std::string::npos) {
@@ -240,15 +241,14 @@ bool RpcDumpContext::Serialize(butil::IOBuf& buf, SampledRequest* sample) {
     
     const size_t starting_size = buf.size();
     butil::IOBufAsZeroCopyOutputStream buf_stream(&buf);
-    if (!sample->SerializeToZeroCopyStream(&buf_stream)) {
+    if (!sample->meta.SerializeToZeroCopyStream(&buf_stream)) {
         LOG(ERROR) << "Fail to serialize";
         return false;
     }
     const size_t meta_size = buf.size() - starting_size;
     buf.append(sample->request);
 
-    // dummy supresses strict-aliasing warning.
-    uint32_t* dummy = (uint32_t*)rpc_header;
+    uint32_t* dummy = (uint32_t*)rpc_header;  // suppress strict-alias warning
     *dummy = *(uint32_t*)"PRPC";
     butil::RawPacker(rpc_header + 4)
         .pack32(meta_size + sample->request.size())
@@ -259,7 +259,7 @@ bool RpcDumpContext::Serialize(butil::IOBuf& buf, SampledRequest* sample) {
 
 SampleIterator::SampleIterator(const butil::StringPiece& dir)
     : _cur_fd(-1)
-    , _enum(NULL)
+    , _enum(nullptr)
     , _dir(std::string(dir.data(), dir.size())) {
 }
 
@@ -269,7 +269,7 @@ SampleIterator::~SampleIterator() {
         _cur_fd = -1;
     }
     delete _enum;
-    _enum = NULL;
+    _enum = nullptr;
 }
 
 SampledRequest* SampleIterator::Next() {
@@ -307,13 +307,13 @@ SampledRequest* SampleIterator::Next() {
             _cur_fd = -1;
         }
         
-        if (_enum == NULL) {
+        if (_enum == nullptr) {
             _enum = new butil::FileEnumerator(
                 _dir, false, butil::FileEnumerator::FILES);
         }
         butil::FilePath filename = _enum->Next();
         if (filename.empty()) {
-            return NULL;
+            return nullptr;
         }
         _cur_fd = open(filename.value().c_str(), O_RDONLY);
     }
@@ -322,13 +322,13 @@ SampledRequest* SampleIterator::Next() {
 SampledRequest* SampleIterator::Pop(butil::IOBuf& buf, bool* format_error) {
     char backing_buf[12];
     const char* p = (const char*)buf.fetch(backing_buf, sizeof(backing_buf));
-    if (NULL == p) {  // buf.length() < sizeof(backing_buf)
-        return NULL;
+    if (nullptr == p) {  // buf.length() < sizeof(backing_buf)
+        return nullptr;
     }
     if (*(const uint32_t*)p != *(const uint32_t*)"PRPC") {
         LOG(ERROR) << "Unmatched magic string";
         *format_error = true;
-        return NULL;
+        return nullptr;
     }
     uint32_t body_size;
     uint32_t meta_size;
@@ -336,24 +336,24 @@ SampledRequest* SampleIterator::Pop(butil::IOBuf& buf, bool* format_error) {
     if (body_size > FLAGS_max_body_size) {
         LOG(ERROR) << "Too big body=" << body_size;
         *format_error = true;
-        return NULL;
+        return nullptr;
     } else if (buf.length() < sizeof(backing_buf) + body_size) {
-        return NULL;
+        return nullptr;
     }
     if (meta_size > body_size) {
         LOG(ERROR) << "meta_size=" << meta_size << " is bigger than body_size="
                    << body_size;
         *format_error = true;
-        return NULL;
+        return nullptr;
     }
     buf.pop_front(sizeof(backing_buf));
     butil::IOBuf meta_buf;
     buf.cutn(&meta_buf, meta_size);
     std::unique_ptr<SampledRequest> req(new SampledRequest);
-    if (!ParsePbFromIOBuf(req.get(), meta_buf)) {
+    if (!ParsePbFromIOBuf(&req->meta, meta_buf)) {
         LOG(ERROR) << "Fail to parse RpcDumpMeta";
         *format_error = true;
-        return NULL;
+        return nullptr;
     }
     buf.cutn(&req->request, body_size - meta_size);
     return req.release();

@@ -1,6 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // protobuf-json: Conversions between protobuf and json.
-// Copyright (c) 2014 Baidu, Inc.
-// Date:  2014-10-29 18:30:33
 
 #ifndef BRPC_JSON2PB_PB_TO_JSON_H
 #define BRPC_JSON2PB_PB_TO_JSON_H
@@ -8,6 +23,7 @@
 #include <string>
 #include <google/protobuf/message.h>
 #include <google/protobuf/io/zero_copy_stream.h> // ZeroCopyOutputStream
+#include <google/protobuf/util/json_util.h>
 
 namespace json2pb {
 
@@ -49,28 +65,55 @@ struct Pb2JsonOptions {
     // int32 field set to 0 will be omitted. Set this flag to true will override
     // the default behavior and print primitive fields regardless of their values.
     bool always_print_primitive_fields;
+
+    // Convert the single repeated field to a json array when this option is turned on.
+    // Default: false.
+    bool single_repeated_to_array;
 };
 
 // Convert protobuf `messge' to `json' according to `options'.
-// Returns true on success. `error' (if not NULL) will be set with error
+// Returns true on success. `error' (if not nullptr) will be set with error
 // message on failure.
 bool ProtoMessageToJson(const google::protobuf::Message& message,
                         std::string* json,
                         const Pb2JsonOptions& options,
-                        std::string* error = NULL);
+                        std::string* error = nullptr);
 // send output to ZeroCopyOutputStream instead of std::string.
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *json,
+                        google::protobuf::io::ZeroCopyOutputStream* json,
                         const Pb2JsonOptions& options,
-                        std::string* error = NULL);
+                        std::string* error = nullptr);
 
 // Using default Pb2JsonOptions.
 bool ProtoMessageToJson(const google::protobuf::Message& message,
                         std::string* json,
-                        std::string* error = NULL);
+                        std::string* error = nullptr);
 bool ProtoMessageToJson(const google::protobuf::Message& message,
                         google::protobuf::io::ZeroCopyOutputStream* json,
-                        std::string* error = NULL);
+                        std::string* error = nullptr);
+
+// See <google/protobuf/util/json_util.h> for details.
+#if GOOGLE_PROTOBUF_VERSION >= 6030000
+using Pb2ProtoJsonOptions = google::protobuf::util::JsonPrintOptions;
+#else
+using Pb2ProtoJsonOptions = google::protobuf::util::JsonOptions;
+#endif
+
+#if GOOGLE_PROTOBUF_VERSION >= 5026002
+#define AlwaysPrintPrimitiveFields(options) options.always_print_fields_with_no_presence
+#else
+#define AlwaysPrintPrimitiveFields(options) options.always_print_primitive_fields
+#endif
+
+// Convert protobuf `messge' to `json' in ProtoJSON format according to `options'.
+// See https://protobuf.dev/programming-guides/json/ for details.
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message,
+                             google::protobuf::io::ZeroCopyOutputStream* json,
+                             const Pb2ProtoJsonOptions& options = Pb2ProtoJsonOptions(),
+                             std::string* error = nullptr);
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message, std::string* json,
+                             const Pb2ProtoJsonOptions& options = Pb2ProtoJsonOptions(),
+                             std::string* error = nullptr);
 } // namespace json2pb
 
 #endif // BRPC_JSON2PB_PB_TO_JSON_H

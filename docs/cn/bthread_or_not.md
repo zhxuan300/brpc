@@ -1,3 +1,5 @@
+[English version](../en/bthread_or_not.md)
+
 brpc提供了[异步接口](client.md#异步访问)，所以一个常见的问题是：我应该用异步接口还是bthread？
 
 短回答：延时不高时你应该先用简单易懂的同步接口，不行的话用异步接口，只有在需要多核并行计算时才用bthread。
@@ -36,11 +38,11 @@ brpc中的异步和单线程的异步是完全不同的，异步回调会运行�
 bool search() {
   ...
   bthread th1, th2;
-  if (bthread_start_background(&th1, NULL, part1, part1_args) != 0) {
+  if (bthread_start_background(&th1, nullptr, part1, part1_args) != 0) {
     LOG(ERROR) << "Fail to create bthread for part1";
     return false;
   }
-  if (bthread_start_background(&th2, NULL, part2, part2_args) != 0) {
+  if (bthread_start_background(&th2, nullptr, part2, part2_args) != 0) {
     LOG(ERROR) << "Fail to create bthread for part2";
     return false;
   }

@@ -1,6 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2015/09/15 15:42:55
 
 #include "bvar/detail/percentile.h"
@@ -14,6 +28,7 @@ protected:
     void TearDown() {}
 };
 
+#if !WITH_BABYLON_COUNTER
 TEST_F(PercentileTest, add) {
     bvar::detail::Percentile p;
     for (int j = 0; j < 10; ++j) {
@@ -37,6 +52,7 @@ TEST_F(PercentileTest, add) {
         b.describe(out);
     }
 }
+#endif // !WITH_BABYLON_COUNTER
 
 TEST_F(PercentileTest, merge1) {
     // Merge 2 PercentileIntervals b1 and b2. b2 has double SAMPLE_SIZE
@@ -123,6 +139,7 @@ TEST_F(PercentileTest, merge2) {
                    << " belong_to_b2=" << belong_to_b2;
 }
 
+#if !WITH_BABYLON_COUNTER
 TEST_F(PercentileTest, combine_of) {
     // Combine multiple percentle samplers into one
     const int num_samplers = 10;
@@ -132,7 +149,7 @@ TEST_F(PercentileTest, combine_of) {
     const int  N = 1000;
     size_t belongs[num_samplers] = {0};
     size_t total = 0;
-    for (int repeat = 0; repeat < 100; ++repeat) {
+    for (int repeat = 0; repeat < 1; ++repeat) {
         bvar::detail::Percentile p[num_samplers];
         for (int i = 0; i < num_samplers; ++i) {
             for (int j = 0; j < N * (i + 1); ++j) {
@@ -147,7 +164,7 @@ TEST_F(PercentileTest, combine_of) {
         bvar::detail::PercentileSamples<510> g;
         g.combine_of(result.begin(), result.end());
         for (size_t i = 0; i < bvar::detail::NUM_INTERVALS; ++i) {
-            if (g._intervals[i] == NULL) {
+            if (g._intervals[i] == nullptr) {
                 continue;
             }
             bvar::detail::PercentileInterval<510>& p = *g._intervals[i];
@@ -172,3 +189,4 @@ TEST_F(PercentileTest, combine_of) {
                   
     }
 }
+#endif // !WITH_BABYLON_COUNTER

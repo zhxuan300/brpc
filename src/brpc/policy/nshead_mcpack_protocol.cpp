@@ -1,25 +1,28 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
 #include <gflags/gflags.h>
 
-#include "butil/time.h"
 #include "butil/iobuf.h"                        // butil::IOBuf
+#include "butil/strings/string_util.h"
+#include "butil/time.h"
 
 #include "brpc/controller.h"               // Controller
 #include "brpc/socket.h"                   // Socket
@@ -47,7 +50,7 @@ void NsheadMcpackAdaptor::ParseNsheadMeta(
     const google::protobuf::ServiceDescriptor* sd = service->GetDescriptor();
     if (sd->method_count() == 0) {
         cntl->SetFailed(ENOMETHOD, "No method in service=%s",
-                        sd->full_name().c_str());
+                        butil::EnsureString(sd->full_name()).c_str());
         return;
     }
     const google::protobuf::MethodDescriptor* method = sd->method(0);
@@ -57,7 +60,7 @@ void NsheadMcpackAdaptor::ParseNsheadMeta(
 void NsheadMcpackAdaptor::ParseRequestFromIOBuf(
     const NsheadMeta&, const NsheadMessage& raw_req,
     Controller* cntl, google::protobuf::Message* pb_req) const {
-    const std::string& msg_name = pb_req->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(pb_req->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
     if (!handler.parse_from_iobuf(pb_req, raw_req.body)) {
         cntl->SetFailed(EREQUEST, "Fail to parse request message, "
@@ -79,12 +82,12 @@ void NsheadMcpackAdaptor::SerializeResponseToIOBuf(
         type = COMPRESS_TYPE_NONE;
     }
     
-    if (pb_res == NULL) {
+    if (pb_res == nullptr) {
         cntl->CloseConnection("response was not created yet");
         return;
     }
 
-    const std::string& msg_name = pb_res->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(pb_res->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
     if (!handler.serialize_to_iobuf(*pb_res, &raw_res->body,
                                    ::mcpack2pb::FORMAT_MCPACK_V2)) {
@@ -100,7 +103,7 @@ void ProcessNsheadMcpackResponse(InputMessageBase* msg_base) {
     
     // Fetch correlation id that we saved before in `PackNsheadMcpackRequest'
     const bthread_id_t cid = { static_cast<uint64_t>(socket->correlation_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -109,27 +112,29 @@ void ProcessNsheadMcpackResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size());
         span->set_start_parse_us(start_parse_us);
     }
     const int saved_error = cntl->ErrorCode();
-    google::protobuf::Message* res = cntl->response();
-    if (res == NULL) {
-        // silently ignore response.
-        return;
-    }
-    const std::string& msg_name = res->GetDescriptor()->full_name();
-    mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
-    if (!handler.parse_from_iobuf(res, msg->payload)) {
-        return cntl->CloseConnection("Fail to parse response message");
-    }
+    do {
+        google::protobuf::Message* res = cntl->response();
+        if (res == nullptr) {
+            // silently ignore response.
+            break;
+        }
+        const std::string msg_name = butil::EnsureString(res->GetDescriptor()->full_name());
+        mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
+        if (!handler.parse_from_iobuf(res, msg->payload)) {
+            cntl->CloseConnection("Fail to parse response message");
+            break;
+        }
+    } while (0);
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 } 
 
@@ -141,7 +146,7 @@ void SerializeNsheadMcpackRequest(butil::IOBuf* buf, Controller* cntl,
                         "nshead_mcpack protocol doesn't support compression");
         return;
     }
-    const std::string& msg_name = pb_req->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(pb_req->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
     if (!handler.serialize_to_iobuf(*pb_req, buf, ::mcpack2pb::FORMAT_MCPACK_V2)) {
         cntl->SetFailed(EREQUEST, "Fail to serialize %s", msg_name.c_str());

@@ -1,0 +1,75 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "brpc/policy/crc32c_checksum.h"
+
+#include "brpc/details/controller_private_accessor.h"
+#include "brpc/log.h"
+#include "butil/crc32c.h"
+#include "butil/sys_byteorder.h"
+
+namespace brpc {
+namespace policy {
+
+namespace {
+
+// Extends `crc' over every block of `buf'. Shared by Crc32cCompute and
+// Crc32cVerify to keep the byte range/order (`buf' then `attachment', see
+// ChecksumIn::attachment) identical on both call sites.
+uint32_t ExtendCrc32c(uint32_t crc, const butil::IOBuf& buf) {
+    butil::IOBufAsZeroCopyInputStream wrapper(buf);
+    const void* data;
+    int size;
+    while (wrapper.Next(&data, &size)) {
+        crc = butil::crc32c::Extend(crc, static_cast<const char*>(data), size);
+    }
+    return crc;
+}
+
+// Computes the crc32c over `in.buf', and over `in.attachment' as well when
+// the caller opted in (ChecksumIn::attachment != nullptr).
+uint32_t ComputeCrc32c(const ChecksumIn& in) {
+    uint32_t crc = ExtendCrc32c(0, *in.buf);
+    if (in.attachment != nullptr) {
+        crc = ExtendCrc32c(crc, *in.attachment);
+    }
+    return crc;
+}
+
+}  // namespace
+
+void Crc32cCompute(const ChecksumIn& in) {
+    uint32_t crc = ComputeCrc32c(in);
+    RPC_VLOG << "Crc32cCompute crc=" << crc;
+    crc = butil::HostToNet32(butil::crc32c::Mask(crc));
+    ControllerPrivateAccessor(in.cntl).set_checksum_value(
+        reinterpret_cast<char*>(&crc), sizeof(crc));
+}
+
+bool Crc32cVerify(const ChecksumIn& in) {
+    uint32_t crc = ComputeCrc32c(in);
+    auto& val = ControllerPrivateAccessor(const_cast<Controller*>(in.cntl))
+                    .checksum_value();
+    CHECK_EQ(val.size(), sizeof(crc));
+    auto expected = *reinterpret_cast<const uint32_t*>(val.data());
+    expected = butil::crc32c::Unmask(butil::NetToHost32(expected));
+    RPC_VLOG << "Crc32cVerify crc=" << crc << " expected=" << expected;
+    return crc == expected;
+}
+
+}  // namespace policy
+}  // namespace brpc

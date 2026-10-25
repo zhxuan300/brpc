@@ -17,9 +17,13 @@ We need a better abstraction. If several channels are combined into a larger one
 - Support cancellation.
 - Support timeout.
 
-Check [example/parallel_echo_c++](https://github.com/brpc/brpc/tree/master/example/parallel_echo_c++/) for an example.
+Check [example/parallel_echo_c++](https://github.com/apache/brpc/tree/master/example/parallel_echo_c++/) for an example.
 
-Any subclasses of `brpc::ChannelBase` can be added into `ParallelChannel`, including `ParallelChannel` and other combo channels. Set `ParallelChannelOptions.fail_limit` to control maximum number of failures. When number of failed responses reaches the limit, the RPC is ended immediately rather than waiting for timeout.
+Any subclasses of `brpc::ChannelBase` can be added into `ParallelChannel`, including `ParallelChannel` and other combo channels. 
+
+Set `ParallelChannelOptions.fail_limit` to control maximum number of failures. When number of failed responses reaches the limit, the RPC is ended immediately rather than waiting for timeout.
+
+Set `ParallelChannelOptions.sucess_limit` to control maximum number of successful responses. When number of successful responses reaches the limit, the RPC is ended immediately.`ParallelChannelOptions.fail_limit` has a higher priority than `ParallelChannelOptions.success_limit`. Success_limit will take effect only when fail_limit is not set.
 
 A sub channel can be added to the same `ParallelChannel` more than once, which is useful when you need to initiate multiple asynchronous RPC to the same service and wait for their completions.
 
@@ -44,7 +48,7 @@ Calling ` AddChannel` during a RPC over `ParallelChannel` is **NOT thread safe**
 
 ## CallMapper
 
-This class converts RPCs to `ParallelChannel`  to the ones to `sub channel`. If `call_mapper` is NULL, requests to the sub channel is just the ones to `ParallelChannel`, and responses are created by calling `New()` on the responses to `ParallelChannel`. `call_mapper` is deleted when `ParallelChannel` destructs. Due to the reference counting inside, one `call_mapper` can be associated with multiple sub channels.
+This class converts RPCs to `ParallelChannel`  to the ones to `sub channel`. If `call_mapper` is nullptr, requests to the sub channel is just the ones to `ParallelChannel`, and responses are created by calling `New()` on the responses to `ParallelChannel`. `call_mapper` is deleted when `ParallelChannel` destructs. Due to the reference counting inside, one `call_mapper` can be associated with multiple sub channels.
 
 ```c++
 class CallMapper {
@@ -52,13 +56,18 @@ public:
     virtual ~CallMapper();
  
     virtual SubCall Map(int channel_index/*starting from 0*/,
+                        int channel_count,
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) = 0;
 };
 ```
 
+### Map
+
 `channel_index`: The position of the sub channel inside `ParallelChannel`, starting from zero.
+
+`channel_count`: The sub channel count inside `ParallelChannel`.
 
 `method/request/response`: Parameters to `ParallelChannel::CallMethod()`.
 
@@ -69,7 +78,7 @@ The returned `SubCall` configures the calls to the corresponding sub channel and
 
 Common implementations of `Map()` are listed below:
 
-- Broadcast the request. This is also the behavior when `call_mapper` is NULL:
+- Broadcast the request. This is also the behavior when `call_mapper` is nullptr:
 
 ```c++
   class Broadcaster : public CallMapper {
@@ -124,9 +133,21 @@ Common implementations of `Map()` are listed below:
   };
 ```
 
+### MapController
+
+`channel_index`: The position of the sub channel inside `ParallelChannel`, starting from zero.
+
+`channel_count`: The sub channel count inside `ParallelChannel`.
+
+`main_cntl`：Parameters to `ParallelChannel::CallMethod()`.
+
+`sub_cntl`：The controller corresponding to the sub-channel's requests. Default implementation: Copy the http_request and request_attachment of `main_cntl` to the `sub_cntl`.
+
+Note: Modifying `ClientSettings` configurations (such as timeout and retries) is ineffective because all sub controllers use the `ClientSettings` configuration of `main_cntl`.
+
 ## ResponseMerger
 
-`response_merger` merges responses from all sub channels into one for the `ParallelChannel`. When it's NULL, `response->MergeFrom(*sub_response)` is used instead, whose behavior can be summarized as "merge repeated fields and overwrite the rest". If you need more complex behavior, implement `ResponseMerger`. Multiple `response_merger` are called one by one to merge sub responses so that you do not need to consider the race conditions between merging multiple responses simultaneously. The object is deleted when `ParallelChannel ` destructs. Due to the reference counting inside, `response_merger ` can be associated with multiple sub channels.
+`response_merger` merges responses from all sub channels into one for the `ParallelChannel`. When it's nullptr, `response->MergeFrom(*sub_response)` is used instead, whose behavior can be summarized as "merge repeated fields and overwrite the rest". If you need more complex behavior, implement `ResponseMerger`. Multiple `response_merger` are called one by one to merge sub responses so that you do not need to consider the race conditions between merging multiple responses simultaneously. The object is deleted when `ParallelChannel ` destructs. Due to the reference counting inside, `response_merger ` can be associated with multiple sub channels.
 
 Possible values of `Result` are:
 
@@ -141,13 +162,13 @@ Sometimes users may need to know the details around sub calls. `Controller.sub(i
 ```c++
 // Get the controllers for accessing sub channels in combo channels.
 // Ordinary channel:
-//   sub_count() is 0 and sub() is always NULL.
+//   sub_count() is 0 and sub() is always nullptr.
 // ParallelChannel/PartitionChannel:
 //   sub_count() is #sub-channels and sub(i) is the controller for
 //   accessing i-th sub channel inside ParallelChannel, if i is outside
-//    [0, sub_count() - 1], sub(i) is NULL.
-//   NOTE: You must test sub() against NULL, ALWAYS. Even if i is inside
-//   range, sub(i) can still be NULL:
+//    [0, sub_count() - 1], sub(i) is nullptr.
+//   NOTE: You must test sub() against nullptr, ALWAYS. Even if i is inside
+//   range, sub(i) can still be nullptr:
 //   * the rpc call may fail and terminate before accessing the sub channel
 //   * the sub channel was skipped
 // SelectiveChannel/DynamicPartitionChannel:
@@ -159,14 +180,14 @@ const Controller* sub(int index) const;
 
 # SelectiveChannel
 
-[SelectiveChannel](https://github.com/brpc/brpc/blob/master/src/brpc/selective_channel.h) (referred to as "schan" sometimes) accesses one of the internal sub channels with a load balancing algorithm. It's more high-level compared to ordinary channels: The requests are sent to sub channels instead of servers directly. `SelectiveChannel` is mainly for load balancing between groups of machines and shares basic properties of `Channel`:
+[SelectiveChannel](https://github.com/apache/brpc/blob/master/src/brpc/selective_channel.h) (referred to as "schan" sometimes) accesses one of the internal sub channels with a load balancing algorithm. It's more high-level compared to ordinary channels: The requests are sent to sub channels instead of servers directly. `SelectiveChannel` is mainly for load balancing between groups of machines and shares basic properties of `Channel`:
 
 - Support synchronous and asynchronous accesses.
 - Can be destroyed immediately after initiating an asynchronous operation.
 - Support cancellation.
 - Support timeout.
 
-Check [example/selective_echo_c++](https://github.com/brpc/brpc/tree/master/example/selective_echo_c++/) for an example.
+Check [example/selective_echo_c++](https://github.com/apache/brpc/tree/master/example/selective_echo_c++/) for an example.
 
 Any subclasses of `brpc::ChannelBase` can be added into `SelectiveChannel`, including `SelectiveChannel` and other combo channels. 
 
@@ -196,8 +217,8 @@ After successful initialization, add sub channels with `AddChannel`.
 
 ```c++
 // The second parameter ChannelHandle is used to delete sub channel,
-// which can be NULL if this isn't necessary.
-if (schan.AddChannel(sub_channel, NULL/*ChannelHandle*/) != 0) { 
+// which can be nullptr if this isn't necessary.
+if (schan.AddChannel(sub_channel, nullptr/*ChannelHandle*/) != 0) { 
     LOG(ERROR) << "Fail to add sub_channel";
     return -1;
 }
@@ -207,7 +228,7 @@ Note that:
 
 - Unlike `ParallelChannel`, `SelectiveChannel::AddChannel` can be called at any time, even if a RPC over the SelectiveChannel is going on. (newly added channels take effects at the next RPC).
 - `SelectiveChannel` always owns sub channels, which is different from `ParallelChannel`'s configurable ownership.
-- If the second parameter to `AddChannel` is not NULL, it's filled with a value typed `brpc::SelectiveChannel::ChannelHandle`, which can be used as the parameter to `RemoveAndDestroyChannel` to remove and destroy a channel dynamically.
+- If the second parameter to `AddChannel` is not nullptr, it's filled with a value typed `brpc::SelectiveChannel::ChannelHandle`, which can be used as the parameter to `RemoveAndDestroyChannel` to remove and destroy a channel dynamically.
 - `SelectiveChannel` overrides timeouts in sub channels. For example, having timeout set to 100ms for a sub channel and 500ms for `SelectiveChannel`, the actual timeout is 500ms.
 
 `SelectiveChannel`s are accessed same as regular channels.
@@ -235,26 +256,26 @@ if (channel.Init("c_murmurhash", &schan_options) != 0) {
  
 for (int i = 0; i < 3; ++i) {
     brpc::Channel* sub_channel = new brpc::Channel;
-    if (sub_channel->Init(ns_node_name[i], "rr", NULL) != 0) {
+    if (sub_channel->Init(ns_node_name[i], "rr", nullptr) != 0) {
         LOG(ERROR) << "Fail to init sub channel " << i;
         return -1;
     }
-    if (channel.AddChannel(sub_channel, NULL/*handle for removal*/) != 0) {
+    if (channel.AddChannel(sub_channel, nullptr/*handle for removal*/) != 0) {
         LOG(ERROR) << "Fail to add sub_channel to channel";
         return -1;
     } 
 }
 ...
 XXXService_Stub stub(&channel);
-stub.FooMethod(&cntl, &request, &response, NULL);
+stub.FooMethod(&cntl, &request, &response, nullptr);
 ...
 ```
 
 # PartitionChannel
 
-[PartitionChannel](https://github.com/brpc/brpc/blob/master/src/brpc/partition_channel.h) is a specialized `ParallelChannel` to add sub channels automatically based on tags defined in the naming service. As a result, users can list all machines in one naming service and partition them by tags. Check [example/partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/partition_echo_c++/) for an example.
+[PartitionChannel](https://github.com/apache/brpc/blob/master/src/brpc/partition_channel.h) is a specialized `ParallelChannel` to add sub channels automatically based on tags defined in the naming service. As a result, users can list all machines in one naming service and partition them by tags. Check [example/partition_echo_c++](https://github.com/apache/brpc/tree/master/example/partition_echo_c++/) for an example.
 
-`ParititonChannel` only supports one kind to partitioning method. When multiple methods need to coexist, or one method needs to be changed to another smoothly, try `DynamicPartitionChannel`, which creates corresponding sub `PartitionChannel` for different partitioning methods, and divide traffic to partitions according to capacities of servers. Check [example/dynamic_partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/dynamic_partition_echo_c++/) for an example.
+`ParititonChannel` only supports one kind to partitioning method. When multiple methods need to coexist, or one method needs to be changed to another smoothly, try `DynamicPartitionChannel`, which creates corresponding sub `PartitionChannel` for different partitioning methods, and divide traffic to partitions according to capacities of servers. Check [example/dynamic_partition_echo_c++](https://github.com/apache/brpc/tree/master/example/dynamic_partition_echo_c++/) for an example.
 
 If partitions are listed in different naming services, users have to implement the partitioning by `ParallelChannel` and include sub channels to corresponding naming services respectively. Refer to [the previous section](#ParallelChannel) for usages of `ParellelChannel`.
 
@@ -274,7 +295,7 @@ public:
             LOG(ERROR) << "Invalid tag=" << tag;
             return false;
         }
-        char* endptr = NULL;
+        char* endptr = nullptr;
         out->index = strtol(tag.c_str(), &endptr, 10);
         if (endptr != tag.data() + pos) {
             LOG(ERROR) << "Invalid index=" << butil::StringPiece(tag.data(), pos);

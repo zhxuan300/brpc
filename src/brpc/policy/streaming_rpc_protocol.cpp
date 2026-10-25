@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include "brpc/policy/streaming_rpc_protocol.h"
 
@@ -25,6 +27,7 @@
 #include "butil/iobuf.h"                         // butil::IOBuf
 #include "butil/raw_pack.h"                      // RawPacker RawUnpacker
 #include "brpc/log.h"
+#include "brpc/server.h"
 #include "brpc/socket.h"                        // Socket
 #include "brpc/streaming_rpc_meta.pb.h"         // StreamFrameMeta
 #include "brpc/policy/most_common_message.h"
@@ -41,10 +44,9 @@ void PackStreamMessage(butil::IOBuf* out,
                        const StreamFrameMeta &fm,
                        const butil::IOBuf *data) {
     const uint32_t data_length = data ? data->length() : 0;
-    const uint32_t meta_length = fm.ByteSize();
+    const uint32_t meta_length = GetProtobufByteSize(fm);
     char head[12];
-    // dummy supresses strict-aliasing warning.
-    uint32_t* dummy = (uint32_t*)head;
+    uint32_t* dummy = (uint32_t*)head;  // suppresses strict-alias warning
     *(uint32_t*)dummy = *(const uint32_t*)"STRM";
     butil::RawPacker(head + 4)
         .pack32(data_length + meta_length)
@@ -52,13 +54,13 @@ void PackStreamMessage(butil::IOBuf* out,
     out->append(head, ARRAY_SIZE(head));
     butil::IOBufAsZeroCopyOutputStream wrapper(out);
     CHECK(fm.SerializeToZeroCopyStream(&wrapper));
-    if (data != NULL) {
+    if (data != nullptr) {
         out->append(*data);
     }
 }
 
 ParseResult ParseStreamingMessage(butil::IOBuf* source,
-                            Socket* socket, bool /*read_eof*/, const void* /*arg*/) {
+                            Socket* socket, bool /*read_eof*/, const void* arg) {
     char header_buf[12];
     const size_t n = source->copy_to(header_buf, sizeof(header_buf));
     if (n >= 4) {
@@ -89,6 +91,16 @@ ParseResult ParseStreamingMessage(butil::IOBuf* source,
         source->pop_front(sizeof(header_buf) + body_size);
         return MakeParseError(PARSE_ERROR_TRY_OTHERS);
     }
+    if (arg != nullptr) {
+        // Stream frames are consumed here and never reach InputMessenger's
+        // authentication hook.
+        const Server* server = static_cast<const Server*>(arg);
+        if (server->options().auth != nullptr && !socket->IsAuthenticated()) {
+            LOG(WARNING) << "Reject streaming frame from unauthenticated "
+                         << *socket;
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+    }
     source->pop_front(sizeof(header_buf));
     butil::IOBuf meta_buf;
     source->cutn(&meta_buf, meta_size);
@@ -101,53 +113,61 @@ ParseResult ParseStreamingMessage(butil::IOBuf* source,
             LOG(WARNING) << "Fail to Parse StreamFrameMeta from " << *socket;
             break;
         }
-        SocketUniquePtr ptr;
-        if (Socket::Address((SocketId)fm.stream_id(), &ptr) != 0) {
-            RPC_VLOG_IF(fm.frame_type() != FRAME_TYPE_RST 
-                            && fm.frame_type() != FRAME_TYPE_CLOSE
-                            && fm.frame_type() != FRAME_TYPE_FEEDBACK)
+        StreamUniquePtr sptr;
+        if (Stream::Address((StreamId)fm.stream_id(), &sptr) != 0) {
+            RPC_VLOG_IF(fm.frame_type() != FRAME_TYPE_RST &&
+                        fm.frame_type() != FRAME_TYPE_CLOSE &&
+                        fm.frame_type() != FRAME_TYPE_FEEDBACK)
                    << "Fail to find stream=" << fm.stream_id();
-            if (fm.has_source_stream_id()) {
+            // It's normal that the stream is closed before receiving feedback frames from peer.
+            // In this case, RST frame should not be sent to peer, otherwise on-fly data can be lost.
+            if (fm.has_source_stream_id() && fm.frame_type() != FRAME_TYPE_FEEDBACK) {
                 SendStreamRst(socket, fm.source_stream_id());
             }
             break;
         }
         meta_buf.clear();  // to reduce memory resident
-        ((Stream*)ptr->conn())->OnReceived(fm, &payload, socket);
+        sptr->OnReceived(fm, &payload, socket);
     } while (0);
 
     // Hack input messenger
-    return MakeMessage(NULL);
+    return MakeMessage(nullptr);
 }
 
 void ProcessStreamingMessage(InputMessageBase* /*msg*/) {
     CHECK(false) << "Should never be called";
 }
 
-void SendStreamRst(Socket *sock, int64_t remote_stream_id) {
-    CHECK(sock != NULL);
+void SendStreamRst(Socket* sock, int64_t remote_stream_id) {
+    CHECK(sock != nullptr);
     StreamFrameMeta fm;
     fm.set_stream_id(remote_stream_id);
     fm.set_frame_type(FRAME_TYPE_RST);
     butil::IOBuf out;
-    PackStreamMessage(&out, fm, NULL);
-    sock->Write(&out);
+    PackStreamMessage(&out, fm, nullptr);
+    Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = true;
+    sock->Write(&out, &wopt);
 }
 
-void SendStreamClose(Socket *sock, int64_t remote_stream_id,
+void SendStreamClose(Socket* sock, int64_t remote_stream_id,
                      int64_t source_stream_id) {
-    CHECK(sock != NULL);
+    CHECK(sock != nullptr);
     StreamFrameMeta fm;
     fm.set_stream_id(remote_stream_id);
     fm.set_source_stream_id(source_stream_id);
     fm.set_frame_type(FRAME_TYPE_CLOSE);
     butil::IOBuf out;
-    PackStreamMessage(&out, fm, NULL);
-    sock->Write(&out);
+    PackStreamMessage(&out, fm, nullptr);
+    Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = true;
+    sock->Write(&out, &wopt);
 }
 
 int SendStreamData(Socket* sock, const butil::IOBuf* data,
-                   int64_t remote_stream_id, int64_t source_stream_id) {
+                   int64_t remote_stream_id, int64_t source_stream_id,
+                   bthread_id_t response_id) {
+    CHECK(sock != nullptr);
     StreamFrameMeta fm;
     fm.set_stream_id(remote_stream_id);
     fm.set_source_stream_id(source_stream_id);
@@ -155,7 +175,13 @@ int SendStreamData(Socket* sock, const butil::IOBuf* data,
     fm.set_has_continuation(false);
     butil::IOBuf out;
     PackStreamMessage(&out, fm, data);
-    return sock->Write(&out);
+    Socket::WriteOptions wopt;
+    if (INVALID_BTHREAD_ID != response_id) {
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
+    wopt.ignore_eovercrowded = true;
+    return sock->Write(&out, &wopt);
 }
 
 }  // namespace policy

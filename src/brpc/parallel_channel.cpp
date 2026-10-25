@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include "bthread/bthread.h"                  // bthread_id_xx
 #include "bthread/unstable.h"                 // bthread_timer_add
@@ -22,13 +24,7 @@
 #include "brpc/details/controller_private_accessor.h"
 #include "brpc/parallel_channel.h"
 
-
 namespace brpc {
-
-ParallelChannelOptions::ParallelChannelOptions()
-    : timeout_ms(500)
-    , fail_limit(-1) {
-}
 
 DECLARE_bool(usercode_in_pthread);
 
@@ -38,17 +34,20 @@ struct Memory {
     int size;
     void* ptr;
 };
-static __thread Memory tls_cached_pchan_mem = { 0, NULL };
+static __thread Memory tls_cached_pchan_mem = { 0, nullptr };
 #endif
 
 class ParallelChannelDone : public google::protobuf::Closure {
 private:
-    ParallelChannelDone(int fail_limit, int ndone, int nchan, int memsize,
+    ParallelChannelDone(int fail_limit, int success_limit,
+                        int ndone, int nchan, int memsize,
                         Controller* cntl, google::protobuf::Closure* user_done)
         : _fail_limit(fail_limit)
+        , _success_limit(success_limit)
         , _ndone(ndone)
         , _nchan(nchan)
         , _memsize(memsize)
+        , _current_success(0)
         , _current_fail(0)
         , _current_done(0)
         , _cntl(cntl)
@@ -57,15 +56,13 @@ private:
         , _callmethod_pthread(0) {
     }
 
-    ~ParallelChannelDone() { }
-
 public:
     class SubDone : public google::protobuf::Closure {
     public:
-        SubDone() : shared_data(NULL) {
+        SubDone() : shared_data(nullptr) {
         }
 
-        ~SubDone() {
+        ~SubDone() override {
             // Can't delete request/response in ~SubCall because the
             // object is copyable.
             if (ap.flags & DELETE_REQUEST) {
@@ -76,7 +73,7 @@ public:
             }
         }
  
-        void Run() {
+        void Run() override {
             shared_data->OnSubDoneRun(this);
         }
 
@@ -87,7 +84,8 @@ public:
     };
     
     static ParallelChannelDone* Create(
-        int fail_limit, int ndone, const SubCall* aps, int nchan,
+        int fail_limit, int success_limit,
+        int ndone, const SubCall* aps, int nchan,
         Controller* cntl, google::protobuf::Closure* user_done) {
         // We need to create the object in this way because _sub_done is
         // dynamically allocated.
@@ -104,7 +102,7 @@ public:
         if (ndone != nchan) {
             req_size += sizeof(int) * nchan;
         }
-        void* mem = NULL;
+        void* mem = nullptr;
         int memsize = 0;
 #ifdef BRPC_CACHE_PCHAN_MEM
         Memory pchan_mem = tls_cached_pchan_mem;
@@ -112,24 +110,24 @@ public:
             mem = pchan_mem.ptr;
             memsize = pchan_mem.size;
             pchan_mem.size = 0;
-            pchan_mem.ptr = NULL;
+            pchan_mem.ptr = nullptr;
             tls_cached_pchan_mem = pchan_mem;
         } else {
             mem = malloc(req_size);
             memsize = req_size;
-            if (BAIDU_UNLIKELY(NULL == mem)) {
-                return NULL;
+            if (BAIDU_UNLIKELY(nullptr == mem)) {
+                return nullptr;
             }
         }
 #else
         mem = malloc(req_size);
         memsize = req_size;
-        if (BAIDU_UNLIKELY(NULL == mem)) {
-            return NULL;
+        if (BAIDU_UNLIKELY(nullptr == mem)) {
+            return nullptr;
         }
 #endif
-        ParallelChannelDone* d = new (mem) ParallelChannelDone(
-            fail_limit, ndone, nchan, memsize, cntl, user_done);
+        auto d = new (mem) ParallelChannelDone(
+            fail_limit, success_limit, ndone, nchan, memsize, cntl, user_done);
 
         // Apply client settings of _cntl to controllers of sub calls, except
         // timeout. If we let sub channel do their timeout separately, when
@@ -158,7 +156,7 @@ public:
     }
 
     static void Destroy(ParallelChannelDone* d) {
-        if (d != NULL) {
+        if (d != nullptr) {
             for (int i = 0; i < d->_ndone; ++i) {
                 d->sub_done(i)->~SubDone();
             }
@@ -181,7 +179,7 @@ public:
         }
     }
 
-    void Run() {
+    void Run() override {
         const int ec = _cntl->ErrorCode();
         if (ec == EPCHANFINISH) {
             // all sub calls finished. Clear the error and we'll set
@@ -191,12 +189,12 @@ public:
         } else {
             CHECK(ECANCELED == ec || ERPCTIMEDOUT == ec) << "ec=" << ec;
         }
-        OnSubDoneRun(NULL);
+        OnSubDoneRun(nullptr);
     }
 
     static void* RunOnComplete(void* arg) {
         static_cast<ParallelChannelDone*>(arg)->OnComplete();
-        return NULL;
+        return nullptr;
     }
 
     // For otherwhere to know if they're in the same thread.
@@ -215,17 +213,28 @@ public:
     }
     
     void OnSubDoneRun(SubDone* fin) {
-        if (fin != NULL) {
+        if (fin != nullptr) {
             // [ called from SubDone::Run() ]
 
-            // Count failed sub calls, if fail_limit is reached, cancel others.
-            if (fin->cntl.FailedInline() &&
-                _current_fail.fetch_add(1, butil::memory_order_relaxed) + 1
-                == _fail_limit) {
+            int error_code = fin->cntl.ErrorCode();
+            // EPCHANFINISH is not an error of sub calls.
+            bool fail = 0 != error_code && EPCHANFINISH != error_code;
+            bool cancel =
+                // Count failed sub calls, if `fail_limit' is reached, cancel others.
+                (fail && _current_fail.fetch_add(1, butil::memory_order_relaxed) + 1
+                         == _fail_limit) ||
+                // Count successful sub calls, if `success_limit' is reached, cancel others.
+                (0 == error_code &&
+                 _current_success.fetch_add(1, butil::memory_order_relaxed) + 1
+                 == _success_limit);
+
+            if (cancel) {
+                // Only cancel once by `fail_limit' or `success_limit'.
                 for (int i = 0; i < _ndone; ++i) {
                     SubDone* sd = sub_done(i);
                     if (fin != sd) {
-                        bthread_id_error(sd->cntl.call_id(), ECANCELED);
+                        bthread_id_error(
+                            sd->cntl.call_id(), fail ? ECANCELED : EPCHANFINISH);
                     }
                 }
             }
@@ -278,7 +287,7 @@ public:
         }
         butil::atomic_thread_fence(butil::memory_order_acquire);
 
-        if (fin != NULL &&
+        if (fin != nullptr &&
             !_cntl->is_done_allowed_to_run_in_place() &&
             IsSameThreadAsCallMethod()) {
             // A sub channel's CallMethod calls a subdone directly, create a
@@ -312,7 +321,7 @@ public:
                 SubDone* sd = sub_done(i);
                 google::protobuf::Message* sub_res = sd->cntl._response;
                 if (!sd->cntl.FailedInline()) {  // successful calls only.
-                    if (sd->merger == NULL) {
+                    if (sd->merger == nullptr) {
                         try {
                             _cntl->_response->MergeFrom(*sub_res);
                         } catch (const std::exception& e) {
@@ -404,7 +413,7 @@ public:
     }
     
     int sub_channel_size() const { return _nchan; }
-    // Different from sub_done(), sub_channel_controller returns NULL for
+    // Different from sub_done(), sub_channel_controller returns nullptr for
     // invalid accesses and never crashes.
     const Controller* sub_channel_controller(int i) const {
         if (i >= 0 && i < _nchan) {
@@ -416,11 +425,12 @@ public:
                 return &sub_done(offset)->cntl;
             }
         }
-        return NULL;
+        return nullptr;
     }
 
 private:
     int _fail_limit;
+    int _success_limit;
     int _ndone;
     int _nchan;
 #if defined(__clang__)
@@ -428,6 +438,7 @@ private:
 #else
     int _memsize;
 #endif
+    butil::atomic<int> _current_success;
     butil::atomic<int> _current_fail;
     butil::atomic<uint32_t> _current_done;
     Controller* _cntl;
@@ -449,7 +460,7 @@ const Controller* GetSubControllerOfParallelChannel(
 }
 
 int ParallelChannel::Init(const ParallelChannelOptions* options) {
-    if (options != NULL) {
+    if (options != nullptr) {
         _options = *options;
     }
     return 0;
@@ -459,7 +470,27 @@ int ParallelChannel::AddChannel(ChannelBase* sub_channel,
                                 ChannelOwnership ownership,
                                 CallMapper* call_mapper,
                                 ResponseMerger* merger) {
-    if (NULL == sub_channel) {
+    if (nullptr == sub_channel) {
+        LOG(ERROR) << "Param[sub_channel] is NULL";
+        return -1;
+    }
+    if (_chans.capacity() == 0) {
+        _chans.reserve(32);
+    }
+    SubChan sc;
+    sc.chan = sub_channel;
+    sc.ownership = ownership;
+    sc.call_mapper = call_mapper;
+    sc.merger = merger;
+    _chans.push_back(sc);
+    return 0;
+}
+
+int ParallelChannel::AddChannel(ChannelBase* sub_channel,
+                                ChannelOwnership ownership,
+                                const butil::intrusive_ptr<CallMapper>& call_mapper,
+                                const butil::intrusive_ptr<ResponseMerger>& merger) {
+    if (nullptr == sub_channel) {
         LOG(ERROR) << "Param[sub_channel] is NULL";
         return -1;
     }
@@ -538,12 +569,12 @@ void* ParallelChannel::RunDoneAndDestroy(void* arg) {
     Controller* c = static_cast<Controller*>(arg);
     // Move done out from the controller.
     google::protobuf::Closure* done = c->_done;
-    c->_done = NULL;
+    c->_done = nullptr;
     // Save call_id from the controller which may be deleted after Run().
     const bthread_id_t cid = c->call_id();
     done->Run();
     CHECK_EQ(0, bthread_id_unlock_and_destroy(cid));
-    return NULL;
+    return nullptr;
 }
 
 void ParallelChannel::CallMethod(
@@ -559,7 +590,7 @@ void ParallelChannel::CallMethod(
     cntl->_pchan_sub_count = nchan;
 
     const CallId cid = cntl->call_id();
-    const int rc = bthread_id_lock(cid, NULL);
+    const int rc = bthread_id_lock(cid, nullptr);
     if (rc != 0) {
         CHECK_EQ(EINVAL, rc);
         if (!cntl->FailedInline()) {
@@ -577,17 +608,19 @@ void ParallelChannel::CallMethod(
     }
     cntl->set_used_by_rpc();
 
-    ParallelChannelDone* d = NULL;
+    ParallelChannelDone* d = nullptr;
     int ndone = nchan;
     int fail_limit = 1;
+    int success_limit = 1;
+    Controller::ClientSettings settings{};
     DEFINE_SMALL_ARRAY(SubCall, aps, nchan, 64);
 
     if (cntl->FailedInline()) {
         // The call_id is cancelled before RPC.
         goto FAIL;
     }
-    // we don't support http whose response is NULL.
-    if (response == NULL) {
+    // we don't support http whose response is nullptr.
+    if (response == nullptr) {
         cntl->SetFailed(EINVAL, "response must be non-NULL");
         goto FAIL;
     }
@@ -598,8 +631,8 @@ void ParallelChannel::CallMethod(
 
     for (int i = 0; i < nchan; ++i) {
         SubChan& sub_chan = _chans[i];
-        if (sub_chan.call_mapper != NULL) {
-            aps[i] = sub_chan.call_mapper->Map(i, method, request, response);
+        if (sub_chan.call_mapper != nullptr) {
+            aps[i] = sub_chan.call_mapper->Map(i, nchan, method, request, response);
             // Test is_skip first because it implies is_bad.
             if (aps[i].is_skip()) {
                 --ndone;
@@ -610,7 +643,7 @@ void ParallelChannel::CallMethod(
             }
         } else {
             google::protobuf::Message* cur_res = response->New();
-            if (cur_res == NULL) {
+            if (cur_res == nullptr) {
                 cntl->SetFailed(ENOMEM, "Fail to new response");
                 goto FAIL;
             }
@@ -633,10 +666,22 @@ void ParallelChannel::CallMethod(
             fail_limit = ndone;
         }
     }
-    
-    d = ParallelChannelDone::Create(fail_limit, ndone, aps, nchan,
-                                    cntl, done);
-    if (NULL == d) {
+
+    // `success_limit' is only valid when `fail_limit' is not set.
+    if (_options.fail_limit >= 0 || _options.success_limit < 0) {
+        success_limit = ndone;
+    } else {
+        success_limit = _options.success_limit;
+        if (success_limit < 1) {
+            success_limit = 1;
+        } else if (success_limit > ndone) {
+            success_limit = ndone;
+        }
+    }
+
+    d = ParallelChannelDone::Create(
+        fail_limit, success_limit, ndone, aps, nchan, cntl, done);
+    if (nullptr == d) {
         cntl->SetFailed(ENOMEM, "Fail to new ParallelChannelDone");
         goto FAIL;
     }
@@ -674,12 +719,28 @@ void ParallelChannel::CallMethod(
     d->SaveThreadInfoOfCallsite();
     CHECK_EQ(0, bthread_id_unlock(cid));
     // Don't touch `cntl' and `d' again (for async RPC)
-    
+
+    // Apply client settings of _cntl to controllers of sub calls, except
+    // timeout. If we let sub channel do their timeout separately, when
+    // timeout happens, we get ETOOMANYFAILS rather than ERPCTIMEDOUT.
+    cntl->SaveClientSettings(&settings);
+    settings.timeout_ms = -1;
     for (int i = 0, j = 0; i < nchan; ++i) {
         if (!aps[i].is_skip()) {
             ParallelChannelDone::SubDone* sd = d->sub_done(j++);
-            // Forward the attachment to each sub call
-            sd->cntl.request_attachment().append(cntl->request_attachment());
+            if (nullptr != _chans[i].call_mapper) {
+                _chans[i].call_mapper->MapController(i, nchan, cntl, &sd->cntl);
+            } else {
+                // Forward the attachment to each sub call.
+                sd->cntl.request_attachment().append(cntl->request_attachment());
+            }
+            sd->cntl.ApplyClientSettings(settings);
+            sd->cntl.allow_done_to_run_in_place();
+        }
+    }
+    for (int i = 0, j = 0; i < nchan; ++i) {
+        if (!aps[i].is_skip()) {
+            ParallelChannelDone::SubDone* sd = d->sub_done(j++);
             _chans[i].chan->CallMethod(sd->ap.method, &sd->cntl,
                                        sd->ap.request, sd->ap.response, sd);
         }
@@ -688,7 +749,7 @@ void ParallelChannel::CallMethod(
         // Destroy()-ed) because we may need to check requests for debugging
         // purposes.
     }
-    if (done == NULL) {
+    if (done == nullptr) {
         Join(cid);
         cntl->OnRPCEnd(butil::gettimeofday_us());
     }
@@ -697,8 +758,8 @@ void ParallelChannel::CallMethod(
 FAIL:
     // The RPC was failed after locking call_id and before calling sub channels.
     if (d) {
-        // Set the _done to NULL to make sure cntl->sub(any_index) is NULL.
-        cntl->_done = NULL;
+        // Set the _done to nullptr to make sure cntl->sub(any_index) is nullptr.
+        cntl->_done = nullptr;
         ParallelChannelDone::Destroy(d);
     }
     if (done) {
@@ -711,7 +772,7 @@ FAIL:
             if (bthread_start_background(&bh, &attr, RunDoneAndDestroy, cntl) == 0) {
                 return;
             }
-            cntl->_done = NULL;
+            cntl->_done = nullptr;
             LOG(FATAL) << "Fail to start bthread";
         }
         done->Run();

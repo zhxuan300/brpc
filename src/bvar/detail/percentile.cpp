@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2015/09/15 15:14:32
 
 #include "bvar/detail/percentile.h"
@@ -20,7 +22,7 @@
 
 namespace bvar {
 namespace detail {
-
+#if !WITH_BABYLON_COUNTER
 inline uint32_t ones32(uint32_t x) {
     /* 32-bit recursive reduction using SWAR...
      * but first step is mapping 2-bit values
@@ -83,18 +85,16 @@ private:
     int64_t _latency;
 };
 
-Percentile::Percentile() : _combiner(NULL), _sampler(NULL) {
-    _combiner = new combiner_type;
-}
+Percentile::Percentile()
+    : _combiner(std::make_shared<combiner_type>()), _sampler(nullptr) {}
 
 Percentile::~Percentile() {
     // Have to destroy sampler first to avoid the race between destruction and
     // sampler
-    if (_sampler != NULL) {
+    if (_sampler != nullptr) {
         _sampler->destroy();
-        _sampler = NULL;
+        _sampler = nullptr;
     }
-    delete _combiner;
 }
 
 Percentile::value_type Percentile::reset() {
@@ -124,9 +124,44 @@ Percentile &Percentile::operator<<(int64_t latency) {
         }
         return *this;
     }
-    agent->merge_global(AddLatency(latency));
+    agent->merge_global(AddLatency(latency), _combiner);
     return *this;
 }
+#else
+Percentile::value_type Percentile::reset() {
+    constexpr static size_t SAMPLE_SIZE = value_type::SAMPLE_SIZE;
+    value_type result;
+    _concurrent_sampler.for_each([&](
+        size_t index, const babylon::ConcurrentSampler::SampleBucket& bucket) {
+        result.merge(bucket, index);
+        auto capacity = _concurrent_sampler.bucket_capacity(index);
+        auto num_added = bucket.record_num.load(::std::memory_order_relaxed);
+        if (capacity < SAMPLE_SIZE && num_added > capacity) {
+            capacity = std::min<size_t>(SAMPLE_SIZE, num_added * 1.5);
+            _concurrent_sampler.set_bucket_capacity(index, capacity);
+        }
+    });
+    _concurrent_sampler.reset();
+    return result;
+}
 
+Percentile& Percentile::operator<<(int64_t value) {
+    if (BAIDU_UNLIKELY(value < 0)) {
+        // we don't check overflow(of uint32) in percentile because the
+        // overflowed value which is included in last range does not affect
+        // overall distribution of other values too much.
+        if (!_debug_name.empty()) {
+            LOG_EVERY_SECOND(WARNING) << "Input=" << value << " to `" << _debug_name
+                                      << "' is negative, drop";
+        } else {
+            LOG_EVERY_SECOND(WARNING) << "Input=" << value << " to Percentile("
+                                      << (void*)this << ") is negative, drop";
+        }
+    } else {
+        _concurrent_sampler << value;
+    }
+    return *this;
+}
+#endif // WITH_BABYLON_COUNTER
 }  // namespace detail
 }  // namespace bvar

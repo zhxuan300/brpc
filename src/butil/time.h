@@ -1,18 +1,20 @@
-// Copyright (c) 2010 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Wed Aug 11 10:38:17 2010
 
 // Measuring time
@@ -213,6 +215,7 @@ inline int64_t monotonic_time_s() {
 
 namespace detail {
 inline uint64_t clock_cycles() {
+#if defined(__x86_64__) || defined(__amd64__)
     unsigned int lo = 0;
     unsigned int hi = 0;
     // We cannot use "=A", since this would use %rax on x86_64
@@ -221,11 +224,53 @@ inline uint64_t clock_cycles() {
         : "=a" (lo), "=d" (hi)
         );
     return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__)
+    uint64_t virtual_timer_value;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+    return virtual_timer_value;
+#elif defined(__ARM_ARCH)
+  #if (__ARM_ARCH >= 6)
+    unsigned int pmccntr;
+    unsigned int pmuseren;
+    unsigned int pmcntenset;
+    // Read the user mode perf monitor counter access permissions.
+    asm volatile ("mrc p15, 0, %0, c9, c14, 0" : "=r" (pmuseren));
+    if (pmuseren & 1) {  // Allows reading perfmon counters for user mode code.
+        asm volatile ("mrc p15, 0, %0, c9, c12, 1" : "=r" (pmcntenset));
+        if (pmcntenset & 0x80000000ul) {  // Is it counting?
+            asm volatile ("mrc p15, 0, %0, c9, c13, 0" : "=r" (pmccntr));
+            // The counter is set up to count every 64th cycle
+            return static_cast<uint64_t>(pmccntr) * 64;  // Should optimize to << 6
+        }
+    }
+  #else
+    #error "unsupported arm_arch"
+  #endif
+#elif defined(__loongarch64)
+    uint64_t stable_counter;
+    uint64_t counter_id;
+    __asm__ __volatile__ (
+        "rdtime.d %1, %0"
+        : "=r" (stable_counter), "=r" (counter_id)
+        );
+    return stable_counter;
+#elif defined(__riscv)
+    uint64_t cycles;
+    __asm__ __volatile__ (
+        "rdcycle %0"
+        : "=r" (cycles)
+        );
+    return cycles;
+#else
+  #error "unsupported arch"
+#endif
 }
-extern int64_t read_invariant_cpu_frequency();
+
 // Be positive iff:
 // 1 Intel x86_64 CPU (multiple cores) supporting constant_tsc and
 // nonstop_tsc(check flags in /proc/cpuinfo)
+// 2 aarch64, where the counter frequency is read from CNTFRQ_EL0.
+// Only computed when BUTIL_USE_CPU_FREQUENCY is enabled.
 extern int64_t invariant_cpu_freq;
 }  // namespace detail
 
@@ -236,7 +281,7 @@ extern int64_t invariant_cpu_freq;
 // note: Inlining shortens time cost per-call for 15ns in a loop of many
 //       calls to this function.
 inline int64_t cpuwide_time_ns() {
-#if !defined(BAIDU_INTERNAL)
+#if !defined(BAIDU_INTERNAL) && !BUTIL_USE_CPU_FREQUENCY
     // nearly impossible to get the correct invariant cpu frequency on
     // different CPU and machines. CPU-ID rarely works and frequencies
     // in "model name" and "cpu Mhz" are both unreliable.
@@ -255,16 +300,19 @@ inline int64_t cpuwide_time_ns() {
         const uint64_t remain = tsc % cpu_freq;
         // TODO: should be OK until CPU's frequency exceeds 16GHz.
         return remain * 1000000000L / cpu_freq + sec * 1000000000L;
-    } else if (!cpu_freq) {
+    } else {
         // Lack of necessary features, return system-wide monotonic time instead.
         return monotonic_time_ns();
-    } else {
-        // Use a thread-unsafe method(OK to us) to initialize the freq
-        // to save a "if" test comparing to using a local static variable
-        detail::invariant_cpu_freq = detail::read_invariant_cpu_frequency();
-        return cpuwide_time_ns();
     }
-#endif // defined(BAIDU_INTERNAL)
+#endif // defined(BAIDU_INTERNAL) || BUTIL_USE_CPU_FREQUENCY
+}
+
+// Get cpu clock time of the current thread in nanoseconds without the time spent in blocking I/O operations.
+// Cost ~200ns
+inline int64_t cputhread_time_ns() {
+    timespec now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
 }
 
 inline int64_t cpuwide_time_us() {
@@ -286,7 +334,7 @@ inline int64_t cpuwide_time_s() {
 // --------------------------------------------------------------------
 inline int64_t gettimeofday_us() {
     timeval now;
-    gettimeofday(&now, NULL);
+    gettimeofday(&now, nullptr);
     return now.tv_sec * 1000000L + now.tv_usec;
 }
 
@@ -340,7 +388,7 @@ public:
     };
 
     Timer() : _stop(0), _start(0) {}
-    explicit Timer(const TimerType) {
+    explicit Timer(const TimerType) : Timer() {
         start();
     }
 

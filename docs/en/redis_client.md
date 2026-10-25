@@ -1,6 +1,6 @@
 [中文版](../cn/redis_client.md)
 
-[redis](http://redis.io/) is one of the most popular caching service in recent years. Compared to memcached it provides users with more data structures and operations, speeding up developments. In order to access redis servers more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the redis protocol. Check [example/redis_c++](https://github.com/brpc/brpc/tree/master/example/redis_c++/) for an example.
+[redis](http://redis.io/) is one of the most popular caching service in recent years. Compared to memcached it provides users with more data structures and operations, speeding up developments. In order to access redis servers more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the redis protocol. Check [example/redis_c++](https://github.com/apache/brpc/tree/master/example/redis_c++/) for an example.
 
 Advantages compared to [hiredis](https://github.com/redis/hiredis) (the official redis client):
 
@@ -42,7 +42,7 @@ brpc::RedisRequest set_request;
 brpc::RedisResponse response;
 brpc::Controller cntl;
 set_request.AddCommand("SET %s %d", my_key.c_str(), my_number);
-redis_channel.CallMethod(NULL, &cntl, &set_request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &set_request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -63,7 +63,7 @@ brpc::RedisRequest incr_request;
 incr_request.AddCommand("INCR %s", my_key.c_str());
 response.Clear();
 cntl.Reset();
-redis_channel.CallMethod(NULL, &cntl, &incr_request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &incr_request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -88,7 +88,7 @@ request.AddCommand("INCR counter1");
 request.AddCommand("DECR counter1");
 request.AddCommand("INCRBY counter1 10");
 request.AddCommand("DECRBY counter1 20");
-redis_channel.CallMethod(NULL, &cntl, &request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -104,9 +104,20 @@ CHECK_EQ(10, response.reply(2).integer());
 CHECK_EQ(-10, response.reply(3).integer());
 ```
 
+# Request redis with authenticator
+
+Create a RedisAuthenticator, and set to ChannelOptions.
+
+```c++
+brpc::ChannelOptions options;
+brpc::policy::RedisAuthenticator* auth = new brpc::policy::RedisAuthenticator("my_password");
+options.auth = auth;
+```
+
+
 # RedisRequest
 
-A [RedisRequest](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h) may contain multiple commands by calling `AddCommand*`, which returns true on success and false otherwise. **The callsite backtrace is also printed on error**.
+A [RedisRequest](https://github.com/apache/brpc/blob/master/src/brpc/redis.h) may contain multiple commands by calling `AddCommand*`, which returns true on success and false otherwise. **The callsite backtrace is also printed on error**.
 
 ```c++
 bool AddCommand(const char* fmt, ...);
@@ -116,7 +127,9 @@ bool AddCommandByComponents(const butil::StringPiece* components, size_t n);
 
 Formatting is compatible with hiredis, namely `%b` corresponds to binary data (pointer + length), others are similar to those in `printf`. Some improvements have been made such as characters enclosed by single or double quotes are recognized as one field regardless of the spaces inside. For example, `AddCommand("Set 'a key with space' 'a value with space as well'")` sets value `a value with space as well` to key `a key with space`, while in hiredis the command must be written as `redisvCommand(..., "SET% s% s", "a key with space", "a value with space as well");`
 
-`AddCommandByComponents` is similar to `redisCommandArgv` in hiredis. Users specify each part of the command in an array, which is immune to escaping issues often occurring in `AddCommand` and `AddCommandV`. If you encounter errors such as "Unmatched quote" or "invalid format" when using `AddCommand` and `AddCommandV`, try this method.
+> Note that if the `fmt` parameter of `AddCommand` and `AddCommandV` is set incorrectly, it may cause the program to crash or lead to data leakage. Please set it with caution. Should not use user input-influenced content as the `fmt` parameter!
+
+`AddCommandByComponents` is similar to `redisCommandArgv` in hiredis. Users specify each part of the command in an array or `std::vector<butil::StringPiece>`, which is immune to escaping issues often occurring in `AddCommand` and `AddCommandV`. If you encounter errors such as "Unmatched quote" or "invalid format" when using `AddCommand` and `AddCommandV`, try this method.
 
 If `AddCommand*` fails, subsequent `AddCommand*` and `CallMethod` also fail. In general, there is no need to check return value of `AddCommand*`, since the RPC fails directly anyway.
 
@@ -126,7 +139,7 @@ Call `Clear()` before re-using the `RedisRequest` object.
 
 # RedisResponse
 
-A [RedisResponse](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h) may contain one or multiple [RedisReply](https://github.com/brpc/brpc/blob/master/src/brpc/redis_reply.h)s. Use `reply_size()` for total number of replies and `reply(i)` for reference to the i-th reply (counting from 0). Note that in hiredis, if the request contains N commands, you have to call `redisGetReply` N times to get replies, while it's unnecessary in brpc as the `RedisResponse` already includes the N replies which are accessible by reply(i). As long as RPC is successful, `response.reply_size()` should be equal to `request.command_size()`, unless the redis-server is buggy. The precondition that redis works correctly is that replies correspond to commands one by one in the same sequence (positional correspondence).
+A [RedisResponse](https://github.com/apache/brpc/blob/master/src/brpc/redis.h) may contain one or multiple [RedisReply](https://github.com/apache/brpc/blob/master/src/brpc/redis_reply.h)s. Use `reply_size()` for total number of replies and `reply(i)` for reference to the i-th reply (counting from 0). Note that in hiredis, if the request contains N commands, you have to call `redisGetReply` N times to get replies, while it's unnecessary in brpc as the `RedisResponse` already includes the N replies which are accessible by reply(i). As long as RPC is successful, `response.reply_size()` should be equal to `request.command_size()`, unless the redis-server is buggy. The precondition that redis works correctly is that replies correspond to commands one by one in the same sequence (positional correspondence).
 
 Each `RedisReply` may be:
 
@@ -148,6 +161,55 @@ Call `Clear()` before re-using the `RedisRespones` object.
 Create a `Channel` using the consistent hashing as the load balancing algorithm(c_md5 or c_murmurhash) to access a redis cluster mounted under a naming service. Note that each `RedisRequest` should contain only one command or all commands have the same key. Under current implementation, multiple commands inside a single request are always sent to a same server. If the keys are located on different servers, the result must be wrong. In which case, you have to divide the request into multilple ones with one command each.
 
 Another choice is to use the common [twemproxy](https://github.com/twitter/twemproxy) solution, which makes clients access the cluster just like accessing a single server, although the solution needs to deploy proxies and adds more latency.
+
+For native Redis Cluster (slot based routing, MOVED/ASK redirection and topology refresh from `CLUSTER SLOTS`/`CLUSTER NODES`), use `brpc::RedisClusterChannel`:
+
+```c++
+#include <brpc/redis_cluster.h>
+
+brpc::RedisClusterChannel channel;
+brpc::RedisClusterChannelOptions options;
+options.max_redirect = 5;
+if (channel.Init("127.0.0.1:7000,127.0.0.1:7001", &options) != 0) {
+    LOG(ERROR) << "Fail to init redis cluster channel";
+}
+```
+
+`RedisClusterChannel` supports synchronous/asynchronous `CallMethod`, automatic redirection retries and periodic topology refresh. Multi-key support includes `MGET/MSET/DEL/EXISTS/UNLINK/EVAL/EVALSHA`. `MULTI/EXEC` is currently not supported.
+
+## RedisClusterChannel example
+
+`example/redis_c++/redis_cluster_client.cpp` demonstrates:
+
+- bootstrap from multiple seed nodes.
+- MOVED/ASK auto-redirection and retry.
+- topology refresh from `CLUSTER SLOTS` with `CLUSTER NODES` fallback.
+- sync pipeline and async calls using one channel.
+
+Build and run:
+
+```bash
+cd example/redis_c++
+make redis_cluster_client
+./redis_cluster_client \
+  --seeds=127.0.0.1:7000,127.0.0.1:7001 \
+  --max_redirect=5 \
+  --timeout_ms=1000
+```
+
+Frequently used options:
+
+- `RedisClusterChannelOptions::max_redirect`: max redirects per command.
+- `RedisClusterChannelOptions::refresh_interval_s`: interval of periodic topology refresh.
+- `RedisClusterChannelOptions::topology_refresh_timeout_ms`: timeout for topology commands.
+- `RedisClusterChannelOptions::channel_options`: normal brpc channel options for each redis node.
+- `RedisClusterChannelOptions::enable_periodic_refresh`: disable this when your app controls refresh explicitly.
+
+Notes:
+
+- `MGET/MSET/DEL/EXISTS/UNLINK` are executed per key and merged in request order.
+- `EVAL/EVALSHA` requires all declared keys to be in one slot.
+- `MULTI/EXEC` returns an error reply by design.
 
 # Debug
 
@@ -228,7 +290,9 @@ We can see a tremendous drop of QPS compared to the one using single connection 
 
 # Command Line Interface
 
-[example/redis_c++/redis_cli](https://github.com/brpc/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp) is a command line tool similar to the official CLI, demostrating brpc's capability to talk with redis servers. When unexpected results are got from a redis-server using a brpc client, you can debug with this tool interactively as well.
+[example/redis_c++/redis_cli](https://github.com/apache/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp) is a command line tool similar to the official CLI, demostrating brpc's capability to talk with redis servers. When unexpected results are got from a redis-server using a brpc client, you can debug with this tool interactively as well.
+
+For native Redis Cluster, you can start from [example/redis_c++/redis_cluster_client.cpp](https://github.com/apache/brpc/blob/master/example/redis_c%2B%2B/redis_cluster_client.cpp).
 
 Like the official CLI, `redis_cli <command>` runs the command directly, and `-server` which is address of the redis-server can be specified.
 

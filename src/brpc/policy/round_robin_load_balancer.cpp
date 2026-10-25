@@ -1,35 +1,30 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include "butil/macros.h"
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/round_robin_load_balancer.h"
 
 
 namespace brpc {
 namespace policy {
-
-const uint32_t prime_offset[] = {
-#include "bthread/offset_inl.list"
-};
-
-inline uint32_t GenRandomStride() {
-    return prime_offset[butil::fast_rand_less_than(ARRAY_SIZE(prime_offset))];
-}
 
 bool RoundRobinLoadBalancer::Add(Servers& bg, const ServerId& id) {
     if (bg.server_list.capacity() < 128) {
@@ -95,9 +90,6 @@ size_t RoundRobinLoadBalancer::AddServersInBatch(
 size_t RoundRobinLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -110,10 +102,17 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
     if (n == 0) {
         return ENODATA;
     }
+    if (_cluster_recover_policy && _cluster_recover_policy->StopRecoverIfNecessary()) {
+        if (_cluster_recover_policy->DoReject(s->server_list)) {
+            return EREJECT;
+        }
+    }
     TLS tls = s.tls();
     if (tls.stride == 0) {
-        tls.stride = GenRandomStride();
-        tls.offset = 0;
+        tls.stride = bthread::prime_offset();
+        // use random at first time, for the case of
+        // use rr lb every time in new thread
+        tls.offset = butil::fast_rand_less_than(n);
     }
 
     for (size_t i = 0; i < n; ++i) {
@@ -121,18 +120,26 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
         const SocketId id = s->server_list[tls.offset].id;
         if (((i + 1) == n  // always take last chance
              || !ExcludedServers::IsExcluded(in.excluded, id))
-            && Socket::Address(id, out->ptr) == 0
-            && !(*out->ptr)->IsLogOff()) {
+            && IsServerAvailable(id, out->ptr)) {
             s.tls() = tls;
             return 0;
         }
+    }
+    if (_cluster_recover_policy) {
+        _cluster_recover_policy->StartRecover();
     }
     s.tls() = tls;
     return EHOSTDOWN;
 }
 
-RoundRobinLoadBalancer* RoundRobinLoadBalancer::New() const {
-    return new (std::nothrow) RoundRobinLoadBalancer;
+RoundRobinLoadBalancer* RoundRobinLoadBalancer::New(
+    const butil::StringPiece& params) const {
+    RoundRobinLoadBalancer* lb = new RoundRobinLoadBalancer;
+    if (!lb->SetParameters(params)) {
+        delete lb;
+        lb = nullptr;
+    }
+    return lb;
 }
 
 void RoundRobinLoadBalancer::Destroy() {
@@ -156,6 +163,10 @@ void RoundRobinLoadBalancer::Describe(
         }
     }
     os << '}';
+}
+
+bool RoundRobinLoadBalancer::SetParameters(const butil::StringPiece& params) {
+    return GetRecoverPolicyByParams(params, &_cluster_recover_policy);
 }
 
 }  // namespace policy

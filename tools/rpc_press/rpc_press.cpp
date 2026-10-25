@@ -1,16 +1,19 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <gflags/gflags.h>
 #include <google/protobuf/dynamic_message.h>
@@ -28,7 +31,7 @@ DEFINE_string(method, "example.EchoService.Echo", "The full method name");
 DEFINE_string(server, "0.0.0.0:8002", "ip:port of the server when -load_balancer is empty, the naming service otherwise");
 DEFINE_string(input, "", "The file containing requests in json format");
 DEFINE_string(output, "", "The file containing responses in json format");
-DEFINE_string(lb_policy, "", "The load balancer algorithm: rr, random, la, c_murmurhash, c_md5");
+DEFINE_string(lb_policy, "", "The load balancer algorithm: rr, random, la, p2c, c_murmurhash, c_md5");
 DEFINE_int32(thread_num, 0, "Number of threads to send requests. 0: automatically chosen according to -qps");
 DEFINE_string(protocol, "baidu_std", "baidu_std hulu_pbrpc sofa_pbrpc http public_pbrpc nova_pbrpc ubrpc_compack...");
 DEFINE_string(connection_type, "", "Type of connections: single, pooled, short");
@@ -68,6 +71,14 @@ bool set_press_options(pbrpcframework::PressOptions* options){
         }
     }
 
+    const int rate_limit_per_thread = 1000000;
+    double req_rate_per_thread = options->test_req_rate / options->test_thread_num;
+    if (req_rate_per_thread > rate_limit_per_thread) {
+        LOG(ERROR) << "req_rate: " << (int64_t) req_rate_per_thread << " is too large in one thread. The rate limit is " 
+                <<  rate_limit_per_thread << " in one thread";
+        return false;  
+    }
+
     options->input = FLAGS_input;
     options->output = FLAGS_output;
     options->connection_type = FLAGS_connection_type;
@@ -86,7 +97,7 @@ bool set_press_options(pbrpcframework::PressOptions* options){
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     // set global log option
 
     if (FLAGS_dummy_port >= 0) {

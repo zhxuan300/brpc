@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date 2014/09/24 19:34:24
 
 #ifndef  BVAR_DETAIL__AGENT_GROUP_H
@@ -121,20 +123,20 @@ public:
                 }
             }
         }
-        return NULL;
+        return nullptr;
     }
 
     // Note: May return non-null for unexist id, see notes on ThreadBlock
     inline static Agent* get_or_create_tls_agent(AgentId id) {
         if (__builtin_expect(id < 0, 0)) {
             CHECK(false) << "Invalid id=" << id;
-            return NULL;
+            return nullptr;
         }
-        if (_s_tls_blocks == NULL) {
+        if (_s_tls_blocks == nullptr) {
             _s_tls_blocks = new (std::nothrow) std::vector<ThreadBlock *>;
-            if (__builtin_expect(_s_tls_blocks == NULL, 0)) {
+            if (__builtin_expect(_s_tls_blocks == nullptr, 0)) {
                 LOG(FATAL) << "Fail to create vector, " << berror();
-                return NULL;
+                return nullptr;
             }
             butil::thread_atexit(_destroy_tls_blocks);
         }
@@ -144,10 +146,10 @@ public:
             _s_tls_blocks->resize(std::max(block_id + 1, 32ul));
         }
         ThreadBlock* tb = (*_s_tls_blocks)[block_id];
-        if (tb == NULL) {
+        if (tb == nullptr) {
             ThreadBlock *new_block = new (std::nothrow) ThreadBlock;
-            if (__builtin_expect(new_block == NULL, 0)) {
-                return NULL;
+            if (__builtin_expect(new_block == nullptr, 0)) {
+                return nullptr;
             }
             tb = new_block;
             (*_s_tls_blocks)[block_id] = new_block;
@@ -164,15 +166,13 @@ private:
             delete (*_s_tls_blocks)[i];
         }
         delete _s_tls_blocks;
-        _s_tls_blocks = NULL;
+        _s_tls_blocks = nullptr;
     }
 
     inline static std::deque<AgentId> &_get_free_ids() {
         if (__builtin_expect(!_s_free_ids, 0)) {
             _s_free_ids = new (std::nothrow) std::deque<AgentId>();
-            if (!_s_free_ids) {
-                abort();
-            }
+            RELEASE_ASSERT(_s_free_ids);
         }
         return *_s_free_ids;
     }
@@ -187,14 +187,14 @@ template <typename Agent>
 pthread_mutex_t AgentGroup<Agent>::_s_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 template <typename Agent>
-std::deque<AgentId>* AgentGroup<Agent>::_s_free_ids = NULL;
+std::deque<AgentId>* AgentGroup<Agent>::_s_free_ids = nullptr;
 
 template <typename Agent>
 AgentId AgentGroup<Agent>::_s_agent_kinds = 0;
 
 template <typename Agent>
 __thread std::vector<typename AgentGroup<Agent>::ThreadBlock *>
-*AgentGroup<Agent>::_s_tls_blocks = NULL;
+*AgentGroup<Agent>::_s_tls_blocks = nullptr;
 
 }  // namespace detail
 }  // namespace bvar

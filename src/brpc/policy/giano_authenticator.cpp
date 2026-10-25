@@ -1,20 +1,22 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifdef BAIDU_INTERNAL
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
 
 #include "butil/logging.h"
 #include "brpc/policy/giano_authenticator.h"
@@ -25,29 +27,27 @@ namespace policy {
 GianoAuthenticator::GianoAuthenticator(const baas::CredentialGenerator* gen,
                                        const baas::CredentialVerifier* ver) {
     if (gen) {
-        _generator = new(std::nothrow) baas::CredentialGenerator(*gen);
-        CHECK(_generator);
+        _generator = new baas::CredentialGenerator(*gen);
     } else {
-        _generator = NULL;
+        _generator = nullptr;
     }
     if (ver) {
-        _verifier = new(std::nothrow) baas::CredentialVerifier(*ver);
-        CHECK(_verifier);
+        _verifier = new baas::CredentialVerifier(*ver);
     } else {
-        _verifier = NULL;
+        _verifier = nullptr;
     }        
 }
 
 GianoAuthenticator::~GianoAuthenticator() {
     delete _generator;
-    _generator = NULL;
+    _generator = nullptr;
 
     delete _verifier;
-    _verifier = NULL;
+    _verifier = nullptr;
 }
 
 int GianoAuthenticator::GenerateCredential(std::string* auth_str) const {
-    if (NULL == _generator) {
+    if (nullptr == _generator) {
         LOG(FATAL) << "CredentialGenerator is NULL";
         return -1;
     }
@@ -60,7 +60,7 @@ int GianoAuthenticator::VerifyCredential(
         const std::string& auth_str,
         const butil::EndPoint& client_addr,
         AuthContext* out_ctx) const {
-    if (NULL == _verifier) {
+    if (nullptr == _verifier) {
         LOG(FATAL) << "CredentialVerifier is NULL";
         return -1;
     }
@@ -73,7 +73,7 @@ int GianoAuthenticator::VerifyCredential(
                      << baas::sdk::GetReturnCodeMessage(rc);
         return -1;        
     }
-    if (out_ctx != NULL) {
+    if (out_ctx != nullptr) {
         out_ctx->set_user(ctx.user());
         out_ctx->set_group(ctx.group());
         out_ctx->set_roles(ctx.roles());

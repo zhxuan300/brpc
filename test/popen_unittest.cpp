@@ -1,6 +1,20 @@
-// Copyright (c) 2017 Baidu.com, Inc. All Rights Reserved
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2017/11/06 10:57:08
 
 #include "butil/popen.h"
@@ -92,7 +106,7 @@ static void* counter_thread(void* args) {
     while (!ca->stop) {
         ++ca->counter;
     }
-    return NULL;
+    return nullptr;
 }
 
 static int fork_thread(void* arg) {
@@ -105,22 +119,23 @@ const int CHILD_STACK_SIZE = 64 * 1024;
 TEST(PopenTest, does_vfork_suspend_all_threads) {
     pthread_t tid;
     CounterArg ca = { 0 , false };
-    ASSERT_EQ(0, pthread_create(&tid, NULL, counter_thread, &ca));
+    ASSERT_EQ(0, pthread_create(&tid, nullptr, counter_thread, &ca));
     usleep(100 * 1000);
     char* child_stack_mem = (char*)malloc(CHILD_STACK_SIZE);
     void* child_stack = child_stack_mem + CHILD_STACK_SIZE;  
     const int64_t counter_before_fork = ca.counter;
-    pid_t cpid = clone(fork_thread, child_stack, CLONE_VFORK, NULL);
+    pid_t cpid = clone(fork_thread, child_stack, CLONE_VFORK, nullptr);
     const int64_t counter_after_fork = ca.counter;
     usleep(100 * 1000);
     const int64_t counter_after_sleep = ca.counter;
     int ws;
     ca.stop = true;
-    pthread_join(tid, NULL);
+    pthread_join(tid, nullptr);
     std::cout << "bc=" << counter_before_fork << " ac=" << counter_after_fork
               << " as=" << counter_after_sleep
               << std::endl;
     ASSERT_EQ(cpid, waitpid(cpid, &ws, __WALL));
+    free(child_stack_mem);
 }
 
 #endif  // OS_LINUX

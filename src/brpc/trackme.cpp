@@ -1,18 +1,20 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -41,11 +43,11 @@ static const int32_t TRACKME_MIN_INTERVAL = 30;
 static const int32_t TRACKME_MAX_INTERVAL = 600;
 static int32_t s_trackme_interval = TRACKME_MIN_INTERVAL;
 // Protecting global vars on trackme
-static pthread_mutex_t g_trackme_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_trackme_mutex = PTHREAD_MUTEX_INITIALIZER;
 // For contacting with trackme_server.
-static Channel* g_trackme_chan = NULL;
+static Channel* s_trackme_chan = nullptr;
 // Any server address in this process.
-static std::string* g_trackme_addr = NULL;
+static std::string* s_trackme_addr = nullptr;
 
 // Information of bugs.
 // Notice that this structure may be a combination of all affected bugs.
@@ -61,12 +63,12 @@ struct BugInfo {
 };
 // If a bug was shown, its info was stored in this var as well so that we
 // can avoid showing the same bug repeatly.
-static BugInfo* g_bug_info = NULL;
+static BugInfo* g_bug_info = nullptr;
 // The timestamp(microseconds) that we sent TrackMeRequest.
-static int64_t g_trackme_last_time = 0;
+static int64_t s_trackme_last_time = 0;
 
 // version of RPC.
-// Since the code for getting BRPC_REVISION often fails, 
+// Since the code for getting BRPC_REVISION often fails,
 // BRPC_REVISION must be defined to string and be converted to number
 // within our code.
 // The code running before main() may see g_rpc_version=0, should be OK.
@@ -79,14 +81,14 @@ const int64_t g_rpc_version = 0;
 int ReadJPaasHostPort(int container_port) {
     const uid_t uid = getuid();
     struct passwd* pw = getpwuid(uid);
-    if (pw == NULL) {
+    if (pw == nullptr) {
         RPC_VLOG << "Fail to get password file entry of uid=" << uid;
         return -1;
     }
     char JPAAS_LOG_PATH[64];
     snprintf(JPAAS_LOG_PATH, sizeof(JPAAS_LOG_PATH),
              "%s/jpaas_run/logs/env.log", pw->pw_dir);
-    char* line = NULL;
+    char* line = nullptr;
     size_t line_len = 0;
     ssize_t nr = 0;
     butil::ScopedFILE fp(fopen(JPAAS_LOG_PATH, "r"));
@@ -103,7 +105,7 @@ int ReadJPaasHostPort(int container_port) {
             --nr;
         }
         if (nr > prefix_len && memcmp(line, prefix, prefix_len) == 0) {
-            host_port = strtol(line + prefix_len, NULL, 10);
+            host_port = strtol(line + prefix_len, nullptr, 10);
             break;
         }
     }
@@ -114,8 +116,8 @@ int ReadJPaasHostPort(int container_port) {
 
 // Called in server.cpp
 void SetTrackMeAddress(butil::EndPoint pt) {
-    BAIDU_SCOPED_LOCK(g_trackme_mutex);
-    if (g_trackme_addr == NULL) {
+    BAIDU_SCOPED_LOCK(s_trackme_mutex);
+    if (s_trackme_addr == nullptr) {
         // JPAAS has NAT capabilities, read its log to figure out the open port
         // accessible from outside.
         const int jpaas_port = ReadJPaasHostPort(pt.port);
@@ -124,7 +126,7 @@ void SetTrackMeAddress(butil::EndPoint pt) {
                      << " instead of jpaas_container_port=" << pt.port;
             pt.port = jpaas_port;
         }
-        g_trackme_addr = new std::string(butil::endpoint2str(pt).c_str());
+        s_trackme_addr = new std::string(butil::endpoint2str(pt).c_str());
     }
 }
 
@@ -137,13 +139,13 @@ static void HandleTrackMeResponse(Controller* cntl, TrackMeResponse* res) {
         cur_info.error_text = res->error_text();
         bool already_reported = false;
         {
-            BAIDU_SCOPED_LOCK(g_trackme_mutex);
-            if (g_bug_info != NULL && *g_bug_info == cur_info) {
+            BAIDU_SCOPED_LOCK(s_trackme_mutex);
+            if (g_bug_info != nullptr && *g_bug_info == cur_info) {
                 // we've shown the bug.
                 already_reported = true;
             } else {
                 // save the bug.
-                if (g_bug_info == NULL) {
+                if (g_bug_info == nullptr) {
                     g_bug_info = new BugInfo(cur_info);
                 } else {
                     *g_bug_info = cur_info;
@@ -185,15 +187,11 @@ static void HandleTrackMeResponse(Controller* cntl, TrackMeResponse* res) {
 }
 
 static void TrackMeNow(std::unique_lock<pthread_mutex_t>& mu) {
-    if (g_trackme_addr == NULL) {
+    if (s_trackme_addr == nullptr) {
         return;
     }
-    if (g_trackme_chan == NULL) {
-        Channel* chan = new (std::nothrow) Channel;
-        if (chan == NULL) {
-            LOG(FATAL) << "Fail to new trackme channel";
-            return;
-        }
+    if (s_trackme_chan == nullptr) {
+        Channel* chan = new Channel;
         ChannelOptions opt;
         // keep #connections on server-side low
         opt.connection_type = CONNECTION_TYPE_SHORT;
@@ -202,17 +200,17 @@ static void TrackMeNow(std::unique_lock<pthread_mutex_t>& mu) {
             delete chan;
             return;
         }
-        g_trackme_chan = chan;
+        s_trackme_chan = chan;
     }
     mu.unlock();
-    TrackMeService_Stub stub(g_trackme_chan);
+    TrackMeService_Stub stub(s_trackme_chan);
     TrackMeRequest req;
     req.set_rpc_version(g_rpc_version);
-    req.set_server_addr(*g_trackme_addr);
+    req.set_server_addr(*s_trackme_addr);
     TrackMeResponse* res = new TrackMeResponse;
     Controller* cntl = new Controller;
-    cntl->set_request_code(policy::MurmurHash32(g_trackme_addr->data(), g_trackme_addr->size()));
-    google::protobuf::Closure* done = 
+    cntl->set_request_code(policy::MurmurHash32(s_trackme_addr->data(), s_trackme_addr->size()));
+    google::protobuf::Closure* done =
         ::brpc::NewCallback(&HandleTrackMeResponse, cntl, res);
     stub.TrackMe(cntl, &req, res, done);
 }
@@ -223,16 +221,16 @@ void TrackMe() {
     if (FLAGS_trackme_server.empty()) {
         return;
     }
-    int64_t now = butil::gettimeofday_us();
-    std::unique_lock<pthread_mutex_t> mu(g_trackme_mutex);
-    if (g_trackme_last_time == 0) {
-        // Delay the first ping randomly within s_trackme_interval. This 
+    int64_t now = butil::cpuwide_time_us();
+    std::unique_lock<pthread_mutex_t> mu(s_trackme_mutex);
+    if (s_trackme_last_time == 0) {
+        // Delay the first ping randomly within s_trackme_interval. This
         // protects trackme_server from ping storms.
-        g_trackme_last_time =
+        s_trackme_last_time =
             now + butil::fast_rand_less_than(s_trackme_interval) * 1000000L;
     }
-    if (now > g_trackme_last_time + 1000000L * s_trackme_interval) {
-        g_trackme_last_time = now;
+    if (now > s_trackme_last_time + 1000000L * s_trackme_interval) {
+        s_trackme_last_time = now;
         return TrackMeNow(mu);
     }
 }

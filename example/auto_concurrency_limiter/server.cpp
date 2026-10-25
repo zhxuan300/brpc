@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A server to receive EchoRequest and send back EchoResponse.
 
@@ -28,8 +31,6 @@
 #include <fstream>
 #include "cl_test.pb.h"
 
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 DEFINE_int32(server_bthread_concurrency, 4, 
              "Configuring the value of bthread_concurrency, For compute max qps, ");
 DEFINE_int32(server_sync_sleep_us, 2500, 
@@ -90,12 +91,12 @@ public:
         , _running_case(false) {
     };
 
-    virtual ~EchoServiceImpl() {};
+    virtual ~EchoServiceImpl() {}
 
     void SetTestCase(const test::TestCase& test_case) {
         _test_case = test_case;
         _next_stage_start = _test_case.latency_stage_list(0).duration_sec() + 
-            butil::gettimeofday_s();
+            butil::cpuwide_time_s();
         _stage_index = 0;
         _running_case = false;
         DisplayStage(_test_case.latency_stage_list(_stage_index));
@@ -136,7 +137,7 @@ public:
 
     void ComputeLatency() {
         if (_stage_index < _test_case.latency_stage_list_size() &&
-            butil::gettimeofday_s() > _next_stage_start) {
+            butil::cpuwide_time_s() > _next_stage_start) {
             ++_stage_index;
             if (_stage_index < _test_case.latency_stage_list_size()) {
                 _next_stage_start += _test_case.latency_stage_list(_stage_index).duration_sec();
@@ -166,7 +167,7 @@ public:
             int latency = lower_bound + (upper_bound - lower_bound) / 
                 double(latency_stage.duration_sec()) * 
                 (latency_stage.duration_sec() - _next_stage_start + 
-                butil::gettimeofday_s());
+                butil::cpuwide_time_s());
             _latency.store(latency, butil::memory_order_relaxed);
         } else {
             LOG(FATAL) << "Wrong Type:" << latency_stage.type();
@@ -196,7 +197,7 @@ public:
                                 brpc::SERVER_OWNS_SERVICE) != 0) {
             LOG(FATAL) << "Fail to add service";
         }
-        g_timer_thread.start(NULL);
+        g_timer_thread.start(nullptr);
     }
     virtual ~ControlServiceImpl() { 
         _echo_service->StopTestCase();
@@ -270,7 +271,7 @@ private:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     bthread::FLAGS_bthread_concurrency= FLAGS_server_bthread_concurrency;
 
     brpc::Server server;
@@ -283,7 +284,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    if (server.Start(FLAGS_cntl_port, NULL) != 0) {
+    if (server.Start(FLAGS_cntl_port, nullptr) != 0) {
         LOG(ERROR) << "Fail to start EchoServer";
         return -1;
     }

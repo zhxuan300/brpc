@@ -1,18 +1,20 @@
-// Copyright (c) 2018 Iqiyi, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Daojin Cai (caidaojin@qiyi.com)
 
 #ifndef BRPC_POLICY_WEIGHTED_ROUND_ROBIN_LOAD_BALANCER_H
 #define BRPC_POLICY_WEIGHTED_ROUND_ROBIN_LOAD_BALANCER_H
@@ -30,14 +32,14 @@ namespace policy {
 // Weight is got from tag of ServerId.
 class WeightedRoundRobinLoadBalancer : public LoadBalancer {
 public:
-    bool AddServer(const ServerId& id);
-    bool RemoveServer(const ServerId& id);
-    size_t AddServersInBatch(const std::vector<ServerId>& servers);
-    size_t RemoveServersInBatch(const std::vector<ServerId>& servers);
-    int SelectServer(const SelectIn& in, SelectOut* out);
-    LoadBalancer* New() const;
-    void Destroy();
-    void Describe(std::ostream&, const DescribeOptions& options);
+    bool AddServer(const ServerId& id) override;
+    bool RemoveServer(const ServerId& id) override;
+    size_t AddServersInBatch(const std::vector<ServerId>& servers) override;
+    size_t RemoveServersInBatch(const std::vector<ServerId>& servers) override;
+    int SelectServer(const SelectIn& in, SelectOut* out) override;
+    LoadBalancer* New(const butil::StringPiece&) const override;
+    void Destroy() override;
+    void Describe(std::ostream&, const DescribeOptions& options) override;
 
 private:
     struct Server {
@@ -56,9 +58,9 @@ private:
         size_t position = 0;
         uint64_t stride = 0;
         Server remain_server;
-        // If server list changed, we need caculate a new stride.
-        bool IsNeededCaculateNewStride(const uint64_t curr_weight_sum, 
-                                       const size_t curr_servers_num) {
+        // If server list changed, we need calculate a new stride.
+        bool IsNeededCalculateNewStride(const uint64_t curr_weight_sum,
+                                        const size_t curr_servers_num) {
             if (curr_weight_sum != weight_sum 
                 || curr_servers_num != servers_num) {
                 weight_sum = curr_weight_sum;

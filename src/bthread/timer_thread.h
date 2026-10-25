@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 
 #ifndef BTHREAD_TIMER_THREAD_H
 #define BTHREAD_TIMER_THREAD_H
@@ -81,7 +84,7 @@ public:
     // Get identifier of internal pthread.
     // Returns (pthread_t)0 if start() is not called yet.
     pthread_t thread_id() const { return _thread; }
-    
+
 private:
     // the timer thread will run this method.
     void run();
@@ -92,11 +95,15 @@ private:
 
     TimerThreadOptions _options;
     Bucket* _buckets;        // list of tasks to be run
-    internal::FastPthreadMutex _mutex;    // protect _nearest_run_time
+    FastPthreadMutex _mutex;    // protect _nearest_run_time
     int64_t _nearest_run_time;
     // the futex for wake up timer thread. can't use _nearest_run_time because
     // it's 64-bit.
     int _nsignals;
+    // Number of tasks buffered in the internal min-heap, published by the
+    // timer thread each iteration. Not part of the public API; read by unit
+    // tests through the -fno-access-control build flag.
+    butil::atomic<int64_t> _npending;
     pthread_t _thread;       // all scheduled task will be run on this thread
 };
 

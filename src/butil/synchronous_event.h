@@ -1,18 +1,20 @@
-// Copyright (c) 2010 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Sun Nov 7 21:43:34 CST 2010
 
 #ifndef BUTIL_SYNCHRONOUS_EVENT_H
@@ -42,7 +44,7 @@
 //    FooEvent foo_event;                 // An instance of the event
 //    FooObserver foo_observer;           // An instance of the observer
 //    foo_event.subscribe(&foo_observer); // register the observer to the event
-//    foo_event.notify(1, NULL);          // foo_observer.on_event(1, NULL) is
+//    foo_event.notify(1, nullptr);          // foo_observer.on_event(1, nullptr) is
 //                                        // called *immediately*
 
 namespace butil {
@@ -64,9 +66,9 @@ public:
 
     // Add an observer, callable inside on_event() and added observers
     // will be called with the same event in the same run.
-    // Returns 0 when successful, -1 when the obsever is NULL or already added. 
+    // Returns 0 when successful, -1 when the obsever is nullptr or already added.
     int subscribe(Observer* ob) {
-        if (NULL == ob) {
+        if (nullptr == ob) {
             LOG(ERROR) << "Observer is NULL";
             return -1;
         }
@@ -80,9 +82,9 @@ public:
 
     // Remove an observer, callable inside on_event().
     // Users are responsible for removing observers before destroying them.
-    // Returns 0 when successful, -1 when the observer is NULL or already removed.
+    // Returns 0 when successful, -1 when the observer is nullptr or already removed.
     int unsubscribe(Observer* ob) {
-        if (NULL == ob) {
+        if (nullptr == ob) {
             LOG(ERROR) << "Observer is NULL";
             return -1;
         }
@@ -91,7 +93,7 @@ public:
         if (it == _obs.end()) {
             return -1;
         }
-        *it = NULL;
+        *it = nullptr;
         --_n;
         return 0;
     }
@@ -100,7 +102,7 @@ public:
     void clear() {
         for (typename ObserverSet::iterator
                  it = _obs.begin(); it != _obs.end(); ++it) {
-            *it = NULL;
+            *it = nullptr;
         }
         _n = 0;
     }

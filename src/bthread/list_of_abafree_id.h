@@ -1,26 +1,31 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Mon Jun 20 11:57:23 CST 2016
 
 #ifndef BTHREAD_LIST_OF_ABAFREE_ID_H
 #define BTHREAD_LIST_OF_ABAFREE_ID_H
 
-#include <vector>
 #include <deque>
+#include <vector>
+#include <cstdint>
+#include "butil/macros.h"
 
 namespace bthread {
 
@@ -45,6 +50,9 @@ namespace bthread {
 //   // Max #entries. Often has close relationship with concurrency, 65536
 //   // is "huge" for most apps.
 //   static const size_t MAX_ENTRIES = 65536;
+//   // Initial GC length, when the number of blocks reaches this length, 
+//   // start to initiate list GC operation. It will release useless blocks
+//   static const size_t INIT_GC_SIZE = 4096;
 //
 //   // Initial value of id. Id with the value is treated as invalid.
 //   static const Id ID_INIT = ...;
@@ -61,13 +69,14 @@ class ListOfABAFreeId {
 public:
     ListOfABAFreeId();
     ~ListOfABAFreeId();
-    
+
     // Add an identifier into the list.
     int add(Id id);
-    
+
     // Apply fn(id) to all identifiers.
-    template <typename Fn> void apply(const Fn& fn);
-    
+    template <typename Fn>
+    void apply(const Fn& fn);
+
     // Put #entries of each level into `counts'
     // Returns #levels.
     size_t get_sizes(size_t* counts, size_t n);
@@ -79,36 +88,48 @@ private:
         IdBlock* next;
     };
     void forward_index();
+
+    struct TempIdBlock {
+        IdBlock* block;
+        uint32_t index;
+        uint32_t nblock;
+    };
+
+    int gc();
+    int add_to_temp_list(TempIdBlock* temp_list, Id id);
+    template <typename Fn>
+    int for_each(const Fn& fn);
+    void free_list(IdBlock* block);
+
     IdBlock* _cur_block;
     uint32_t _cur_index;
     uint32_t _nblock;
     IdBlock _head_block;
+    uint32_t _next_gc_size;
 };
 
 // [impl.]
 
 template <typename Id, typename IdTraits> 
 ListOfABAFreeId<Id, IdTraits>::ListOfABAFreeId()
-    : _cur_block(&_head_block)
-    , _cur_index(0)
-    , _nblock(1) {
+        : _cur_block(&_head_block), _cur_index(0), _nblock(1), _next_gc_size(IdTraits::INIT_GC_SIZE) {
     for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
         _head_block.ids[i] = IdTraits::ID_INIT;
     }
-    _head_block.next = NULL;
+    _head_block.next = nullptr;
 }
 
 template <typename Id, typename IdTraits> 
 ListOfABAFreeId<Id, IdTraits>::~ListOfABAFreeId() {
-    _cur_block = NULL;
+    _cur_block = nullptr;
     _cur_index = 0;
     _nblock = 0;
-    for (IdBlock* p = _head_block.next; p != NULL;) {
+    for (IdBlock* p = _head_block.next; p != nullptr;) {
         IdBlock* saved_next = p->next;
         delete p;
         p = saved_next;
     }
-    _head_block.next = NULL;
+    _head_block.next = nullptr;
 }
 
 template <typename Id, typename IdTraits> 
@@ -137,6 +158,30 @@ int ListOfABAFreeId<Id, IdTraits>::add(Id id) {
         }
         saved_pos[i] = pos;
     }
+    // If we don't expect a GC to occur in abalist, then an error is reported and EAGAIN is returned.
+    if (_nblock * IdTraits::BLOCK_SIZE > IdTraits::MAX_ENTRIES) {
+        return EAGAIN;
+    }
+    // If the number of blocks exceeds the minimum GC length, start the GC operation
+    if (_nblock * IdTraits::BLOCK_SIZE > _next_gc_size) {
+        uint32_t before_gc_blocks = _nblock;
+        int rc = gc();
+        // To avoid frequent GC operations, we only let the GC be effective enough to continue the GC. 
+        // otherwise we let the next GC occur length * 2.
+        // 
+        // Condition for a GC to be sufficiently efficient: the number of blocks 
+        // retained after the GC is 1/4 of the previous one.
+        if ((before_gc_blocks - _nblock) * IdTraits::BLOCK_SIZE < (_next_gc_size - (_next_gc_size >> 2))) {
+            _next_gc_size <<= 1;
+            // We want to make sure that GC must occur before MAX_ENTRIES.
+            static_assert(IdTraits::MAX_ENTRIES > IdTraits::BLOCK_SIZE * 2, "MAX_ENTRIES should be greater than 2 * IdTraits::BLOCK_SIZE");
+            if (_next_gc_size >= IdTraits::MAX_ENTRIES) {
+                _next_gc_size = IdTraits::MAX_ENTRIES - IdTraits::BLOCK_SIZE * 2;
+            }
+        }
+
+        return rc;
+    }
     // The list is considered to be "crowded", add a new block and scatter
     // the conflict identifiers by inserting an empty entry after each of
     // them, so that even if the identifiers are still valid when we walk
@@ -149,13 +194,7 @@ int ListOfABAFreeId<Id, IdTraits>::add(Id id) {
     //
     //  [..xxxx....] -> [......yyyy] -> [..........]
     //    block A        new block      block B
-    if (_nblock * IdTraits::BLOCK_SIZE > IdTraits::MAX_ENTRIES) {
-        return EAGAIN;
-    }
-    IdBlock* new_block = new (std::nothrow) IdBlock;
-    if (NULL == new_block) {
-        return ENOMEM;
-    }
+    IdBlock* new_block = new IdBlock;
     ++_nblock;
     for (size_t i = 0; i < _cur_index; ++i) {
         new_block->ids[i] = IdTraits::ID_INIT;
@@ -186,14 +225,104 @@ int ListOfABAFreeId<Id, IdTraits>::add(Id id) {
 }
 
 template <typename Id, typename IdTraits>
+int ListOfABAFreeId<Id, IdTraits>::gc() {
+    IdBlock* new_block = new IdBlock;
+    // reset head block
+    for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
+        new_block->ids[i] = IdTraits::ID_INIT;
+    }
+    new_block->next = nullptr;
+
+    TempIdBlock tmp_id_block;
+    tmp_id_block.block = new_block;
+    tmp_id_block.nblock = 1;
+    tmp_id_block.index = 0;
+
+    // Add each element of the old list to the new list
+    int rc = for_each([&](Id id) {
+        int rc;
+        rc = add_to_temp_list(&tmp_id_block, id);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = add_to_temp_list(&tmp_id_block, IdTraits::ID_INIT);
+        if (rc != 0) {
+            return rc;
+        }
+        return 0;
+    });
+
+    if (rc != 0) {
+        free_list(new_block);
+        return rc;
+    }
+
+    // reset head block
+    for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
+        _head_block.ids[i] = IdTraits::ID_INIT;
+    }
+
+    free_list(_head_block.next);
+    _cur_block = tmp_id_block.block;
+    _cur_index = tmp_id_block.index;
+    // nblock and head_block
+    _nblock = tmp_id_block.nblock + 1;
+    _head_block.next = new_block;
+
+    return 0;
+}
+
+template <typename Id, typename IdTraits>
+int ListOfABAFreeId<Id, IdTraits>::add_to_temp_list(TempIdBlock* block_list, Id id) {
+    block_list->block->ids[block_list->index++] = id;
+    // add new list
+    if (block_list->index == IdTraits::BLOCK_SIZE) {
+        block_list->index = 0;
+        block_list->nblock++;
+        block_list->block->next = new IdBlock;
+        block_list->block = block_list->block->next;
+        for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
+            block_list->block->ids[i] = IdTraits::ID_INIT;
+        }
+        block_list->block->next = nullptr;
+    }
+    return 0;
+}
+
+template <typename Id, typename IdTraits>
+template <typename Fn>
+int ListOfABAFreeId<Id, IdTraits>::for_each(const Fn& fn) {
+    for (IdBlock* p = &_head_block; p != nullptr; p = p->next) {
+        for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
+            if (p->ids[i] != IdTraits::ID_INIT && IdTraits::exists(p->ids[i])) {
+                int rc = fn(p->ids[i]);
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+template <typename Id, typename IdTraits>
 template <typename Fn>
 void ListOfABAFreeId<Id, IdTraits>::apply(const Fn& fn) {
-    for (IdBlock* p = &_head_block; p != NULL; p = p->next) {
+    for (IdBlock* p = &_head_block; p != nullptr; p = p->next) {
         for (size_t i = 0; i < IdTraits::BLOCK_SIZE; ++i) {
             if (p->ids[i] != IdTraits::ID_INIT && IdTraits::exists(p->ids[i])) {
                 fn(p->ids[i]);
             }
         }
+    }
+}
+
+template <typename Id, typename IdTraits>
+void ListOfABAFreeId<Id, IdTraits>::free_list(IdBlock* p) {
+    for (; p != nullptr;) {
+        IdBlock* saved_next = p->next;
+        delete p;
+        p = saved_next;
     }
 }
 
@@ -207,6 +336,6 @@ size_t ListOfABAFreeId<Id, IdTraits>::get_sizes(size_t* cnts, size_t n) {
     return 1;
 }
 
-}  // namespace bthread
+} // namespace bthread
 
-#endif  // BTHREAD_LIST_OF_ABAFREE_ID_H
+#endif // BTHREAD_LIST_OF_ABAFREE_ID_H

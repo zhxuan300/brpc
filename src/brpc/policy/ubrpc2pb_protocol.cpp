@@ -1,25 +1,29 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
 #include <gflags/gflags.h>
 
-#include "butil/time.h"
 #include "butil/iobuf.h"                         // butil::IOBuf
+#include "butil/strings/string_util.h"
+#include "butil/time.h"
+
 #include "brpc/controller.h"               // Controller
 #include "brpc/socket.h"                   // Socket
 #include "brpc/server.h"                   // Server
@@ -51,7 +55,7 @@ void UbrpcAdaptor::ParseNsheadMeta(
     }
     mcpack2pb::ObjectIterator it1(&stream, request.body.size() - stream.popped_bytes());
     bool found_content = false;
-    for (; it1 != NULL; ++it1) {
+    for (; it1 != nullptr; ++it1) {
         if (it1->name == "content") {
             found_content = true;
             break;
@@ -68,7 +72,7 @@ void UbrpcAdaptor::ParseNsheadMeta(
     }
 
     mcpack2pb::ArrayIterator it2(it1->value);
-    if (it2 == NULL) {
+    if (it2 == nullptr) {
         cntl->SetFailed(EREQUEST, "Fail to parse request.content as array");
         return;
     }
@@ -77,7 +81,7 @@ void UbrpcAdaptor::ParseNsheadMeta(
     bool has_params = false;
     size_t user_req_offset = 0;
     size_t user_req_size = 0;
-    for (mcpack2pb::ObjectIterator it3(*it2); it3 != NULL; ++it3) {
+    for (mcpack2pb::ObjectIterator it3(*it2); it3 != nullptr; ++it3) {
         if (it3->name == "service_name") {
             if (it3->value.type() != mcpack2pb::FIELD_STRING) {
                 cntl->SetFailed(EREQUEST, "Expect request.content[0].service_name"
@@ -116,7 +120,7 @@ void UbrpcAdaptor::ParseNsheadMeta(
             user_req_size = it3->value.size();
             const size_t stream_end = stream.popped_bytes() + it3->value.size();
             mcpack2pb::ObjectIterator it4(it3->value);
-            if (it4 == NULL || it4.field_count() == 0) {
+            if (it4 == nullptr || it4.field_count() == 0) {
                 cntl->SetFailed(EREQUEST, "Nothing in request.content[0].params");
                 return;
             }
@@ -167,9 +171,9 @@ void UbrpcAdaptor::ParseNsheadMeta(
 void UbrpcAdaptor::ParseRequestFromIOBuf(
     const NsheadMeta&, const NsheadMessage& raw_req,
     Controller* cntl, google::protobuf::Message* pb_req) const {
-    const std::string& msg_name = pb_req->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(pb_req->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
-    if (handler.parse_body == NULL) {
+    if (handler.parse_body == nullptr) {
         return cntl->SetFailed(EREQUEST, "Fail to find parser of %s",
                                msg_name.c_str());
     }
@@ -212,7 +216,7 @@ void UbrpcAdaptor::SerializeResponseToIOBuf(
         type = COMPRESS_TYPE_NONE;
     }
 
-    if (pb_res == NULL || cntl->Failed()) {
+    if (pb_res == nullptr || cntl->Failed()) {
         if (!cntl->Failed()) {
             cntl->SetFailed(ERESPONSE, "response was not created yet");
         }
@@ -225,9 +229,9 @@ void UbrpcAdaptor::SerializeResponseToIOBuf(
     //     return AppendError(meta, cntl, raw_res->body);
     // }
 
-    const std::string& msg_name = pb_res->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(pb_res->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
-    if (handler.serialize_body == NULL) {
+    if (handler.serialize_body == nullptr) {
         cntl->SetFailed(ERESPONSE, "Fail to find serializer of %s",
                         msg_name.c_str());
         return AppendError(meta, cntl, raw_res->body);
@@ -250,7 +254,7 @@ void UbrpcAdaptor::SerializeResponseToIOBuf(
             }
             sr.begin_object("result_params");
             const char* const response_name = cntl->idl_names().response_name;
-            if (response_name != NULL && *response_name) {
+            if (response_name != nullptr && *response_name) {
                 sr.begin_object(response_name);
                 handler.serialize_body(*pb_res, sr, _format);
                 sr.end_object();
@@ -273,13 +277,13 @@ void UbrpcAdaptor::SerializeResponseToIOBuf(
 
 static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
                           google::protobuf::Message* res) {
-    if (res == NULL) {
+    if (res == nullptr) {
         // silently ignore response.
         return;
     }
-    const std::string& msg_name = res->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(res->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
-    if (handler.parse_body == NULL) {
+    if (handler.parse_body == nullptr) {
         return cntl->SetFailed(ERESPONSE, "Fail to find parser of %s",
                                msg_name.c_str());
     }
@@ -291,7 +295,7 @@ static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
     }
     mcpack2pb::ObjectIterator it1(&stream, buf.size() - stream.popped_bytes());
     bool found_content = false;
-    for (; it1 != NULL; ++it1) {
+    for (; it1 != nullptr; ++it1) {
         if (it1->name == "content") {
             found_content = true;
             break;
@@ -307,7 +311,7 @@ static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
         return;
     }
     mcpack2pb::ArrayIterator it2(it1->value);
-    if (it2 == NULL) {
+    if (it2 == nullptr) {
         cntl->SetFailed("Fail to parse response.content as array");
         return;
     }
@@ -315,7 +319,7 @@ static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
     size_t user_res_offset = 0;
     size_t user_res_size = 0;
     const char* response_name = "result_params";
-    for (mcpack2pb::ObjectIterator it3(*it2); it3 != NULL; ++it3) {
+    for (mcpack2pb::ObjectIterator it3(*it2); it3 != nullptr; ++it3) {
         if (it3->name == "error") {
             if (it3->value.type() != mcpack2pb::FIELD_OBJECT) {
                 cntl->SetFailed(ERESPONSE, "Expect response.content[0].error"
@@ -325,7 +329,7 @@ static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
             }
             int32_t code = 0;
             std::string msg;
-            for (mcpack2pb::ObjectIterator it4(it3->value); it4 != NULL; ++it4) {
+            for (mcpack2pb::ObjectIterator it4(it3->value); it4 != nullptr; ++it4) {
                 if (it4->name == "code") {
                     if (!mcpack2pb::is_primitive(it4->value.type()) ||
                         !mcpack2pb::is_integral(
@@ -386,10 +390,10 @@ static void ParseResponse(Controller* cntl, butil::IOBuf& buf,
             user_res_size = it3->value.size();
             const size_t stream_end = stream.popped_bytes() + it3->value.size();
             const char* const expname = cntl->idl_names().response_name;
-            if (expname != NULL && *expname) {
+            if (expname != nullptr && *expname) {
                 mcpack2pb::ObjectIterator it4(it3->value);
                 bool found_response_name = false;
-                for (; it4 != NULL; ++it4) {
+                for (; it4 != nullptr; ++it4) {
                     if (it4->name == expname) {
                         found_response_name = true;
                         break;
@@ -442,7 +446,7 @@ void ProcessUbrpcResponse(InputMessageBase* msg_base) {
     
     // Fetch correlation id that we saved before in `PackUbrpcRequest'
     const bthread_id_t cid = { static_cast<uint64_t>(socket->correlation_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -451,8 +455,7 @@ void ProcessUbrpcResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size());
@@ -463,7 +466,7 @@ void ProcessUbrpcResponse(InputMessageBase* msg_base) {
     
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 } 
 
@@ -475,12 +478,12 @@ static void SerializeUbrpcRequest(butil::IOBuf* buf, Controller* cntl,
         return cntl->SetFailed(
             EREQUEST, "ubrpc protocol doesn't support compression");
     }
-    if (cntl->method() == NULL) {
+    if (cntl->method() == nullptr) {
         return cntl->SetFailed(ENOMETHOD, "method is NULL");
     }
-    const std::string& msg_name = request->GetDescriptor()->full_name();
+    const std::string msg_name = butil::EnsureString(request->GetDescriptor()->full_name());
     mcpack2pb::MessageHandler handler = mcpack2pb::find_message_handler(msg_name);
-    if (handler.serialize_body == NULL) {
+    if (handler.serialize_body == nullptr) {
         return cntl->SetFailed(EREQUEST, "Fail to find serializer of %s",
                                msg_name.c_str());
     }
@@ -498,12 +501,12 @@ static void SerializeUbrpcRequest(butil::IOBuf* buf, Controller* cntl,
         sr.begin_mcpack_array("content", mcpack2pb::FIELD_OBJECT);
         sr.begin_object();
         {
-            sr.add_string("service_name", cntl->method()->service()->name());
+            sr.add_string("service_name", butil::EnsureString(cntl->method()->service()->name()));
             sr.add_int64("id", cntl->call_id().value);
-            sr.add_string("method", cntl->method()->name());
+            sr.add_string("method", butil::EnsureString(cntl->method()->name()));
             sr.begin_object("params");
             const char* const request_name = cntl->idl_names().request_name;
-            if (request_name != NULL && *request_name) {
+            if (request_name != nullptr && *request_name) {
                 sr.begin_object(request_name);
                 handler.serialize_body(*request, sr, format);
                 sr.end_object();

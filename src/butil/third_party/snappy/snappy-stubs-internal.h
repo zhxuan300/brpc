@@ -114,13 +114,13 @@ namespace snappy {
 // See if that would be more efficient on platforms supporting it,
 // at least for copies.
 
-inline uint64_tUNALIGNED_LOAD64(const void *p) {
-    uint64_tt;
+inline uint64_t UNALIGNED_LOAD64(const void *p) {
+    uint64_t t;
     memcpy(&t, p, sizeof t);
     return t;
 }
 
-inline void UNALIGNED_STORE64(void *p, uint64_tv) {
+inline void UNALIGNED_STORE64(void *p, uint64_t v) {
     memcpy(p, &v, sizeof v);
 }
 
@@ -141,8 +141,8 @@ inline uint32_t UNALIGNED_LOAD32(const void *p) {
     return t;
 }
 
-inline uint64_tUNALIGNED_LOAD64(const void *p) {
-    uint64_tt;
+inline uint64_t UNALIGNED_LOAD64(const void *p) {
+    uint64_t t;
     memcpy(&t, p, sizeof t);
     return t;
 }
@@ -155,7 +155,7 @@ inline void UNALIGNED_STORE32(void *p, uint32_t v) {
     memcpy(p, &v, sizeof v);
 }
 
-inline void UNALIGNED_STORE64(void *p, uint64_tv) {
+inline void UNALIGNED_STORE64(void *p, uint64_t v) {
     memcpy(p, &v, sizeof v);
 }
 
@@ -164,6 +164,21 @@ inline void UNALIGNED_STORE64(void *p, uint64_tv) {
 // This can be more efficient than UNALIGNED_LOAD64 + UNALIGNED_STORE64
 // on some platforms, in particular ARM.
 inline void UnalignedCopy64(const void *src, void *dst) {
+#if defined(__riscv) && __riscv_xlen == 64
+    // RISC-V optimized: single ld/sd pair for 8-byte copy (aligned only)
+    if ((((uintptr_t)src | (uintptr_t)dst) & 7) == 0) {
+        uint64_t tmp;
+        __asm__ volatile(
+            "ld %0, %1\n\t"
+            "sd %0, %2\n\t"
+            : "=&r"(tmp)
+            : "m"(*(const uint64_t*)src), "m"(*(uint64_t*)dst)
+            : "memory");
+    } else {
+        // Unaligned: fall back to memcpy-based approach
+        memcpy(dst, src, 8);
+    }
+#else
     if (sizeof(void *) == 8) {
         UNALIGNED_STORE64(dst, UNALIGNED_LOAD64(src));
     } else {
@@ -173,6 +188,7 @@ inline void UnalignedCopy64(const void *src, void *dst) {
         UNALIGNED_STORE32(dst_char, UNALIGNED_LOAD32(src_char));
         UNALIGNED_STORE32(dst_char + 4, UNALIGNED_LOAD32(src_char + 4));
     }
+#endif
 }
 
 // Convert to little-endian storage, opposite of network format.

@@ -17,9 +17,13 @@ ParallelChannel (有时被称为“pchan”)同时访问其包含的sub channel�
 - 可以取消。
 - 支持超时。
 
-示例代码见[example/parallel_echo_c++](https://github.com/brpc/brpc/tree/master/example/parallel_echo_c++/)。
+示例代码见[example/parallel_echo_c++](https://github.com/apache/brpc/tree/master/example/parallel_echo_c++/)。
 
-任何brpc::ChannelBase的子类都可以加入ParallelChannel，包括ParallelChannel和其他组合Channel。用户可以设置ParallelChannelOptions.fail_limit来控制访问的最大失败次数，当失败的访问达到这个数目时，RPC会立刻结束而不等待超时。
+任何brpc::ChannelBase的子类都可以加入ParallelChannel，包括ParallelChannel和其他组合Channel。
+
+用户可以设置ParallelChannelOptions.fail_limit来控制访问的最大失败次数，当失败的访问达到这个数目时，RPC会立刻结束而不等待超时。
+
+用户可以设置ParallelChannelOptions.success_limit来控制访问的最大成功次数，当成功的访问达到这个数目时，RPC会立刻结束。ParallelChannelOptions.fail_limit的优先级高于ParallelChannelOptions.success_limit，只有未设置fail_limit时，success_limit才会生效。
 
 一个sub channel可多次加入同一个ParallelChannel。当你需要对同一个服务发起多次异步访问并等待它们完成的话，这很有用。
 
@@ -44,7 +48,7 @@ int AddChannel(brpc::ChannelBase* sub_channel,
 
 ## CallMapper
 
-用于把对ParallelChannel的调用转化为对sub channel的调用。如果call_mapper是NULL，sub channel的请求就是ParallelChannel的请求，而response则New()自ParallelChannel的response。如果call_mapper不为NULL，则会在ParallelChannel析构时被删除。call_mapper内含引用计数，一个call_mapper可与多个sub channel关联。
+用于把对ParallelChannel的调用转化为对sub channel的调用。如果call_mapper是nullptr，sub channel的请求就是ParallelChannel的请求，而response则New()自ParallelChannel的response。如果call_mapper不为nullptr，则会在ParallelChannel析构时被删除。call_mapper内含引用计数，一个call_mapper可与多个sub channel关联。
 
 ```c++
 class CallMapper {
@@ -52,13 +56,20 @@ public:
     virtual ~CallMapper();
  
     virtual SubCall Map(int channel_index/*starting from 0*/,
+                        int channel_count,
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) = 0;
+
+    virtual void MapController(int channel_index/*starting from 0*/, int channel_count,
+                               const Controller* main_cntl, Controller* sub_cntl);
 };
 ```
+### Map
 
 channel_index：该sub channel在ParallelChannel中的位置，从0开始计数。
+
+channel_count：ParallelChannel中sub channel的数量。
 
 method/request/response：ParallelChannel.CallMethod()的参数。
 
@@ -69,7 +80,7 @@ method/request/response：ParallelChannel.CallMethod()的参数。
 
 常见的Map()实现有：
 
-- 广播request。这也是call_mapper为NULL时的行为：
+- 广播request。这也是call_mapper为nullptr时的行为：
 ```c++
   class Broadcaster : public CallMapper {
   public:
@@ -117,9 +128,21 @@ method/request/response：ParallelChannel.CallMethod()的参数。
   };
 ```
 
+### MapController
+
+channel_index：该sub channel在ParallelChannel中的位置，从0开始计数。
+
+channel_count：ParallelChannel中sub channel的数量。
+
+main_cntl：ParallelChannel.CallMethod()的参数。
+
+sub_cntl：sub channel的请求对应的controller。默认实现：拷贝main_cntl的http_request和request_attachment到sub_cntl中。
+
+注意：修改ClientSettings相关配置（如超时、重试等）是无效的，因为所有sub_cntl都是使用main_cntl的ClientSettings配置。
+
 ## ResponseMerger
 
-response_merger把sub channel的response合并入总的response，其为NULL时，则使用response->MergeFrom(*sub_response)，MergeFrom的行为可概括为“除了合并repeated字段，其余都是覆盖”。如果你需要更复杂的行为，则需实现ResponseMerger。response_merger是一个个执行的，所以你并不需要考虑多个Merge同时运行的情况。response_merger在ParallelChannel析构时被删除。response_merger内含引用计数，一个response_merger可与多个sub channel关联。
+response_merger把sub channel的response合并入总的response，其为nullptr时，则使用response->MergeFrom(*sub_response)，MergeFrom的行为可概括为“除了合并repeated字段，其余都是覆盖”。如果你需要更复杂的行为，则需实现ResponseMerger。response_merger是一个个执行的，所以你并不需要考虑多个Merge同时运行的情况。response_merger在ParallelChannel析构时被删除。response_merger内含引用计数，一个response_merger可与多个sub channel关联。
 
 Result的取值有：
 - MERGED: 成功合并。
@@ -134,13 +157,13 @@ Result的取值有：
 ```c++
 // Get the controllers for accessing sub channels in combo channels.
 // Ordinary channel:
-//   sub_count() is 0 and sub() is always NULL.
+//   sub_count() is 0 and sub() is always nullptr.
 // ParallelChannel/PartitionChannel:
 //   sub_count() is #sub-channels and sub(i) is the controller for
 //   accessing i-th sub channel inside ParallelChannel, if i is outside
-//    [0, sub_count() - 1], sub(i) is NULL.
-//   NOTE: You must test sub() against NULL, ALWAYS. Even if i is inside
-//   range, sub(i) can still be NULL:
+//    [0, sub_count() - 1], sub(i) is nullptr.
+//   NOTE: You must test sub() against nullptr, ALWAYS. Even if i is inside
+//   range, sub(i) can still be nullptr:
 //   * the rpc call may fail and terminate before accessing the sub channel
 //   * the sub channel was skipped
 // SelectiveChannel/DynamicPartitionChannel:
@@ -152,14 +175,14 @@ const Controller* sub(int index) const;
 
 # SelectiveChannel
 
-[SelectiveChannel](https://github.com/brpc/brpc/blob/master/src/brpc/selective_channel.h) (有时被称为“schan”)按负载均衡算法访问其包含的Channel，相比普通Channel它更加高层：把流量分给sub channel，而不是具体的Server。SelectiveChannel主要用来支持机器组之间的负载均衡，它具备Channel的主要属性：
+[SelectiveChannel](https://github.com/apache/brpc/blob/master/src/brpc/selective_channel.h) (有时被称为“schan”)按负载均衡算法访问其包含的Channel，相比普通Channel它更加高层：把流量分给sub channel，而不是具体的Server。SelectiveChannel主要用来支持机器组之间的负载均衡，它具备Channel的主要属性：
 
 - 支持同步和异步访问。
 - 发起异步操作后可以立刻删除。
 - 可以取消。
 - 支持超时。
 
-示例代码见[example/selective_echo_c++](https://github.com/brpc/brpc/tree/master/example/selective_echo_c++/)。
+示例代码见[example/selective_echo_c++](https://github.com/apache/brpc/tree/master/example/selective_echo_c++/)。
 
 任何brpc::ChannelBase的子类都可加入SelectiveChannel，包括SelectiveChannel和其他组合Channel。
 
@@ -188,7 +211,7 @@ if (schan.Init(load_balancer, &schan_options) != 0) {
 初始化完毕后通过AddChannel加入sub channel。
 
 ```c++
-if (schan.AddChannel(sub_channel, NULL/*ChannelHandle*/) != 0) {  // 第二个参数ChannelHandle用于删除sub channel，不用删除可填NULL
+if (schan.AddChannel(sub_channel, nullptr/*ChannelHandle*/) != 0) {  // 第二个参数ChannelHandle用于删除sub channel，不用删除可填nullptr
     LOG(ERROR) << "Fail to add sub_channel";
     return -1;
 }
@@ -226,26 +249,26 @@ if (channel.Init("c_murmurhash", &schan_options) != 0) {
  
 for (int i = 0; i < 3; ++i) {
     brpc::Channel* sub_channel = new brpc::Channel;
-    if (sub_channel->Init(ns_node_name[i], "rr", NULL) != 0) {
+    if (sub_channel->Init(ns_node_name[i], "rr", nullptr) != 0) {
         LOG(ERROR) << "Fail to init sub channel " << i;
         return -1;
     }
-    if (channel.AddChannel(sub_channel, NULL/*handle for removal*/) != 0) {
+    if (channel.AddChannel(sub_channel, nullptr/*handle for removal*/) != 0) {
         LOG(ERROR) << "Fail to add sub_channel to channel";
         return -1;
     } 
 }
 ...
 XXXService_Stub stub(&channel);
-stub.FooMethod(&cntl, &request, &response, NULL);
+stub.FooMethod(&cntl, &request, &response, nullptr);
 ...
 ```
 
 # PartitionChannel
 
-[PartitionChannel](https://github.com/brpc/brpc/blob/master/src/brpc/partition_channel.h)是特殊的ParallelChannel，它会根据命名服务中的tag自动建立对应分库的sub channel。这样用户就可以把所有的分库机器挂在一个命名服务内，通过tag来指定哪台机器对应哪个分库。示例代码见[example/partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/partition_echo_c++/)。
+[PartitionChannel](https://github.com/apache/brpc/blob/master/src/brpc/partition_channel.h)是特殊的ParallelChannel，它会根据命名服务中的tag自动建立对应分库的sub channel。这样用户就可以把所有的分库机器挂在一个命名服务内，通过tag来指定哪台机器对应哪个分库。示例代码见[example/partition_echo_c++](https://github.com/apache/brpc/tree/master/example/partition_echo_c++/)。
 
-ParititonChannel只能处理一种分库方法，当用户需要多种分库方法共存，或从一个分库方法平滑地切换为另一种分库方法时，可以使用DynamicPartitionChannel，它会根据不同的分库方式动态地建立对应的sub PartitionChannel，并根据容量把请求分配给不同的分库。示例代码见[example/dynamic_partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/dynamic_partition_echo_c++/)。
+ParititonChannel只能处理一种分库方法，当用户需要多种分库方法共存，或从一个分库方法平滑地切换为另一种分库方法时，可以使用DynamicPartitionChannel，它会根据不同的分库方式动态地建立对应的sub PartitionChannel，并根据容量把请求分配给不同的分库。示例代码见[example/dynamic_partition_echo_c++](https://github.com/apache/brpc/tree/master/example/dynamic_partition_echo_c++/)。
 
 如果分库在不同的命名服务内，那么用户得自行用ParallelChannel组装，即每个sub channel对应一个分库（使用不同的命名服务）。ParellelChannel的使用方法见[上面](#ParallelChannel)。
 
@@ -265,7 +288,7 @@ public:
             LOG(ERROR) << "Invalid tag=" << tag;
             return false;
         }
-        char* endptr = NULL;
+        char* endptr = nullptr;
         out->index = strtol(tag.c_str(), &endptr, 10);
         if (endptr != tag.data() + pos) {
             LOG(ERROR) << "Invalid index=" << butil::StringPiece(tag.data(), pos);

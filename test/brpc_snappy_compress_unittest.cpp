@@ -1,15 +1,33 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: 2015/01/20 19:01:06
 
 #include <gtest/gtest.h>
-#include "butil/gperftools_profiler.h"
+#include <gflags/gflags.h>
+#include "gperftools_helper.h"
 #include "butil/third_party/snappy/snappy.h"
 #include "butil/macros.h"
 #include "butil/iobuf.h"
 #include "butil/time.h"
 #include "snappy_message.pb.h"
+#include "brpc/compress.h"
 #include "brpc/policy/snappy_compress.h"
 #include "brpc/policy/gzip_compress.h"
 
@@ -236,4 +254,34 @@ TEST_F(test_compress_method, mass_snappy_iobuf) {
     std::string check_str = check_buf.to_string();
     ASSERT_TRUE(strcmp(check_str.c_str(), text) == 0);
     delete [] text;
+}
+
+TEST_F(test_compress_method, decompressed_size_capped) {
+    // Regression test: decompressors used to enforce no output limit, so a
+    // small compressed body (checked against -max_body_size in compressed
+    // form only) could decompress to tens of GiB (decompression bomb).
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_decompressed_body_size = 1024;
+
+    butil::IOBuf raw;
+    raw.append(std::string(64 * 1024, '\0'));
+
+    butil::IOBuf gzipped;
+    ASSERT_TRUE(brpc::policy::GzipCompress(raw, &gzipped, nullptr));
+    butil::IOBuf out;
+    ASSERT_FALSE(brpc::policy::GzipDecompress(gzipped, &out));
+
+    butil::IOBuf snappied;
+    ASSERT_TRUE(brpc::policy::SnappyCompress(raw, &snappied));
+    out.clear();
+    ASSERT_FALSE(brpc::policy::SnappyDecompress(snappied, &out));
+
+    // Payloads under the cap still decompress fine.
+    brpc::FLAGS_max_decompressed_body_size = 1024 * 1024;
+    out.clear();
+    ASSERT_TRUE(brpc::policy::GzipDecompress(gzipped, &out));
+    ASSERT_EQ(raw.size(), out.size());
+    out.clear();
+    ASSERT_TRUE(brpc::policy::SnappyDecompress(snappied, &out));
+    ASSERT_EQ(raw.size(), out.size());
 }

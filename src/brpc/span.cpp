@@ -1,20 +1,23 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <netinet/in.h>
+#include <functional>
 #include <gflags/gflags.h>
 #include <leveldb/db.h>
 #include <leveldb/comparator.h>
@@ -27,14 +30,98 @@
 #include "butil/object_pool.h"
 #include "butil/fast_rand.h"
 #include "butil/file_util.h"
+#include "butil/files/file_enumerator.h"
 #include "brpc/shared_object.h"
 #include "brpc/reloadable_flags.h"
 #include "brpc/span.h"
 
 #define BRPC_SPAN_INFO_SEP "\1"
 
-
 namespace brpc {
+
+// Callback for creating a new bthread span when creating a new bthread.
+// This is called by bthread layer when BTHREAD_INHERIT_SPAN flag is set.
+// Returns a heap-allocated weak_ptr<Span>* as void*, or nullptr if span creation fails.
+void* CreateBthreadSpanAsVoid() {
+    const int64_t received_us = butil::cpuwide_time_us();
+    const int64_t base_realtime = butil::gettimeofday_us() - received_us;
+    std::shared_ptr<Span> span = Span::CreateBthreadSpan("Bthread", base_realtime);
+
+    if (!span) {
+        return nullptr;
+    }
+    return new std::weak_ptr<Span>(span);
+}
+
+void DestroyRpczParentSpan(void* ptr) {
+    if (ptr) {
+        delete static_cast<std::weak_ptr<Span>*>(ptr);
+    }
+}
+
+void EndBthreadSpan() {
+    std::shared_ptr<Span> span = GetTlsParentSpan();
+    if (span) {
+        span->set_ending_tid(bthread_self());
+    }
+
+    ClearTlsParentSpan();
+}
+
+void SetTlsParentSpan(std::shared_ptr<Span> span) {
+    using namespace bthread;
+    LocalStorage ls = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_bls);
+    if (ls.rpcz_parent_span) {
+        *static_cast<std::weak_ptr<Span>*>(ls.rpcz_parent_span) = span;
+    } else {
+        ls.rpcz_parent_span = new std::weak_ptr<Span>(span);
+        BAIDU_SET_VOLATILE_THREAD_LOCAL(tls_bls, ls);
+    }
+}
+
+std::shared_ptr<Span> GetTlsParentSpan() {
+    using namespace bthread;
+    LocalStorage ls = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_bls);
+    if (!ls.rpcz_parent_span) {
+        return nullptr;
+    }
+
+    auto* weak_ptr = static_cast<std::weak_ptr<Span>*>(ls.rpcz_parent_span);
+    return weak_ptr->lock();
+}
+
+void ClearTlsParentSpan() {
+    using namespace bthread;
+    LocalStorage ls = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_bls);
+    if (ls.rpcz_parent_span) {
+        static_cast<std::weak_ptr<Span>*>(ls.rpcz_parent_span)->reset();
+    }
+}
+
+bool HasTlsParentSpan() {
+    using namespace bthread;
+    LocalStorage ls = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_bls);
+    if (!ls.rpcz_parent_span) {
+        return false;
+    }
+
+    auto* weak_ptr = static_cast<std::weak_ptr<Span>*>(ls.rpcz_parent_span);
+    return !weak_ptr->expired();
+}
+
+
+void SpanDeleter::operator()(Span* r) const {
+    if (r == nullptr) {
+        return;
+    }
+
+    // All children will be destroyed automatically along with the list.
+    // The list holds std::shared_ptr<> which will trigger deletion of
+    // children.
+    r->_client_list.clear();
+    r->_info.clear();
+    butil::return_object(r);
+}
 
 const int64_t SPAN_DELETE_INTERVAL_US = 10000000L/*10s*/;
 
@@ -56,6 +143,9 @@ DEFINE_int32(rpcz_keep_span_seconds, 3600,
 BRPC_VALIDATE_GFLAG(rpcz_keep_span_seconds, PositiveInteger);
 
 DEFINE_bool(rpcz_keep_span_db, false, "Don't remove DB of rpcz at program's exit");
+
+DEFINE_int64(rpcz_save_span_min_latency_us, 0, "The minimum latency microseconds of span saved");
+BRPC_VALIDATE_GFLAG(rpcz_save_span_min_latency_us, NonNegativeInteger);
 
 struct IdGen {
     bool init;
@@ -79,7 +169,7 @@ inline uint64_t UpdateTLSRandom64(IdGen* g) {
 
 inline uint64_t GenerateSpanId() {
     // 0 is an invalid Id
-    IdGen* g = &tls_trace_id_gen;
+    IdGen* g = &tls_span_id_gen;
     if (g->seq == 0) {
         UpdateTLSRandom64(g);
         g->seq = 1;
@@ -89,7 +179,7 @@ inline uint64_t GenerateSpanId() {
 
 inline uint64_t GenerateTraceId() {
     // 0 is an invalid Id
-    IdGen* g = &tls_span_id_gen;
+    IdGen* g = &tls_trace_id_gen;
     if (g->seq == 0) {
         UpdateTLSRandom64(g);
         g->seq = 1;
@@ -97,15 +187,29 @@ inline uint64_t GenerateTraceId() {
     return (g->current_random & 0xFFFFFFFFFFFF0000ULL) | g->seq++;
 }
 
-Span* Span::CreateClientSpan(const std::string& full_method_name,
-                             int64_t base_real_us) {
-    Span* span = butil::get_object<Span>(Forbidden());
-    if (__builtin_expect(span == NULL, 0)) {
-        return NULL;
+Span::Span(Forbidden) {
+    CHECK_EQ(0, pthread_spin_init(&_info_spinlock, 0))
+        << "Failed to initialize _info_spinlock";
+    CHECK_EQ(0, pthread_spin_init(&_client_list_spinlock, 0))
+        << "Failed to initialize _client_list_spinlock";
+}
+
+Span::~Span() {
+    pthread_spin_destroy(&_client_list_spinlock);
+    pthread_spin_destroy(&_info_spinlock);
+}
+
+std::shared_ptr<Span> Span::CreateClientSpan(const std::string& full_method_name,
+                                             int64_t base_real_us) {
+    Span* span_raw = butil::get_object<Span>(Forbidden());
+    if (__builtin_expect(span_raw == nullptr, 0)) {
+        return nullptr;
     }
+    std::shared_ptr<Span> span(span_raw, SpanDeleter());
+    span->_submitted.store(false, butil::memory_order_relaxed);
     span->_log_id = 0;
     span->_base_cid = INVALID_BTHREAD_ID;
-    span->_ending_cid = INVALID_BTHREAD_ID;
+    span->_ending_cid = INVALID_BTHREAD_ID;  // Client Span uses ending_cid
     span->_type = SPAN_TYPE_CLIENT;
     span->_async = false;
     span->_protocol = PROTOCOL_UNKNOWN;
@@ -118,22 +222,65 @@ Span* Span::CreateClientSpan(const std::string& full_method_name,
     span->_start_callback_real_us = 0;
     span->_start_send_real_us = 0;
     span->_sent_real_us = 0;
-    span->_next_client = NULL;
-    span->_tls_next = NULL;
     span->_full_method_name = full_method_name;
     span->_info.clear();
-    Span* parent = (Span*)bthread::tls_bls.rpcz_parent_span;
+    std::shared_ptr<Span> parent = Span::tls_parent();
     if (parent) {
         span->_trace_id = parent->trace_id();
         span->_parent_span_id = parent->span_id();
         span->_local_parent = parent;
-        span->_next_client = parent->_next_client;
-        parent->_next_client = span;
+        {
+            BAIDU_SCOPED_LOCK(parent->_client_list_spinlock);
+            parent->_client_list.push_back(span);
+        }
     } else {
         span->_trace_id = GenerateTraceId();
         span->_parent_span_id = 0;
-        span->_local_parent = NULL;
     }
+    span->_span_id = GenerateSpanId();
+    return span;
+}
+
+std::shared_ptr<Span> Span::CreateBthreadSpan(const std::string& full_method_name,
+                                              int64_t base_real_us) {
+    std::shared_ptr<Span> parent = Span::tls_parent();
+    Span* span_raw = butil::get_object<Span>(Forbidden());
+    if (__builtin_expect(span_raw == nullptr, 0)) {
+        return nullptr;
+    }
+    std::shared_ptr<Span> span(span_raw, SpanDeleter());
+    span->_submitted.store(false, butil::memory_order_relaxed);
+    span->_log_id = 0;
+    span->_base_cid = INVALID_BTHREAD_ID;
+    span->_ending_tid = INVALID_BTHREAD;  // Bthread Span uses ending_tid
+    span->_type = SPAN_TYPE_BTHREAD;
+    span->_async = false;
+    span->_protocol = PROTOCOL_UNKNOWN;
+    span->_error_code = 0;
+    span->_request_size = 0;
+    span->_response_size = 0;
+    span->_base_real_us = base_real_us;
+    span->_received_real_us = 0;
+    span->_start_parse_real_us = 0;
+    span->_start_callback_real_us = 0;
+    span->_start_send_real_us = 0;
+    span->_sent_real_us = 0;
+    span->_full_method_name = full_method_name;
+    span->_info.clear();
+
+    if (parent) {
+        span->_trace_id = parent->trace_id();
+        span->_parent_span_id = parent->span_id();
+        span->_local_parent = parent;
+        {
+            BAIDU_SCOPED_LOCK(parent->_client_list_spinlock);
+            parent->_client_list.push_back(span);
+        }
+    } else {
+        span->_trace_id = GenerateTraceId();
+        span->_parent_span_id = 0;
+    }
+
     span->_span_id = GenerateSpanId();
     return span;
 }
@@ -144,20 +291,22 @@ inline const std::string& unknown_span_name() {
     return s_unknown_method_name;
 }
 
-Span* Span::CreateServerSpan(
+std::shared_ptr<Span> Span::CreateServerSpan(
     const std::string& full_method_name,
     uint64_t trace_id, uint64_t span_id, uint64_t parent_span_id,
     int64_t base_real_us) {
-    Span* span = butil::get_object<Span>(Forbidden());
-    if (__builtin_expect(span == NULL, 0)) {
-        return NULL;
+    Span* span_raw = butil::get_object<Span>(Forbidden());
+    if (__builtin_expect(span_raw == nullptr, 0)) {
+        return nullptr;
     }
+    std::shared_ptr<Span> span(span_raw, SpanDeleter());
+    span->_submitted.store(false, butil::memory_order_relaxed);
     span->_trace_id = (trace_id ? trace_id : GenerateTraceId());
     span->_span_id = (span_id ? span_id : GenerateSpanId());
     span->_parent_span_id = parent_span_id;
     span->_log_id = 0;
     span->_base_cid = INVALID_BTHREAD_ID;
-    span->_ending_cid = INVALID_BTHREAD_ID;
+    span->_ending_cid = INVALID_BTHREAD_ID;  // Server Span uses ending_cid
     span->_type = SPAN_TYPE_SERVER;
     span->_async = false;
     span->_protocol = PROTOCOL_UNKNOWN;
@@ -170,16 +319,13 @@ Span* Span::CreateServerSpan(
     span->_start_callback_real_us = 0;
     span->_start_send_real_us = 0;
     span->_sent_real_us = 0;
-    span->_next_client = NULL;
-    span->_tls_next = NULL;
     span->_full_method_name = (!full_method_name.empty() ?
                                full_method_name : unknown_span_name());
     span->_info.clear();
-    span->_local_parent = NULL;
     return span;
 }
 
-Span* Span::CreateServerSpan(
+std::shared_ptr<Span> Span::CreateServerSpan(
     uint64_t trace_id, uint64_t span_id, uint64_t parent_span_id,
     int64_t base_real_us) {
     return CreateServerSpan(unknown_span_name(), trace_id, span_id,
@@ -191,21 +337,21 @@ void Span::ResetServerSpanName(const std::string& full_method_name) {
                          full_method_name : unknown_span_name());
 }
 
-void Span::destroy() {
+void Span::submit(int64_t cpuwide_us) {
+    // Called for server spans and root client spans (those without a local
+    // parent). Child client spans are serialized under their parent via
+    // _client_list instead.
     EndAsParent();
-    Span* p = _next_client;
-    while (p) {
-        Span* p_next = p->_next_client;
-        p->_info.clear();
-        butil::return_object(p);
-        p = p_next;
-    }
-    _info.clear();
-    butil::return_object(this);
+    // If memory allocation fails, the server span will not be submitted for persistence.
+    // The server span will be destroyed later when its shared_ptr refcount drops to zero
+    // Child spans (held in _client_list) will also be destroyed when
+    // their refcounts reach zero.
+    (new SpanContainer(shared_from_this()))->submit(cpuwide_us);
 }
 
 void Span::Annotate(const char* fmt, ...) {
     const int64_t anno_time = butil::cpuwide_time_us() + _base_real_us;
+    BAIDU_SCOPED_LOCK(_info_spinlock);
     butil::string_appendf(&_info, BRPC_SPAN_INFO_SEP "%lld ",
                          (long long)anno_time);
     va_list ap;
@@ -216,6 +362,7 @@ void Span::Annotate(const char* fmt, ...) {
 
 void Span::Annotate(const char* fmt, va_list args) {
     const int64_t anno_time = butil::cpuwide_time_us() + _base_real_us;
+    BAIDU_SCOPED_LOCK(_info_spinlock);
     butil::string_appendf(&_info, BRPC_SPAN_INFO_SEP "%lld ",
                          (long long)anno_time);
     butil::string_vappendf(&_info, fmt, args);
@@ -223,6 +370,7 @@ void Span::Annotate(const char* fmt, va_list args) {
 
 void Span::Annotate(const std::string& info) {
     const int64_t anno_time = butil::cpuwide_time_us() + _base_real_us;
+    BAIDU_SCOPED_LOCK(_info_spinlock);
     butil::string_appendf(&_info, BRPC_SPAN_INFO_SEP "%lld ",
                          (long long)anno_time);
     _info.append(info);
@@ -230,6 +378,7 @@ void Span::Annotate(const std::string& info) {
 
 void Span::AnnotateCStr(const char* info, size_t length) {
     const int64_t anno_time = butil::cpuwide_time_us() + _base_real_us;
+    BAIDU_SCOPED_LOCK(_info_spinlock);
     butil::string_appendf(&_info, BRPC_SPAN_INFO_SEP "%lld ",
                          (long long)anno_time);
     if (length <= 0) {
@@ -240,8 +389,13 @@ void Span::AnnotateCStr(const char* info, size_t length) {
 }
 
 size_t Span::CountClientSpans() const {
-    size_t n = 0;
-    for (Span* p = _next_client; p; p = p->_next_client, ++n);
+    size_t n = 1;
+    {
+        BAIDU_SCOPED_LOCK(_client_list_spinlock);
+        for (const auto& child : _client_list) {
+            n += child->CountClientSpans();
+        }
+    }
     return n;
 }
 
@@ -265,7 +419,7 @@ SpanInfoExtractor::SpanInfoExtractor(const char* info)
 
 bool SpanInfoExtractor::PopAnnotation(
     int64_t before_this_time, int64_t* time, std::string* annotation) {
-    for (; _sp != NULL; ++_sp) {
+    for (; _sp != nullptr; ++_sp) {
         butil::StringSplitter sp_time(_sp.field(), _sp.field() + _sp.length(), ' ');
         if (sp_time) {
             char* endptr;
@@ -290,15 +444,26 @@ bool SpanInfoExtractor::PopAnnotation(
 }
 
 bool CanAnnotateSpan() {
-    return bthread::tls_bls.rpcz_parent_span;
+    return HasTlsParentSpan();
 }
-    
+
 void AnnotateSpan(const char* fmt, ...) {
-    Span* span = (Span*)bthread::tls_bls.rpcz_parent_span;
-    va_list ap;
-    va_start(ap, fmt);
-    span->Annotate(fmt, ap);
-    va_end(ap);
+    std::shared_ptr<Span> span = GetTlsParentSpan();
+    if (span) { // TRACEPRINTF checks CanAnnotateSpan, but this is safer.
+        va_list ap;
+        va_start(ap, fmt);
+        span->Annotate(fmt, ap);
+        va_end(ap);
+    }
+}
+
+void AnnotateSpanEx(std::shared_ptr<Span> span, const char* fmt, ...) {
+    if (span) {
+        va_list ap;
+        va_start(ap, fmt);
+        span->Annotate(fmt, ap);
+        va_end(ap);
+    }
 }
 
 class SpanDB : public SharedObject {
@@ -308,9 +473,9 @@ public:
     std::string id_db_name;
     std::string time_db_name;
 
-    SpanDB() : id_db(NULL), time_db(NULL) { }
+    SpanDB() : id_db(nullptr), time_db(nullptr) { }
     static SpanDB* Open();
-    leveldb::Status Index(const Span* span, std::string* value_buf);
+    leveldb::Status Index(std::shared_ptr<const Span> span, std::string* value_buf);
     leveldb::Status RemoveSpansBefore(int64_t tm);
 
 private:
@@ -320,18 +485,16 @@ private:
         std::swap(db1.time_db, db2.time_db);
         std::swap(db1.time_db_name, db2.time_db_name);
     }
-    
+
     ~SpanDB() {
-        if (id_db == NULL && time_db == NULL) {
+        if (id_db == nullptr && time_db == nullptr) {
             return;
         }
         delete id_db;
         delete time_db;
         if (!FLAGS_rpcz_keep_span_db) {
-            std::string cmd = butil::string_printf("rm -rf %s %s",
-                                                  id_db_name.c_str(),
-                                                  time_db_name.c_str());
-            butil::ignore_result(system(cmd.c_str()));
+            butil::DeleteFile(butil::FilePath(id_db_name), true);
+            butil::DeleteFile(butil::FilePath(time_db_name), true);
         }
     }
 };
@@ -343,17 +506,30 @@ static int64_t g_last_delete_tm = 0;
 
 // Following variables are monitored by builtin services, thus non-static.
 static pthread_mutex_t g_span_db_mutex = PTHREAD_MUTEX_INITIALIZER;
+// The collector already dumps samples on a single thread. This mutex also
+// serializes persistence with shutdown and is intentionally never destroyed,
+// so collector callbacks can still acquire it after the exit guard has run.
+static pthread_mutex_t g_span_dump_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_span_ending = false;  // don't open span again if this var is true.
 // Can't use intrusive_ptr which has ctor/dtor issues.
-static SpanDB* g_span_db = NULL;
-bool has_span_db() { return !!g_span_db; }
+static SpanDB* g_span_db = nullptr;
+bool has_span_db() {
+    BAIDU_SCOPED_LOCK(g_span_db_mutex);
+    return g_span_db != nullptr;
+}
 bvar::CollectorSpeedLimit g_span_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
 static bvar::DisplaySamplingRatio s_display_sampling_ratio(
     "rpcz_sampling_ratio", &g_span_sl);
 
 struct SpanEarlier {
-    bool operator()(bvar::Collected* c1, bvar::Collected* c2) const {
-        return ((Span*)c1)->GetStartRealTimeUs() < ((Span*)c2)->GetStartRealTimeUs();
+    bool operator()(const bvar::Collected* c1, const bvar::Collected* c2) const {
+        const SpanContainer* container1 = static_cast<const SpanContainer*>(c1);
+        const SpanContainer* container2 = static_cast<const SpanContainer*>(c2);
+        
+        const int64_t time1 = container1->span()->GetStartRealTimeUs();
+        const int64_t time2 = container2->span()->GetStartRealTimeUs();
+        
+        return time1 < time2;
     }
 };
 class SpanPreprocessor : public bvar::CollectorPreprocessor {
@@ -361,10 +537,10 @@ public:
     void process(std::vector<bvar::Collected*> & list) {
         // Sort spans by their starting time so that the code on making
         // time monotonic in Span::Index works better.
-        std::sort(list.begin(), list.end(), SpanEarlier()); 
+        std::sort(list.begin(), list.end(), SpanEarlier());
     }
 };
-static SpanPreprocessor* g_span_prep = NULL;
+static SpanPreprocessor* g_span_prep = nullptr;
 
 bvar::CollectorSpeedLimit* Span::speed_limit() {
     return &g_span_sl;
@@ -374,10 +550,15 @@ bvar::CollectorPreprocessor* Span::preprocessor() {
     return g_span_prep;
 }
 
-static void ResetSpanDB(SpanDB* db) {
-    SpanDB* old_db = NULL;
+static bool ResetSpanDB(SpanDB* db) {
+    SpanDB* old_db = nullptr;
     {
         BAIDU_SCOPED_LOCK(g_span_db_mutex);
+        // Opening a DB can overlap with StopSpanIndexing(). Never publish it
+        // after shutdown has started.
+        if (db != nullptr && g_span_ending) {
+            return false;
+        }
         old_db = g_span_db;
         g_span_db = db;
         if (g_span_db) {
@@ -387,15 +568,32 @@ static void ResetSpanDB(SpanDB* db) {
     if (old_db) {
         old_db->RemoveRefManually();
     }
+    return true;
 }
 
-static void RemoveSpanDB() {
-    g_span_ending = true;
-    ResetSpanDB(NULL);
+void StopSpanIndexing() {
+    // Reject new dumps before waiting for the current one. Do not hold the DB
+    // mutex while acquiring the dump mutex: the dumper also needs the DB mutex.
+    {
+        BAIDU_SCOPED_LOCK(g_span_db_mutex);
+        g_span_ending = true;
+    }
+    BAIDU_SCOPED_LOCK(g_span_dump_mutex);
+    ResetSpanDB(nullptr);
 }
+
+// Defined after the flags in this translation unit so this destructor runs
+// before their destructors. Registering cleanup lazily in StartSpanIndexing is
+// too late when the first dump starts during process exit.
+struct SpanIndexingExitGuard {
+    ~SpanIndexingExitGuard() { StopSpanIndexing(); }
+};
+// No explicit reference is needed: the compiler registers its destructor for
+// normal process exit (e.g. via __cxa_atexit). When this translation unit is
+// linked in, optimization must preserve the StopSpanIndexing() side effects.
+static SpanIndexingExitGuard g_span_indexing_exit_guard;
 
 static void StartSpanIndexing() {
-    atexit(RemoveSpanDB);
     g_span_prep = new SpanPreprocessor;
     started_span_indexing = true;
 }
@@ -409,15 +607,18 @@ static int StartIndexingIfNeeded() {
 
 inline int GetSpanDB(butil::intrusive_ptr<SpanDB>* db) {
     BAIDU_SCOPED_LOCK(g_span_db_mutex);
-    if (g_span_db != NULL) {
+    if (g_span_db != nullptr) {
         *db = g_span_db;
         return 0;
     }
     return -1;
 }
 
-void Span::Submit(Span* span, int64_t cpuwide_time_us) {
-    if (span->local_parent() == NULL) {
+void Span::Submit(std::shared_ptr<Span> span, int64_t cpuwide_time_us) {
+    // Submit root spans without a local parent. Server spans and root client
+    // spans are submitted independently; child client spans with a live local
+    // parent are serialized under the parent to avoid duplicate submissions.
+    if (span->local_parent().expired() && span->try_mark_submitted()) {
         span->submit(cpuwide_time_us);
     }
 }
@@ -442,6 +643,7 @@ static void Span2Proto(const Span* span, RpczSpan* out) {
     out->set_start_send_real_us(span->start_send_real_us());
     out->set_sent_real_us(span->sent_real_us());
     out->set_full_method_name(span->full_method_name());
+    // info() returns by value for thread safety (see span.h for details).
     out->set_info(span->info());
     out->set_error_code(span->error_code());
 }
@@ -456,6 +658,15 @@ inline uint64_t ToLittleEndian(const uint32_t* buf) {
 }
 
 SpanDB* SpanDB::Open() {
+    // Remove old rpcz directory even if crash occurs.
+    if (!FLAGS_rpcz_keep_span_db) {
+        butil::FileEnumerator dirs(butil::FilePath(FLAGS_rpcz_database_dir), false,
+                                   butil::FileEnumerator::DIRECTORIES, "[0-9]*.[0-9]*.[0-9]*");
+        for (auto name = dirs.Next(); !name.empty(); name = dirs.Next()) {
+            butil::DeleteFile(name, true);
+        }
+    }
+
     SpanDB local;
     leveldb::Status st;
     char prefix[64];
@@ -479,14 +690,14 @@ SpanDB* SpanDB::Open() {
     if (!butil::CreateDirectoryAndGetError(dir, &error)) {
         LOG(ERROR) << "Fail to create directory=`" << dir.value() << ", "
                    << error;
-        return NULL;
+        return nullptr;
     }
 
     local.id_db_name.append("/id.db");
     st = leveldb::DB::Open(options, local.id_db_name.c_str(), &local.id_db);
     if (!st.ok()) {
         LOG(ERROR) << "Fail to open id_db: " << st.ToString();
-        return NULL;
+        return nullptr;
     }
 
     local.time_db_name.append(FLAGS_rpcz_database_dir);
@@ -495,29 +706,31 @@ SpanDB* SpanDB::Open() {
     st = leveldb::DB::Open(options, local.time_db_name.c_str(), &local.time_db);
     if (!st.ok()) {
         LOG(ERROR) << "Fail to open time_db: " << st.ToString();
-        return NULL;
+        return nullptr;
     }
-    SpanDB* db = new (std::nothrow) SpanDB;
-    if (NULL == db) {
-        return NULL;
-    }
+    SpanDB* db = new SpanDB;
     LOG(INFO) << "Opened " << local.id_db_name << " and "
                << local.time_db_name;
     Swap(local, *db);
     return db;
 }
 
-leveldb::Status SpanDB::Index(const Span* span, std::string* value_buf) {
+leveldb::Status SpanDB::Index(std::shared_ptr<const Span> span, std::string* value_buf) {
     leveldb::WriteOptions options;
     options.sync = false;
 
     leveldb::Status st;
-    
+
     // NOTE: Writing into time_db before id_db so that if the second write
     // fails, the entry in time_db will be finally removed when it's out
     // of time window.
 
     const int64_t start_time = span->GetStartRealTimeUs();
+    const int64_t latency_us = span->GetEndRealTimeUs() - start_time;
+    // if latency_us < FLAGS_rpcz_save_span_min_latency_us, don't save this span
+    if (latency_us < FLAGS_rpcz_save_span_min_latency_us) {
+        return leveldb::Status::OK();
+    }
     BriefSpan brief;
     brief.set_trace_id(span->trace_id());
     brief.set_span_id(span->span_id());
@@ -527,7 +740,7 @@ leveldb::Status SpanDB::Index(const Span* span, std::string* value_buf) {
     brief.set_request_size(span->request_size());
     brief.set_response_size(span->response_size());
     brief.set_start_real_us(start_time);
-    brief.set_latency_us(span->GetEndRealTimeUs() - start_time);
+    brief.set_latency_us(latency_us);
     brief.set_full_method_name(span->full_method_name());
     if (!brief.SerializeToString(value_buf)) {
         return leveldb::Status::InvalidArgument(
@@ -562,21 +775,52 @@ leveldb::Status SpanDB::Index(const Span* span, std::string* value_buf) {
     if (!st.ok()) {
         return st;
     }
-    
+
     uint32_t key_data[4];
     ToBigEndian(span->trace_id(), key_data);
     ToBigEndian(span->span_id(), key_data + 2);
     leveldb::Slice key((char*)key_data, sizeof(key_data));
     RpczSpan value_proto;
-    Span2Proto(span, &value_proto);
-    // client spans should be reversed.
-    size_t client_span_count = span->CountClientSpans();
-    for (size_t i = 0; i < client_span_count; ++i) {
-        value_proto.add_client_spans();
-    }
-    size_t i = 0;
-    for (const Span* p = span->_next_client; p; p = p->_next_client, ++i) {
-        Span2Proto(p, value_proto.mutable_client_spans(client_span_count - i - 1));
+    Span2Proto(span.get(), &value_proto);
+
+    std::vector<std::shared_ptr<const Span>> all_child_spans;
+
+    std::function<void(std::shared_ptr<const Span>)> collect_all_spans =
+        [&](std::shared_ptr<const Span> current_span) {
+            if (!current_span) {
+                return;
+            }
+
+            std::vector<std::shared_ptr<const Span>> children;
+            {
+                BAIDU_SCOPED_LOCK(current_span->_client_list_spinlock);
+                children.reserve(current_span->_client_list.size());
+                for (const auto& child_span : current_span->_client_list) {
+                    if (child_span) {
+                        children.push_back(child_span);
+                    }
+                }
+            }
+
+            for (const auto& child : children) {
+                collect_all_spans(child);
+            }
+
+            all_child_spans.push_back(current_span);
+        };
+
+    collect_all_spans(span);
+
+    // Traverse in reverse order and insert child <span> elements.
+    // Only collect ended spans to avoid race conditions - active spans may still
+    // be modified by other threads, which could lead to inconsistent data when
+    // serializing to database.
+    for (auto it = all_child_spans.rbegin(); it != all_child_spans.rend(); ++it) {
+        if (*it && it->get() != span.get() && !(*it)->is_active() &&
+            (*it)->try_mark_submitted()) {
+            RpczSpan* child_proto = value_proto.add_client_spans();
+            Span2Proto((*it).get(), child_proto);
+        }
     }
     if (!value_proto.SerializeToString(value_buf)) {
         return leveldb::Status::InvalidArgument(
@@ -589,7 +833,7 @@ leveldb::Status SpanDB::Index(const Span* span, std::string* value_buf) {
 
 // NOTE: may take more than 100ms
 leveldb::Status SpanDB::RemoveSpansBefore(int64_t tm) {
-    if (id_db == NULL || time_db == NULL) {
+    if (id_db == nullptr || time_db == nullptr) {
         return leveldb::Status::InvalidArgument(leveldb::Slice("NULL param"));
     }
     leveldb::Status rc;
@@ -601,7 +845,7 @@ leveldb::Status SpanDB::RemoveSpansBefore(int64_t tm) {
             LOG(ERROR) << "Invalid key size: " << it->key().size();
             continue;
         }
-        const int64_t realtime = 
+        const int64_t realtime =
             ToLittleEndian((const uint32_t*)it->key().data());
         if (realtime >= tm) {  // removal is done.
             break;
@@ -618,7 +862,7 @@ leveldb::Status SpanDB::RemoveSpansBefore(int64_t tm) {
                 break;
             }
         } else {
-            LOG(ERROR) << "Fail to parse from value";
+            LOG(ERROR) << "Fail to parse value";
         }
         rc = time_db->Delete(options, it->key());
         if (!rc.ok()) {
@@ -631,33 +875,39 @@ leveldb::Status SpanDB::RemoveSpansBefore(int64_t tm) {
 }
 
 // Write span into leveldb.
-void Span::dump_and_destroy(size_t /*round*/) {
+void Span::dump_to_db() {
+    // This must outlive all locals, including the local DB reference: shutdown
+    // must wait for both persistence and any resulting DB destruction.
+    BAIDU_SCOPED_LOCK(g_span_dump_mutex);
+    {
+        BAIDU_SCOPED_LOCK(g_span_db_mutex);
+        if (g_span_ending) {
+            return;
+        }
+    }
     StartIndexingIfNeeded();
-    
+
     std::string value_buf;
 
     butil::intrusive_ptr<SpanDB> db;
     if (GetSpanDB(&db) != 0) {
-        if (g_span_ending) {
-            destroy();
-            return;
-        }
-        SpanDB* db2 = SpanDB::Open();
-        if (db2 == NULL) {
+        // Own the DB before publishing it. If shutdown started during Open(),
+        // the rejected DB is released before we leave the dump mutex.
+        db.reset(SpanDB::Open());
+        if (!db) {
             LOG(WARNING) << "Fail to open SpanDB";
-            destroy();
             return;
         }
-        ResetSpanDB(db2);
-        db.reset(db2);
+        if (!ResetSpanDB(db.get())) {
+            return;
+        }
     }
 
-    leveldb::Status st = db->Index(this, &value_buf);
-    destroy();
+    leveldb::Status st = db->Index(shared_from_this(), &value_buf);
     if (!st.ok()) {
         LOG(WARNING) << st.ToString();
         if (st.IsNotFound() || st.IsIOError() || st.IsCorruption()) {
-            ResetSpanDB(NULL);
+            ResetSpanDB(nullptr);
             return;
         }
     }
@@ -671,12 +921,48 @@ void Span::dump_and_destroy(size_t /*round*/) {
         if (!st.ok()) {
             LOG(ERROR) << st.ToString();
             if (st.IsNotFound() || st.IsIOError() || st.IsCorruption()) {
-                ResetSpanDB(NULL);
+                ResetSpanDB(nullptr);
                 return;
             }
         }
     }
 }
+
+// ========== SpanContainer ============
+
+// Destroy the span container without persisting to database.
+// This is called in abnormal scenarios:
+// 1. When the pending sample queue is full (to prevent memory explosion)
+// 2. When grab_thread hasn't run for too long (system overload)
+// In these cases, we discard the span quickly without expensive I/O.
+void SpanContainer::destroy() {
+    delete this;
+}
+
+// The round parameter is required by bvar::Collected interface but unused here.
+// Other implementations (e.g., SampledRequest in rpc_dump.cpp) use it to detect
+// new batches and trigger per-round operations like reloading gflags or switching
+// output files. SpanContainer doesn't need batch-level operations since it writes
+// directly to leveldb without buffering or configuration reloading.
+void SpanContainer::dump_and_destroy(size_t round) {
+    if (_span) {
+        _span->dump_to_db();
+    }
+    destroy();
+}
+
+void SpanContainer::submit(int64_t cpuwide_us) {
+    bvar::Collected::submit(cpuwide_us);
+}
+
+bvar::CollectorSpeedLimit* SpanContainer::speed_limit() {
+    if (_span) {
+        return _span->speed_limit();
+    }
+    return nullptr;
+}
+
+// =====================================
 
 int FindSpan(uint64_t trace_id, uint64_t span_id, RpczSpan* response) {
     butil::intrusive_ptr<SpanDB> db;
@@ -747,7 +1033,7 @@ void ListSpans(int64_t starting_realtime, size_t max_scan,
     }
     BriefSpan brief;
     size_t nscan = 0;
-    for (size_t i = 0; nscan < max_scan && it->Valid(); ++i, it->Prev()) {
+    for (; nscan < max_scan && it->Valid(); it->Prev()) {
         const int64_t key_tm = ToLittleEndian((const uint32_t*)it->key().data());
         // May have some bigger time at the beginning, because leveldb returns
         // keys >= starting_realtime.
@@ -756,7 +1042,7 @@ void ListSpans(int64_t starting_realtime, size_t max_scan,
         }
         brief.Clear();
         if (brief.ParseFromArray(it->value().data(), it->value().size())) {
-            if (NULL == filter || filter->Keep(brief)) {
+            if (nullptr == filter || filter->Keep(brief)) {
                 out->push_back(brief);
             }
             // We increase the count no matter filter passed or not to avoid
@@ -774,8 +1060,8 @@ void DescribeSpanDB(std::ostream& os) {
     if (GetSpanDB(&db) != 0) {
         return;
     }
-    
-    if (db->id_db != NULL) {
+
+    if (db->id_db != nullptr) {
         std::string val;
         if (db->id_db->GetProperty(leveldb::Slice("leveldb.stats"), &val)) {
             os << "[ " << db->id_db_name << " ]\n" << val;
@@ -785,7 +1071,7 @@ void DescribeSpanDB(std::ostream& os) {
         }
     }
     os << '\n';
-    if (db->time_db != NULL) {
+    if (db->time_db != nullptr) {
         std::string val;
         if (db->time_db->GetProperty(leveldb::Slice("leveldb.stats"), &val)) {
             os << "[ " << db->time_db_name << " ]\n" << val;

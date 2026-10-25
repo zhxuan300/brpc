@@ -1,20 +1,25 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
-//          Ge,Jun (gejun@baidu.com)
 
+#include <ctype.h>                         // isalnum
+#include <string.h>                        // strpbrk
+#include <unordered_set>
+#include <gflags/gflags.h>
 #include "brpc/log.h"
 #include "brpc/details/http_parser.h"      // http_parser_parse_url
 #include "brpc/uri.h"                      // URI
@@ -22,14 +27,15 @@
 
 namespace brpc {
 
+DEFINE_uint32(http_max_query_count, 1000,
+              "Reject a URL carrying more than so many query parameters. "
+              "0 lifts the limit.");
+
 URI::URI() 
     : _port(-1)
     , _query_was_modified(false)
     , _initialized_query_map(false)
 {}
-
-URI::~URI() {
-}
 
 void URI::Clear() {
     _st.reset();
@@ -40,7 +46,7 @@ void URI::Clear() {
     _path.clear();
     _user_info.clear();
     _fragment.clear();
-    _schema.clear();
+    _scheme.clear();
     _query.clear();
     _query_map.clear();
 }
@@ -54,9 +60,25 @@ void URI::Swap(URI &rhs) {
     _path.swap(rhs._path);
     _user_info.swap(rhs._user_info);
     _fragment.swap(rhs._fragment);
-    _schema.swap(rhs._schema);
+    _scheme.swap(rhs._scheme);
     _query.swap(rhs._query);
     _query_map.swap(rhs._query_map);
+}
+
+// Counting separators rather than map entries deliberately overestimates: the
+// splitter walks every segment even when the keys repeat, and it is that walk,
+// not the final map size, that the limit is meant to bound.
+static bool TooManyQueries(const std::string& query) {
+    if (FLAGS_http_max_query_count == 0 || query.empty()) {
+        return false;
+    }
+    uint32_t count = 1;
+    for (char i : query) {
+        if (i == '&' && ++count > FLAGS_http_max_query_count) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Parse queries, which is case-sensitive
@@ -67,9 +89,6 @@ static void ParseQueries(URI::QueryMap& query_map, const std::string &query) {
     }
     for (QuerySplitter sp(query.c_str()); sp; ++sp) {
         if (!sp.key().empty()) {
-            if (!query_map.initialized()) {
-                query_map.init(URI::QUERY_MAP_INITIAL_BUCKET);
-            }
             std::string key(sp.key().data(), sp.key().size());
             std::string value(sp.value().data(), sp.value().size());
             query_map[key] = value;
@@ -80,13 +99,24 @@ static void ParseQueries(URI::QueryMap& query_map, const std::string &query) {
 inline const char* SplitHostAndPort(const char* host_begin,
                                     const char* host_end,
                                     int* port) {
-    uint64_t port_raw = 0;
-    uint64_t multiply = 1;
     for (const char* q = host_end - 1; q > host_begin; --q) {
         if (*q >= '0' && *q <= '9') {
-            port_raw += (*q - '0') * multiply;
-            multiply *= 10;
+            continue;
         } else if (*q == ':') {
+            // [q + 1, host_end) is all digits. Accumulate it forward and clamp
+            // to -1 as soon as it leaves the valid range, so an out-of-range
+            // port never narrows/wraps into a valid-looking wrong one (e.g.
+            // ":4294967377" truncating to 81, or a long run of digits
+            // overflowing the accumulator). This matches the port<0||port>65535
+            // rejection in str2endpoint/hostname2endpoint.
+            int64_t port_raw = 0;
+            for (const char* p = q + 1; p < host_end; ++p) {
+                port_raw = port_raw * 10 + (*p - '0');
+                if (port_raw > 65535) {
+                    port_raw = -1;
+                    break;
+                }
+            }
             *port = static_cast<int>(port_raw);
             return q;
         } else {
@@ -95,6 +125,21 @@ inline const char* SplitHostAndPort(const char* host_begin,
     }
     *port = -1;
     return host_end;
+}
+
+// valid characters in URL
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.3
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.4
+// space is not allowed by rfc3986, but allowed by brpc
+static bool is_valid_char(char c) {
+    static const std::unordered_set<char> other_valid_char = {
+        ':', '/', '?', '#', '[', ']', '@', '!', '$', '&',
+        '\'', '(', ')', '*', '+', ',', ';', '=', '-', '.',
+        '_', '~', '%', ' '
+    };
+
+    return (isalnum(c) || other_valid_char.count(c));
 }
 
 static bool is_all_spaces(const char* p) {
@@ -136,10 +181,26 @@ static const char g_url_parsing_fast_action_map_raw[] = {
 static const char* const g_url_parsing_fast_action_map =
     g_url_parsing_fast_action_map_raw + 128;
 
+// CR and LF are never valid in a URL and must not survive parsing: every
+// component is written verbatim into the serialized message later on, the
+// host/port into the "Host" header and the :authority pseudo-header, and
+// path/query/fragment into the HTTP/1 request line (PrintWithoutHost) and
+// the HTTP/2 :path (GenerateH2Path). Either byte there appends headers to
+// the request or starts a second one. Only the parsers below reject it; the
+// set_*() overwriters are documented as taking already-valid input.
+static bool has_crlf(const char* s) {
+    return strpbrk(s, "\r\n") != nullptr;
+}
+
 // This implementation is faster than http_parser_parse_url() and allows
-// ignoring of schema("http://")
+// ignoring of scheme("http://")
 int URI::SetHttpURL(const char* url) {
     Clear();
+
+    if (has_crlf(url)) {
+        _st.set_error(EINVAL, "Invalid CR/LF in url");
+        return -1;
+    }
     
     const char* p = url;
     // skip heading blanks
@@ -147,21 +208,24 @@ int URI::SetHttpURL(const char* url) {
         for (++p; *p == ' '; ++p) {}
     }
     const char* start = p;
-    // Find end of host, locate schema and user_info during the searching
-    bool need_schema = true;
+    // Find end of host, locate scheme and user_info during the searching
+    bool need_scheme = true;
     bool need_user_info = true;
     for (; true; ++p) {
-        const char action = g_url_parsing_fast_action_map[(int)*p];
+        const char action = g_url_parsing_fast_action_map[(signed char)*p];
         if (action == URI_PARSE_CONTINUE) {
             continue;
         }
         if (action == URI_PARSE_BREAK) {
             break;
         }
-        if (*p == ':') {
-            if (p[1] == '/' && p[2] == '/' && need_schema) {
-                need_schema = false;
-                _schema.assign(start, p - start);
+        if (!is_valid_char(*p)) {
+            _st.set_error(EINVAL, "invalid character in url");
+            return -1;
+        } else if (*p == ':') {
+            if (p[1] == '/' && p[2] == '/' && need_scheme) {
+                need_scheme = false;
+                _scheme.assign(start, p - start);
                 p += 2;
                 start = p + 1;
             }
@@ -207,6 +271,11 @@ int URI::SetHttpURL(const char* url) {
             }
         }
         _query.assign(start, p - start);
+        if (TooManyQueries(_query)) {
+            _st.set_error(EINVAL, "More than %u query parameters in url",
+                          FLAGS_http_max_query_count);
+            return -1;
+        }
     }
     if (*p == '#') {
         start = ++p;
@@ -225,18 +294,18 @@ int URI::SetHttpURL(const char* url) {
 }
 
 int ParseURL(const char* url,
-             std::string* schema_out, std::string* host_out, int* port_out) {
+             std::string* scheme_out, std::string* host_out, int* port_out) {
     const char* p = url;
     // skip heading blanks
     if (*p == ' ') {
         for (++p; *p == ' '; ++p) {}
     }
     const char* start = p;
-    // Find end of host, locate schema and user_info during the searching
-    bool need_schema = true;
+    // Find end of host, locate scheme and user_info during the searching
+    bool need_scheme = true;
     bool need_user_info = true;
     for (; true; ++p) {
-        const char action = g_url_parsing_fast_action_map[(int)*p];
+        const char action = g_url_parsing_fast_action_map[(signed char)*p];
         if (action == URI_PARSE_CONTINUE) {
             continue;
         }
@@ -244,10 +313,10 @@ int ParseURL(const char* url,
             break;
         }
         if (*p == ':') {
-            if (p[1] == '/' && p[2] == '/' && need_schema) {
-                need_schema = false;
-                if (schema_out) {
-                    schema_out->assign(start, p - start);
+            if (p[1] == '/' && p[2] == '/' && need_scheme) {
+                need_scheme = false;
+                if (scheme_out) {
+                    scheme_out->assign(start, p - start);
                 }
                 p += 2;
                 start = p + 1;
@@ -278,8 +347,8 @@ int ParseURL(const char* url,
 
 void URI::Print(std::ostream& os) const {
     if (!_host.empty()) {
-        if (!_schema.empty()) {
-            os << _schema << "://";
+        if (!_scheme.empty()) {
+            os << _scheme << "://";
         } else {
             os << "http://";
         }
@@ -324,9 +393,6 @@ void URI::PrintWithoutHost(std::ostream& os) const {
 }
 
 void URI::InitializeQueryMap() const {
-    if (!_query_map.initialized()) {
-        CHECK_EQ(0, _query_map.init(QUERY_MAP_INITIAL_BUCKET));
-    }
     ParseQueries(_query_map, _query);
     _query_was_modified = false;
     _initialized_query_map = true;
@@ -383,13 +449,19 @@ void URI::SetHostAndPort(const std::string& host) {
     _host.assign(host_begin, host_end - host_begin);
 }
 
-void URI::SetH2Path(const char* h2_path) {
+int URI::SetH2Path(const char* h2_path) {
+    _st.reset();
     _path.clear();
     _query.clear();
     _fragment.clear();
     _query_was_modified = false;
     _initialized_query_map = false;
     _query_map.clear();
+
+    if (has_crlf(h2_path)) {
+        _st.set_error(EINVAL, "Invalid CR/LF in :path");
+        return -1;
+    }
 
     const char* p = h2_path;
     const char* start = p;
@@ -399,25 +471,18 @@ void URI::SetH2Path(const char* h2_path) {
         start = ++p;
         for (; *p && *p != '#'; ++p) {}
         _query.assign(start, p - start);
+        if (TooManyQueries(_query)) {
+            _st.set_error(EINVAL, "More than %u query parameters in :path",
+                          FLAGS_http_max_query_count);
+            return -1;
+        }
     }
     if (*p == '#') {
         start = ++p;
         for (; *p; ++p) {}
         _fragment.assign(start, p - start);
     }
-}
-
-void QuerySplitter::split() {
-    butil::StringPiece query_pair(_sp.field(), _sp.length());
-    const size_t pos = query_pair.find('=');
-    if (pos == butil::StringPiece::npos) {
-        _key = query_pair;
-        _value.clear();
-    } else {
-        _key= query_pair.substr(0, pos);
-        _value = query_pair.substr(pos + 1);
-    }
-    _is_split = true;
+    return 0;
 }
 
 QueryRemover::QueryRemover(const std::string* str)

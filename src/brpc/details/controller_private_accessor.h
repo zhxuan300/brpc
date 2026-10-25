@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BRPC_CONTROLLER_PRIVATE_ACCESSOR_H
 #define BRPC_CONTROLLER_PRIVATE_ACCESSOR_H
@@ -27,8 +30,9 @@ class Message;
 }
 }
 
-
 namespace brpc {
+
+class Span;
 
 class AuthContext;
 
@@ -54,8 +58,32 @@ public:
         return _cntl->_current_call.sending_sock.get();
     }
 
+    bool does_response_match_request_socket(
+            CallId cid, SocketId response_socket_id) const {
+        const Controller::Call* call = nullptr;
+        if (cid == _cntl->current_id() ||
+            (cid == _cntl->_correlation_id &&
+             _cntl->_current_call.sending_sock == nullptr)) {
+            call = &_cntl->_current_call;
+        } else if (_cntl->_unfinished_call != nullptr &&
+                   cid == _cntl->get_id(_cntl->_unfinished_call->nretry)) {
+            call = _cntl->_unfinished_call;
+        } else {
+            return false;
+        }
+        // A regular client request always records the socket used to send it.
+        // Keep direct response injection available to internal tools and tests
+        // that do not issue a request through Controller::IssueRPC().
+        return call->sending_sock == nullptr ||
+               call->sending_sock->id() == response_socket_id;
+    }
+
+    int64_t real_timeout_ms() {
+        return _cntl->_real_timeout_ms;
+    }
+
     void move_in_server_receiving_sock(SocketUniquePtr& ptr) {
-        CHECK(_cntl->_current_call.sending_sock == NULL);
+        CHECK(_cntl->_current_call.sending_sock == nullptr);
         _cntl->_current_call.sending_sock.reset(ptr.release());
     }
 
@@ -63,40 +91,43 @@ public:
         return _cntl->_current_call.stream_user_data;
     }
 
-    ControllerPrivateAccessor &set_security_mode(bool security_mode) {
+    ControllerPrivateAccessor& set_security_mode(bool security_mode) {
         _cntl->set_flag(Controller::FLAGS_SECURITY_MODE, security_mode);
         return *this;
     }
 
-    ControllerPrivateAccessor &set_remote_side(const butil::EndPoint& pt) {
+    ControllerPrivateAccessor& set_remote_side(const butil::EndPoint& pt) {
         _cntl->_remote_side = pt;
         return *this;
     }
 
-    ControllerPrivateAccessor &set_local_side(const butil::EndPoint& pt) {
+    ControllerPrivateAccessor& set_local_side(const butil::EndPoint& pt) {
         _cntl->_local_side = pt;
         return *this;
     }
  
-    ControllerPrivateAccessor &set_auth_context(const AuthContext* ctx) {
+    ControllerPrivateAccessor& set_auth_context(const AuthContext* ctx) {
         _cntl->set_auth_context(ctx);
         return *this;
     }
 
-    ControllerPrivateAccessor &set_span(Span* span) {
-        _cntl->_span = span;
-        return *this;
-    }
+    // Overloaded set_span methods to support both shared_ptr and raw pointer
+    ControllerPrivateAccessor& set_span(const std::shared_ptr<Span>& span);
+    ControllerPrivateAccessor& set_span(Span* span);
     
-    ControllerPrivateAccessor &set_request_protocol(ProtocolType protocol) {
+    ControllerPrivateAccessor& set_request_protocol(ProtocolType protocol) {
         _cntl->_request_protocol = protocol;
         return *this;
     }
     
-    Span* span() const { return _cntl->_span; }
+    std::shared_ptr<Span> span() const;
 
     uint32_t pipelined_count() const { return _cntl->_pipelined_count; }
     void set_pipelined_count(uint32_t count) {  _cntl->_pipelined_count = count; }
+
+    // The mysql protocol stores its statement type (MYSQL_NORMAL_STATEMENT /
+    // MYSQL_PREPARED_STATEMENT) in the pipelined_count slot.
+    void set_mysql_statement_type(uint32_t type) { set_pipelined_count(type); }
 
     ControllerPrivateAccessor& set_server(const Server* server) {
         _cntl->_server = server;
@@ -112,8 +143,8 @@ public:
         return _cntl->_remote_stream_settings;
     }
 
-    StreamId request_stream() { return _cntl->_request_stream; }
-    StreamId response_stream() { return _cntl->_response_stream; }
+    StreamIds request_streams() { return _cntl->_request_streams; }
+    StreamIds response_streams() { return _cntl->_response_streams; }
 
     void set_method(const google::protobuf::MethodDescriptor* method) 
     { _cntl->_method = method; }
@@ -121,9 +152,33 @@ public:
     void set_readable_progressive_attachment(ReadableProgressiveAttachment* s)
     { _cntl->_rpa.reset(s); }
 
-    void add_with_auth() {
-        _cntl->add_flag(Controller::FLAGS_REQUEST_WITH_AUTH);
+    void set_readable_progressive_attachment(
+        ReadableProgressiveAttachment* s, SocketId socket_id) {
+        _cntl->_rpa.reset(s);
+        _cntl->_progressive_read_socket_id = socket_id;
     }
+
+    void set_auth_flags(uint32_t auth_flags) {
+        _cntl->_auth_flags = auth_flags;
+    }
+
+    void clear_auth_flags() { _cntl->_auth_flags = 0; }
+
+    // Set how the sending socket is reserved after the RPC (mysql transactions).
+    void set_bind_sock_action(BindSockAction action) { _cntl->set_bind_sock_action(action); }
+    // Transfer ownership of the reserved socket to `ptr`.
+    void get_bind_sock(SocketUniquePtr* ptr) {
+        if (_cntl->_bind_sock) {
+            _cntl->_bind_sock->ReAddress(ptr);
+        }
+    }
+    // Reuse an externally-reserved socket for the next RPC.
+    void use_bind_sock(SocketId sock_id) {
+        _cntl->set_bind_sock_action(BIND_SOCK_USE);
+        Socket::Address(sock_id, &_cntl->_bind_sock);
+    }
+    void set_session_data(void* d) { _cntl->_session_data = d; }
+    void* session_data() const { return _cntl->_session_data; }
 
     std::string& protocol_param() { return _cntl->protocol_param(); }
     const std::string& protocol_param() const { return _cntl->protocol_param(); }
@@ -138,6 +193,21 @@ public:
         return *this;
     }
 
+    ControllerPrivateAccessor& set_health_check_call() {
+        _cntl->add_flag(Controller::FLAGS_HEALTH_CHECK_CALL);
+        return *this;
+    }
+
+    void set_checksum_value(const char* c, size_t size) {
+        _cntl->_checksum_value.assign(c, size);
+    }
+
+    void set_checksum_value(const std::string& c) {
+        _cntl->_checksum_value = c;
+    }
+
+    const std::string& checksum_value() const { return _cntl->_checksum_value; }
+
 private:
     Controller* _cntl;
 };
@@ -146,7 +216,7 @@ private:
 // utility only useable by brpc developers.
 class RPCSender {
 public:
-    virtual ~RPCSender() {}
+    virtual ~RPCSender() = default;
     virtual int IssueRPC(int64_t start_realtime_us) = 0;
 };
 

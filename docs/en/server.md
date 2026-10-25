@@ -2,7 +2,7 @@
 
 # Example
 
-[server-side code](https://github.com/brpc/brpc/blob/master/example/echo_c++/server.cpp) of Echo.
+[server-side code](https://github.com/apache/brpc/blob/master/example/echo_c++/server.cpp) of Echo.
 
 # Fill the .proto
 
@@ -33,32 +33,32 @@ protoc generates echo.pb.cc and echo.pb.h. Include echo.pb.h and implement EchoS
 ```c++
 #include "echo.pb.h"
 ...
-class MyEchoService : public EchoService  {
+class MyEchoService : public EchoService {
 public:
-    void Echo(::google::protobuf::RpcController* cntl_base,
-              const ::example::EchoRequest* request,
-              ::example::EchoResponse* response,
-              ::google::protobuf::Closure* done) {
-        // This RAII object calls done->Run() automatically at exit.
-        brpc::ClosureGuard done_guard(done);
-         
-        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
- 
-        // fill response
-        response->set_message(request->message());
-    }
+    void Echo(::google::protobuf::RpcController* cntl_base,
+              const ::example::EchoRequest* request,
+              ::example::EchoResponse* response,
+              ::google::protobuf::Closure* done) {
+        // This RAII object calls done->Run() automatically at exit.
+        brpc::ClosureGuard done_guard(done);
+         
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+ 
+        // fill response
+        response->set_message(request->message());
+    }
 };
 ```
 
-Service is not available before insertion into [brpc.Server](https://github.com/brpc/brpc/blob/master/src/brpc/server.h).
+Service is not available before insertion into [brpc.Server](https://github.com/apache/brpc/blob/master/src/brpc/server.h).
 
-When client sends request, Echo() is called. 
+When client sends request, Echo() is called.
 
 Explain parameters:
 
 **controller**
 
-Statically convertible to brpc::Controller  (provided that the code runs in brpc.Server). Contains parameters that can't be included by request and response, check out [src/brpc/controller.h](https://github.com/brpc/brpc/blob/master/src/brpc/controller.h) for details.
+Statically convertible to brpc::Controller  (provided that the code runs in brpc.Server). Contains parameters that can't be included by request and response, check out [src/brpc/controller.h](https://github.com/apache/brpc/blob/master/src/brpc/controller.h) for details.
 
 **request**
 
@@ -89,26 +89,26 @@ In asynchronous service, request is not processed completely when CallMethod() r
 How synchronous and asynchronous services handle done generally:
 
 ```c++
-class MyFooService: public FooService  {
+class MyFooService: public FooService {
 public:
-    // Synchronous
-    void SyncFoo(::google::protobuf::RpcController* cntl_base,
-                 const ::example::EchoRequest* request,
-                 ::example::EchoResponse* response,
-                 ::google::protobuf::Closure* done) {
-         brpc::ClosureGuard done_guard(done);
-         ...
-    }
- 
-    // Aynchronous
-    void AsyncFoo(::google::protobuf::RpcController* cntl_base,
-                  const ::example::EchoRequest* request,
-                  ::example::EchoResponse* response,
-                  ::google::protobuf::Closure* done) {
-         brpc::ClosureGuard done_guard(done);
-         ...
-         done_guard.release();
-    }
+    // Synchronous
+    void SyncFoo(::google::protobuf::RpcController* cntl_base,
+                 const ::example::EchoRequest* request,
+                 ::example::EchoResponse* response,
+                 ::google::protobuf::Closure* done) {
+         brpc::ClosureGuard done_guard(done);
+         ...
+    }
+ 
+    // Aynchronous
+    void AsyncFoo(::google::protobuf::RpcController* cntl_base,
+                  const ::example::EchoRequest* request,
+                  ::example::EchoResponse* response,
+                  ::google::protobuf::Closure* done) {
+         brpc::ClosureGuard done_guard(done);
+         ...
+         done_guard.release();
+    }
 };
 ```
 
@@ -118,18 +118,18 @@ Interface of ClosureGuard:
 // RAII: Call Run() of the closure on destruction.
 class ClosureGuard {
 public:
-    ClosureGuard();
-    // Constructed with a closure which will be Run() inside dtor.
-    explicit ClosureGuard(google::protobuf::Closure* done);
-    
-    // Call Run() of internal closure if it's not NULL.
-    ~ClosureGuard();
- 
-    // Call Run() of internal closure if it's not NULL and set it to `done'.
-    void reset(google::protobuf::Closure* done);
- 
-    // Set internal closure to NULL and return the one before set.
-    google::protobuf::Closure* release();
+    ClosureGuard();
+    // Constructed with a closure which will be Run() inside dtor.
+    explicit ClosureGuard(google::protobuf::Closure* done);
+    
+    // Call Run() of internal closure if it's not nullptr.
+    ~ClosureGuard();
+ 
+    // Call Run() of internal closure if it's not nullptr and set it to `done'.
+    void reset(google::protobuf::Closure* done);
+ 
+    // Set internal closure to nullptr and return the one before set.
+    google::protobuf::Closure* release();
 };
 ```
 
@@ -137,7 +137,7 @@ public:
 
 Call Controller.SetFailed() to set the RPC to be failed. If error occurs during sending response, framework calls the method as well. Users often call the method in services' CallMethod(), For example if a stage of processing fails, user calls SetFailed() and call done->Run(), then quit CallMethod (If ClosureGuard is used, done->Run() is called automatically). The server-side done is created by framework and contains code sending response back to client. If SetFailed() is called, error information is sent to client instead of normal content. When client receives the response, its controller will be SetFailed() as well and Controller::Failed() will be true. In addition, Controller::ErrorCode() and Controller::ErrorText() are error code and error information respectively.
 
-User may set [status-code](http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html) for http calls by calling `controller.http_response().set_status_code()` at server-side. Standard status-code are defined in [http_status_code.h](https://github.com/brpc/brpc/blob/master/src/brpc/http_status_code.h). Controller.SetFailed() sets status-code as well with the value closest to the error-code in semantics. brpc::HTTP_STATUS_INTERNAL_SERVER_ERROR(500) is chosen when there's no proper value.
+User may set [status-code](http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html) for http calls by calling `controller.http_response().set_status_code()` at server-side. Standard status-code are defined in [http_status_code.h](https://github.com/apache/brpc/blob/master/src/brpc/http_status_code.h). Controller.SetFailed() sets status-code as well with the value closest to the error-code in semantics. brpc::HTTP_STATUS_INTERNAL_SERVER_ERROR(500) is chosen when there's no proper value.
 
 ## Get address of client
 
@@ -167,7 +167,7 @@ In which done->Run() is called after leaving service's CallMethod().
 
 Some server proxies requests to back-end servers and waits for responses that may come back after a long time. To make better use of threads, save done in corresponding event handlers which are triggered after CallMethod() and call done->Run() inside. This kind of service is **asynchronous**.
 
-Last line of asynchronous service is often `done_guard.release()` to prevent done->Run() from being called at successful exit from CallMethod(). Check out [example/session_data_and_thread_local](https://github.com/brpc/brpc/tree/master/example/session_data_and_thread_local/) for a example.
+Last line of asynchronous service is often `done_guard.release()` to prevent done->Run() from being called at successful exit from CallMethod(). Check out [example/session_data_and_thread_local](https://github.com/apache/brpc/tree/master/example/session_data_and_thread_local/) for a example.
 
 Server-side and client-side both use done to represent the continuation code after leaving CallMethod, but they're **totally different**:
 
@@ -194,8 +194,8 @@ Following code adds MyEchoService:
 brpc::Server server;
 MyEchoService my_echo_service;
 if (server.AddService(&my_echo_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-    LOG(FATAL) << "Fail to add my_echo_service";
-    return -1;
+    LOG(FATAL) << "Fail to add my_echo_service";
+    return -1;
 }
 ```
 
@@ -203,21 +203,21 @@ You cannot add or remove services after the server is started.
 
 # Start server
 
-Call following methods of [Server](https://github.com/brpc/brpc/blob/master/src/brpc/server.h) to start serving.
+Call following methods of [Server](https://github.com/apache/brpc/blob/master/src/brpc/server.h) to start serving.
 
 ```c++
 int Start(const char* ip_and_port_str, const ServerOptions* opt);
 int Start(EndPoint ip_and_port, const ServerOptions* opt);
 int Start(int port, const ServerOptions* opt);
-int Start(const char *ip_str, PortRange port_range, const ServerOptions *opt);  // r32009后增加
+int Start(const char *ip_str, PortRange port_range, const ServerOptions *opt);  // r32009后增加
 ```
 
 "localhost:9000", "cq01-cos-dev00.cq01:8000", "127.0.0.1:7000" are valid `ip_and_port_str`. 
 
-All parameters take default values if `options` is NULL. If you need non-default values, code as follows:
+All parameters take default values if `options` is nullptr. If you need non-default values, code as follows:
 
 ```c++
-brpc::ServerOptions options;  // with default values
+brpc::ServerOptions options;  // with default values
 options.xxx = yyy;
 ...
 server.Start(..., &options);
@@ -226,6 +226,10 @@ server.Start(..., &options);
 ## Listen to multiple ports
 
 One server can only listen to one port (not counting ServerOptions.internal_port). To listen to N ports, start N servers .
+
+## Multi-process listening to one port
+
+When the `reuse_port` flag is turned on at startup, multiple processes can listen to one port (use SO_REUSEPORT internal).
 
 # Stop server
 
@@ -245,7 +249,7 @@ RunUntilAskedToQuit() simplifies the code to run and stop servers in most cases.
 ```c++
 // Wait until Ctrl-C is pressed, then Stop() and Join() the server.
 server.RunUntilAskedToQuit();
- 
+ 
 // server is stopped, write the code for releasing resources.
 ```
 
@@ -255,7 +259,7 @@ Services can be added or removed after Join() returns and server can be Start() 
 
 Services using protobuf can be accessed via http/h2+json generally. The json string stored in body is convertible to/from corresponding protobuf message.
 
-[echo server](https://github.com/brpc/brpc/blob/master/example/echo_c%2B%2B/server.cpp) as an example, is accessible from [curl](https://curl.haxx.se/).
+[echo server](https://github.com/apache/brpc/blob/master/example/echo_c%2B%2B/server.cpp) as an example, is accessible from [curl](https://curl.haxx.se/).
 
 
 ```shell
@@ -344,6 +348,17 @@ Server detects supported protocols automatically, without assignment from users.
 
 If you need more protocols, contact us.
 
+# fork without exec
+In general, [forked](https://linux.die.net/man/3/fork) subprocess should call [exec](https://linux.die.net/man/3/exec) ASAP, before which only async-signal-safe functions should be called. brpc programs using fork like this should work correctly even in previous versions. 
+
+But in some scenarios, users continue the subprocess without exec. Since fork only copies its caller's thread, which causes other threads to disappear after fork. In the case of brpc, bvar depends on a sampling_thread to sample various information, which disappears after fork and causes many bvars to be zeros.
+
+Latest brpc re-creates the thread after fork(when necessary) to make bvar work correctly, and can be forked again. A known problem is that the cpu profiler does not work after fork. However users still can't call fork at any time, since brpc and its applications create threads extensively, which are not re-created after fork:
+* most fork continues with exec, which wastes re-creations
+* bring too many troubles and complexities to the code
+
+brpc's strategy is to create these threads on demand and fork without exec should happen before all code that may create the threads. Specifically, **fork without exec should happen before initializing all Servers/Channels/Applications, earlier is better**. fork not obeying this causes the program dysfunctional. BTW, fork without exec better be avoided because many libraries do not support it.
+
 # Settings
 
 ## Version
@@ -360,19 +375,29 @@ If [-log_idle_connection_close](http://brpc.baidu.com:8765/flags/log_idle_connec
 | ------------------------- | ----- | ---------------------------------------- | ------------------- |
 | log_idle_connection_close | false | Print log when an idle connection is closed | src/brpc/socket.cpp |
 
+## Limit server connections
+
+Set `ServerOptions.max_connections` to limit simultaneous connections on the Server's public listener. The default value is 0 (unlimited). All protocols and services on that listener share the same limit, including RPC, HTTP, Redis, and builtin services. No dedicated protocol configuration is required.
+
+The acceptor reserves a slot before creating a brpc Socket, so idle connections and connections awaiting TLS handshakes count toward the limit. Connections over the limit are closed immediately without a protocol-specific response, before protocol parsing or TLS authentication. Connection slots are released when sockets are recycled.
+
+The internal listener configured by `ServerOptions.internal_port` is unlimited and does not consume public connection slots, so builtin services on that port remain available when the public listener is full. A business service registered with multiple Server instances on different ports has an independent limit on each public listener, even when those Servers share the same service object. `ServerStatistics.connection_count` includes both public and internal connections and may therefore exceed `max_connections`; `ServerStatistics.rejected_connection_count` reports the cumulative number of connections rejected by the public listener's limit.
+
+Call `Server::SetMaxConnections()` to atomically update the limit on a running Server, including one started without a limit. Raising the limit affects subsequent admission checks. Lowering it does not close existing connections; new connections are accepted again after the active public connection count falls below the limit. Set the limit to 0 to disable it. The setter returns -1 if the Server is not running and leaves `options().max_connections` at its startup value. Each `Start()` uses the limit in the options passed to that call.
+
 ## pid_file
 
 If this field is non-empty, Server creates a file named so at start-up, with pid as the content. Empty by default.
 
 ## Print hostname in each line of log
 
-This feature only affects logging macros in [butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h). 
+This feature only affects logging macros in [butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h).
 
 If [-log_hostname](http://brpc.baidu.com:8765/flags/log_hostname) is turned on, each line of log contains the hostname so that users know machines at where each line is generated from aggregated logs.
 
 ## Crash after printing FATAL log
 
-This feature only affects logging macros in [butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h), glog crashes for FATAL log by default.
+This feature only affects logging macros in [butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h), glog crashes for FATAL log by default.
 
 If [-crash_on_fatal_log](http://brpc.baidu.com:8765/flags/crash_on_fatal_log) is turned on, program crashes after printing LOG(FATAL) or failed assertions by CHECK*(), and generates coredump (with proper environmental settings). Default value is false. This flag can be turned on in tests to make sure the program never hit critical errors.
 
@@ -380,7 +405,7 @@ If [-crash_on_fatal_log](http://brpc.baidu.com:8765/flags/crash_on_fatal_log) is
 
 ## Minimum log level
 
-This feature is implemented by [butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h) and glog separately, as a same-named gflag.
+This feature is implemented by [butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h) and glog separately, as a same-named gflag.
 
 Only logs with levels **not less than** the level specified by -minloglevel are printed. This flag can be modified at run-time. Correspondence between values and log levels: 0=INFO 1=NOTICE 2=WARNING 3=ERROR 4=FATAL, default value is 0.
 
@@ -461,7 +486,7 @@ In http, attachment corresponds to [message body](http://www.w3.org/Protocols/rf
 
 ## Turn on SSL
 
-Update openssl to the latest version before turning on SSL, since older versions of openssl may have severe security problems and support less encryption algorithms, which is against with the purpose of using SSL. Setup `ServerOptions.ssl_options` to turn on SSL. Refer to [ssl_options.h](https://github.com/brpc/brpc/blob/master/src/brpc/ssl_options.h) for more details.
+Update openssl to the latest version before turning on SSL, since older versions of openssl may have severe security problems and support less encryption algorithms, which is against with the purpose of using SSL. Setup `ServerOptions.ssl_options` to turn on SSL. Refer to [ssl_options.h](https://github.com/apache/brpc/blob/master/src/brpc/ssl_options.h) for more details.
 
 ```c++
 // Certificate structure
@@ -500,8 +525,8 @@ struct ServerSSLOptions {
     // will be used.
     // Default: false
     bool strict_sni;
- 
-    // ... Other options
+ 
+    // ... Other options
 };
 ```
 
@@ -514,6 +539,13 @@ struct ServerSSLOptions {
   ```
 
 - Other options include: cipher suites (recommend using `ECDHE-RSA-AES256-GCM-SHA384` which is the default suite used by chrome, and one of the safest suites. The drawback is more CPU cost), session reuse and so on. 
+
+- If you want to support application layer protocol negotiation, you can use the `alpns` option to set the protocol string supported by the server side. When the server starts, the validity of the protocol will be verified, and multiple protocols are separated by commas. The specific usage is as follows:
+
+  ```c++
+  ServerSSLOptions ssl_options;
+  ssl_options.alpns = "http, h2, baidu_std";
+  ```
 
 - SSL layer works under protocol layer. As a result, all protocols (such as HTTP)  can provide SSL access when it's turned on. Server will decrypt the data first and then pass it into each protocol.
 
@@ -636,6 +668,8 @@ User code(client-side done, server-side CallMethod) runs in bthreads with 1MB st
 
 brpc offers pthread mode to solve the issues. When **-usercode_in_pthread** is turned on, user code will be run in pthreads. Functions that would block bthreads block pthreads.
 
+Note: With -usercode_in_pthread on, brpc::thread_local_data() does not guarantee to return valid value.
+
 Performance issues when pthread mode is on:
 
 - Since synchronous RPCs block worker pthreads, server often needs more workers (ServerOptions.num_threads), and scheduling efficiencies will be slightly lower.
@@ -645,7 +679,7 @@ Performance issues when pthread mode is on:
 
 pthread-mode lets legacy code to try brpc more easily, but we still recommend refactoring the code with bthread-local or even remove TLS gradually, to turn off the option in future.
 
-## Security mode
+## Security
 
 If requests are from public(including being proxied by nginx etc), you have to be aware of some security issues.
 
@@ -656,14 +690,24 @@ Builtin services are useful, on the other hand include a lot of internal informa
 - Set internal port. Set ServerOptions.internal_port to a port which can **only be accessible from internal**. You can view builtin services via internal_port, while accesses from the public port (the one passed to Server.Start) should see following error:
 
   ```
-  [a27eda84bcdeef529a76f22872b78305] Not allowed to access builtin services, try ServerOptions.internal_port=... instead if you're inside internal network
+  Not allowed to access builtin and Tabbed services, try ServerOptions.internal_port=... instead if you're in internal network
   ```
+
+  Conversely internal_port serves builtin (and Tabbed) services only, requests for ordinary services sent to it are rejected with:
+
+  ```
+  Only builtin and Tabbed services are accessible on ServerOptions.internal_port=..., send the request to the port passed to Server::Start() instead
+  ```
+
+  This is necessary: builtin requests on internal_port skip the authentication of ServerOptions.auth, and the verdict is remembered per connection since a connection is only authenticated once, on its first request. Were ordinary services served there as well, sending a builtin request first would mark the whole connection as authenticated and every later request on it would bypass authentication entirely.
+
+  Two kinds of services do not take the error path above. ServerOptions.http_master_service and ServerOptions.baidu_master_service answer for every URL and service name, the builtin ones included, so they are ignored on internal_port and the request falls back to the normal lookup, which keeps the builtin services reachable from that port. ServerOptions.redis_service handles the commands inside the parser and has no Controller to carry the EPERM, so internal_port does not speak redis at all and the connection is closed instead.
 
 - http proxies only proxy specified URLs. nginx etc is able to configure how to map different URLs to back-end servers. For example the configure below maps public traffic to /MyAPI to `/ServiceName/MethodName` of `target-server`. If builtin services like /status are accessed from public, nginx rejects the attempts directly.
 ```nginx
   location /MyAPI {
       ...
-      proxy_pass http://<target-server>/ServiceName/MethodName$query_string   # $query_string is a nginx varible, check out http://nginx.org/en/docs/http/ngx_http_core_module.html for more.
+      proxy_pass http://<target-server>/ServiceName/MethodName$query_string   # $query_string is a nginx variable, check out http://nginx.org/en/docs/http/ngx_http_core_module.html for more.
       ...
   }
 ```
@@ -672,6 +716,11 @@ Builtin services are useful, on the other hand include a lot of internal informa
 ```shell
 curl -s -m 1 <HOSTNAME>:<PORT>/flags/enable_dir_service,enable_threads_service | awk '{if($3=="false"){++falsecnt}else if($3=="Value"){isrpc=1}}END{if(isrpc!=1||falsecnt==2){print "SAFE"}else{print "NOT SAFE"}}'
 ```
+
+### Disable built-in services completely
+
+Set ServerOptions.has_builtin_services = false, you can completely disable the built-in services.
+
 ### Escape URLs controllable from public
 
 brpc::WebEscape() escapes url to prevent injection attacks with malice.
@@ -680,9 +729,13 @@ brpc::WebEscape() escapes url to prevent injection attacks with malice.
 
 Consider returning signatures of the addresses. For example after setting ServerOptions.internal_port, addresses in error information returned by server is replaced by their MD5 signatures.
 
+### Not start the brpc process as the root user
+
+During its operation, brpc writes various files (such as server pid files, rpcz, rpc dump, profiling, etc.). If brpc runs as the root user, attackers may exploit this feature to perform unauthorized file writes. Therefore, regardless of whether brpc provides network services or not, it is not recommended to start the brpc process as the root user.
+
 ## Customize /health
 
-/health returns "OK" by default. If the content on /health needs to be customized: inherit [HealthReporter](https://github.com/brpc/brpc/blob/master/src/brpc/health_reporter.h) and implement code to generate the page (like implementing other http services). Assign an instance to ServerOptions.health_reporter, which is not owned by server and must be valid during lifetime of the server. Users may return richer healthy information according to application requirements.
+/health returns "OK" by default. If the content on /health needs to be customized: inherit [HealthReporter](https://github.com/apache/brpc/blob/master/src/brpc/health_reporter.h) and implement code to generate the page (like implementing other http services). Assign an instance to ServerOptions.health_reporter, which is not owned by server and must be valid during lifetime of the server. Users may return richer healthy information according to application requirements.
 
 ## thread-local variables
 
@@ -692,7 +745,7 @@ Searching services inside Baidu use [thread-local storage](https://en.wikipedia.
 
 A session-local data is bound to a **server-side RPC**: from entering CallMethod of the service, to calling the server-side done->Run(), no matter the service is synchronous or asynchronous. All session-local data are reused as much as possible and not deleted before stopping the server.
 
-After setting ServerOptions.session_local_data_factory, call Controller.session_local_data() to get a session-local data. If ServerOptions.session_local_data_factory is unset, Controller.session_local_data() always returns NULL. 
+After setting ServerOptions.session_local_data_factory, call Controller.session_local_data() to get a session-local data. If ServerOptions.session_local_data_factory is unset, Controller.session_local_data() always returns nullptr. 
 
 If ServerOptions.reserved_session_local_data is greater than 0, Server creates so many data before serving.
 
@@ -717,7 +770,7 @@ public:
         // Get the session-local data which is created by ServerOptions.session_local_data_factory
         // and reused between different RPC.
         MySessionLocalData* sd = static_cast<MySessionLocalData*>(cntl->session_local_data());
-        if (sd == NULL) {
+        if (sd == nullptr) {
             cntl->SetFailed("Require ServerOptions.session_local_data_factory to be set with a correctly implemented instance");
             return;
         }
@@ -728,9 +781,9 @@ public:
 struct ServerOptions {
     ...
     // The factory to create/destroy data attached to each RPC session.
-    // If this field is NULL, Controller::session_local_data() is always NULL.
+    // If this field is nullptr, Controller::session_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* session_local_data_factory;
 
     // Prepare so many session-local data before server starts, so that calls
@@ -743,7 +796,7 @@ struct ServerOptions {
 };
 ```
 
-session_local_data_factory is typed [DataFactory](https://github.com/brpc/brpc/blob/master/src/brpc/data_factory.h). You have to implement CreateData and DestroyData inside.
+session_local_data_factory is typed [DataFactory](https://github.com/apache/brpc/blob/master/src/brpc/data_factory.h). You have to implement CreateData and DestroyData inside.
 
 NOTE: CreateData and DestroyData may be called by multiple threads simultaneously. Thread-safety is a must.
 
@@ -758,14 +811,15 @@ public:
     }
 };
 
+MySessionLocalDataFactory g_session_local_data_factory;
+
 int main(int argc, char* argv[]) {
     ...
-    MySessionLocalDataFactory session_local_data_factory;
 
     brpc::Server server;
     brpc::ServerOptions options;
     ...
-    options.session_local_data_factory = &session_local_data_factory;
+    options.session_local_data_factory = &g_session_local_data_factory;
     ...
 ```
 
@@ -773,7 +827,7 @@ int main(int argc, char* argv[]) {
 
 A server-thread-local is bound to **a call to service's CallMethod**, from entering service's CallMethod, to leaving the method. All server-thread-local data are reused as much as possible and will not be deleted before stopping the server. server-thread-local is implemented as a special bthread-local.
 
-After setting ServerOptions.thread_local_data_factory, call brpc::thread_local_data() to get a thread-local. If ServerOptions.thread_local_data_factory is unset, brpc::thread_local_data() always returns NULL. 
+After setting ServerOptions.thread_local_data_factory, call brpc::thread_local_data() to get a thread-local. If ServerOptions.thread_local_data_factory is unset, brpc::thread_local_data() always returns nullptr. 
 
 If ServerOptions.reserved_thread_local_data is greater than 0, Server creates so many data before serving.
 
@@ -805,7 +859,7 @@ public:
         // and reused between different threads.
         // "tls" is short for "thread local storage".
         MyThreadLocalData* tls = static_cast<MyThreadLocalData*>(brpc::thread_local_data());
-        if (tls == NULL) {
+        if (tls == nullptr) {
             cntl->SetFailed("Require ServerOptions.thread_local_data_factory "
                             "to be set with a correctly implemented instance");
             return;
@@ -818,9 +872,9 @@ struct ServerOptions {
     ...
     // The factory to create/destroy data attached to each searching thread
     // in server.
-    // If this field is NULL, brpc::thread_local_data() is always NULL.
+    // If this field is nullptr, brpc::thread_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* thread_local_data_factory;
 
     // Prepare so many thread-local data before server starts, so that calls
@@ -833,7 +887,7 @@ struct ServerOptions {
 };
 ```
 
-thread_local_data_factory is typed [DataFactory](https://github.com/brpc/brpc/blob/master/src/brpc/data_factory.h). You need to implement CreateData and DestroyData inside.
+thread_local_data_factory is typed [DataFactory](https://github.com/apache/brpc/blob/master/src/brpc/data_factory.h). You need to implement CreateData and DestroyData inside.
 
 NOTE: CreateData and DestroyData may be called by multiple threads simultaneously. Thread-safety is a must.
 
@@ -848,14 +902,15 @@ public:
     }
 };
 
+MyThreadLocalDataFactory g_thread_local_data_factory;
+
 int main(int argc, char* argv[]) {
     ...
-    MyThreadLocalDataFactory thread_local_data_factory;
 
     brpc::Server server;
     brpc::ServerOptions options;
     ...
-    options.thread_local_data_factory  = &thread_local_data_factory;
+    options.thread_local_data_factory  = &g_thread_local_data_factory;
     ...
 ```
 
@@ -872,12 +927,12 @@ Since brpc creates a bthread for each request, the bthread-local in the server b
 ```c++
 // Create a key value identifying a slot in a thread-specific data area.
 // Each thread maintains a distinct thread-specific data area.
-// `destructor', if non-NULL, is called with the value associated to that key
+// `destructor', if non-nullptr, is called with the value associated to that key
 // when the key is destroyed. `destructor' is not called if the value
-// associated is NULL when the key is destroyed.
+// associated is nullptr when the key is destroyed.
 // Returns 0 on success, error code otherwise.
 extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void* data));
- 
+ 
 // Delete a key previously returned by bthread_key_create().
 // It is the responsibility of the application to free the data related to
 // the deleted key in any running thread. No destructor is invoked by
@@ -885,7 +940,7 @@ extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void* data)
 // will no longer be called upon thread exit.
 // Returns 0 on success, error code otherwise.
 extern int bthread_key_delete(bthread_key_t key);
- 
+ 
 // Store `data' in the thread-specific slot identified by `key'.
 // bthread_setspecific() is callable from within destructor. If the application
 // does so, destructors will be repeatedly called for at most
@@ -900,10 +955,10 @@ extern int bthread_key_delete(bthread_key_t key);
 // Returns 0 on success, error code otherwise.
 // If the key is invalid or deleted, return EINVAL.
 extern int bthread_setspecific(bthread_key_t key, void* data);
- 
+ 
 // Return current value of the thread-specific slot identified by `key'.
-// If bthread_setspecific() had not been called in the thread, return NULL.
-// If the key is invalid or deleted, return NULL.
+// If bthread_setspecific() had not been called in the thread, return nullptr.
+// If the key is invalid or deleted, return nullptr.
 extern void* bthread_getspecific(bthread_key_t key);
 ```
 
@@ -911,7 +966,7 @@ extern void* bthread_getspecific(bthread_key_t key);
 
 Create a bthread_key_t which represents a kind of bthread-local variable.
 
-Use bthread_[get|set]specific to get and set bthread-local variables. First-time access to a bthread-local variable from a bthread returns NULL.
+Use bthread_[get|set]specific to get and set bthread-local variables. First-time access to a bthread-local variable from a bthread returns nullptr.
 
 Delete a bthread_key_t after no thread is using bthread-local associated with the key. If a bthread_key_t is deleted during usage, related bthread-local data are leaked.
 
@@ -930,7 +985,7 @@ if (bthread_key_create(&tls_key, my_data_destructor) != 0) {
 ```c++
 // in some thread ...
 MyThreadLocalData* tls = static_cast<MyThreadLocalData*>(bthread_getspecific(tls_key));
-if (tls == NULL) {  // First call to bthread_getspecific (and before any bthread_setspecific) returns NULL
+if (tls == nullptr) {  // First call to bthread_getspecific (and before any bthread_setspecific) returns nullptr
     tls = new MyThreadLocalData;   // Create thread-local data on demand.
     CHECK_EQ(0, bthread_setspecific(tls_key, tls));  // set the data so that next time bthread_getspecific in the thread returns the data.
 }
@@ -970,12 +1025,75 @@ public:
         //   pthread_getspecific -> bthread_getspecific
         //   pthread_setspecific -> bthread_setspecific
         MyThreadLocalData* tls2 = static_cast<MyThreadLocalData*>(bthread_getspecific(_tls2_key));
-        if (tls2 == NULL) {
+        if (tls2 == nullptr) {
             tls2 = new MyThreadLocalData;
             CHECK_EQ(0, bthread_setspecific(_tls2_key, tls2));
         }
         ...
 ```
+
+## RPC Protobuf message factory
+
+`DefaultRpcPBMessageFactory' is used at server-side by default. It is a simple factory class that uses `new' to create request/response messages and `delete' to destroy request/response messages. Currently, the baidu_std protocol and HTTP protocol support this feature.
+
+Users can implement `RpcPBMessages' (encapsulation of request/response message) and `RpcPBMessageFactory' (factory class) to customize the creation and destruction mechanism of protobuf message, and then set to `ServerOptions.rpc_pb_message_factory`. Note: After the server is started, the server owns the `RpcPBMessageFactory`.
+
+The interface is as follows:
+
+```c++
+// Inherit this class to customize rpc protobuf messages,
+// include request and response.
+class RpcPBMessages {
+public:
+    virtual ~RpcPBMessages() = default;
+    // Get protobuf request message.
+    virtual google::protobuf::Message* Request() = 0;
+    // Get protobuf response message.
+    virtual google::protobuf::Message* Response() = 0;
+};
+
+// Factory to manage `RpcPBMessages'.
+class RpcPBMessageFactory {
+public:
+    virtual ~RpcPBMessageFactory() = default;
+    // Get `RpcPBMessages' according to `service' and `method'.
+    // Common practice to create protobuf message:
+    // service.GetRequestPrototype(&method).New() -> request;
+    // service.GetResponsePrototype(&method).New() -> response.
+    virtual RpcPBMessages* Get(const ::google::protobuf::Service& service,
+                               const ::google::protobuf::MethodDescriptor& method) = 0;
+    // Return `RpcPBMessages' to factory.
+    virtual void Return(RpcPBMessages* protobuf_message) = 0;
+};
+```
+
+### Protobuf arena
+
+Protobuf arena is a Protobuf message memory management mechanism with the advantages of improving memory allocation efficiency, reducing memory fragmentation, and being cache-friendly. For more information, see [C++ Arena Allocation Guide](https://protobuf.dev/reference/cpp/arenas/).
+
+Users can set `ServerOptions.rpc_pb_message_factory = brpc::GetArenaRpcPBMessageFactory();` to manage Protobuf message memory,  with the default `start_block_size` (256 bytes) and `max_block_size` (8192 bytes). Alternatively, users can use `brpc::GetArenaRpcPBMessageFactory<StartBlockSize, MaxBlockSize>();` to customize the arena size.
+
+Note: Since Protocol Buffers v3.14.0, Arenas are now unconditionally enabled. However, for versions prior to Protobuf v3.14.0, users need to add the option `option cc_enable_arenas = true;` to the proto file. so for compatibility, this option can be added uniformly.
+
+## Ignoring eovercrowded on server-side
+### Ignore eovercrowded on server-level
+
+Set ServerOptions.ignore_eovercrowded. Default value is 0 which means not ignored.
+
+### Ignore eovercrowded on method-level
+
+server.IgnoreEovercrowdedOf("...") = … sets ignore_eovercrowded of the method. Possible settings:
+
+```c++
+ServerOptions.ignore_eovercrowded = true;                   // Set the default ignore_eovercrowded for all methods
+server.IgnoreEovercrowdedOf("example.EchoService.Echo") = true;
+```
+
+The code is generally put **after AddService, before Start() of the server**. When a setting fails(namely the method does not exist), server will fail to start and notify user to fix settings on IgnoreEovercrowdedOf.
+
+When method-level and server-level ignore_eovercrowded are both set, if any one of them is set to true, eovercrowded will be ignored.
+
+NOTE: No service-level ignore_eovercrowded.
 
 # FAQ
 

@@ -1,26 +1,30 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang(jiangrujie@baidu.com)
-//          Ge,Jun(gejun@baidu.com)
 
+#include <errno.h>
 #include <inttypes.h>
+#include <sys/socket.h>
 #include <gflags/gflags.h>
 #include "butil/fd_guard.h"                 // fd_guard 
 #include "butil/fd_utility.h"               // make_close_on_exec
 #include "butil/time.h"                     // gettimeofday_us
 #include "brpc/acceptor.h"
+#include "brpc/transport_factory.h"
 
 
 namespace brpc {
@@ -36,7 +40,13 @@ Acceptor::Acceptor(bthread_keytable_pool_t* pool)
     , _listened_fd(-1)
     , _acception_id(0)
     , _empty_cond(&_map_mutex)
-    , _ssl_ctx(NULL) {
+    , _connection_count(0)
+    , _rejected_connection_count(0)
+    , _max_connections(0)
+    , _force_ssl(false)
+    , _ssl_ctx(nullptr) 
+    , _socket_mode(SOCKET_MODE_TCP)
+    , _bthread_tag(BTHREAD_TAG_DEFAULT) {
 }
 
 Acceptor::~Acceptor() {
@@ -45,9 +55,23 @@ Acceptor::~Acceptor() {
 }
 
 int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
-                          const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+                          const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                          bool force_ssl) {
+    return StartAccept(listened_fd, idle_timeout_sec, ssl_ctx, force_ssl, 0);
+}
+
+int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
+                          const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                          bool force_ssl,
+                          size_t max_connections) {
     if (listened_fd < 0) {
         LOG(FATAL) << "Invalid listened_fd=" << listened_fd;
+        return -1;
+    }
+
+    if (!ssl_ctx && force_ssl) {
+        LOG(ERROR) << "Fail to force SSL for all connections "
+                      " because ssl_ctx is NULL";
         return -1;
     }
     
@@ -64,20 +88,25 @@ int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
         return -1;
     }
     if (idle_timeout_sec > 0) {
-        if (bthread_start_background(&_close_idle_tid, NULL,
-                                     CloseIdleConnections, this) != 0) {
+        bthread_attr_t tmp = BTHREAD_ATTR_NORMAL;
+        tmp.tag = _bthread_tag;
+        bthread_attr_set_name(&tmp, "CloseIdleConnections");
+        if (bthread_start_background(&_close_idle_tid, &tmp, CloseIdleConnections, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
             return -1;
         }
     }
     _idle_timeout_sec = idle_timeout_sec;
+    _force_ssl = force_ssl;
     _ssl_ctx = ssl_ctx;
+    SetMaxConnections(max_connections);
     
     // Creation of _acception_id is inside lock so that OnNewConnections
     // (which may run immediately) should see sane fields set below.
     SocketOptions options;
     options.fd = listened_fd;
     options.user = this;
+    options.bthread_tag = _bthread_tag;
     options.on_edge_triggered_events = OnNewConnections;
     if (Socket::Create(options, &_acception_id) != 0) {
         // Close-idle-socket thread will be stopped inside destructor
@@ -104,7 +133,7 @@ void* Acceptor::CloseIdleConnections(void* arg) {
             }
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void Acceptor::StopAccept(int /*closewait_ms*/) {
@@ -150,9 +179,8 @@ void Acceptor::StopAccept(int /*closewait_ms*/) {
 
 int Acceptor::Initialize() {
     if (_socket_map.init(INITIAL_CONNECTION_CAP) != 0) {
-        LOG(FATAL) << "Fail to initialize FlatMap, size="
+        LOG(WARNING) << "Fail to initialize FlatMap, size="
                    << INITIAL_CONNECTION_CAP;
-        return -1;
     }
     return 0;    
 }
@@ -175,7 +203,7 @@ void Acceptor::Join() {
     // Join the bthread outside lock.
     if (saved_idle_timeout_sec > 0) {
         bthread_stop(saved_close_idle_tid);
-        bthread_join(saved_close_idle_tid, NULL);
+        bthread_join(saved_close_idle_tid, nullptr);
     }
     
     {
@@ -185,14 +213,42 @@ void Acceptor::Join() {
 }
 
 size_t Acceptor::ConnectionCount() const {
-    // Notice that _socket_map may be modified concurrently. This actually
-    // assumes that size() is safe to call concurrently.
-    return _socket_map.size();
+    return _connection_count.load(butil::memory_order_relaxed);
+}
+
+size_t Acceptor::RejectedConnectionCount() const {
+    return _rejected_connection_count.load(butil::memory_order_relaxed);
+}
+
+bool Acceptor::TryAcquireConnectionSlot() {
+    size_t count = _connection_count.load(butil::memory_order_relaxed);
+    do {
+        const size_t max_connections =
+            _max_connections.load(butil::memory_order_relaxed);
+        if (max_connections != 0 && count >= max_connections) {
+            return false;
+        }
+    } while (!_connection_count.compare_exchange_weak(
+        count, count + 1, butil::memory_order_relaxed));
+    return true;
+}
+
+void Acceptor::ReleaseConnectionSlot() {
+    const size_t previous =
+        _connection_count.fetch_sub(1, butil::memory_order_relaxed);
+    CHECK_GT(previous, 0u);
+}
+
+void Acceptor::SetMaxConnections(size_t max_connections) {
+    // The limit controls only future numeric admission decisions and does not
+    // publish socket state, so a relaxed store is sufficient.
+    _max_connections.store(
+        max_connections, butil::memory_order_relaxed);
 }
 
 void Acceptor::ListConnections(std::vector<SocketId>* conn_list,
                                size_t max_copied) {
-    if (conn_list == NULL) {
+    if (conn_list == nullptr) {
         LOG(FATAL) << "Param[conn_list] is NULL";
         return;
     }
@@ -202,10 +258,6 @@ void Acceptor::ListConnections(std::vector<SocketId>* conn_list,
     conn_list->reserve(ConnectionCount() + 10);
 
     std::unique_lock<butil::Mutex> mu(_map_mutex);
-    if (!_socket_map.initialized()) {
-        // Optional. Uninitialized FlatMap should be iteratable.
-        return;
-    }
     // Copy all the SocketId (protected by mutex) into a temporary
     // container to avoid dealing with sockets inside the mutex.
     size_t ntotal = 0;
@@ -239,9 +291,10 @@ void Acceptor::ListConnections(std::vector<SocketId>* conn_list) {
 
 void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
     while (1) {
-        struct sockaddr in_addr;
+        struct sockaddr_storage in_addr;
+        bzero(&in_addr, sizeof(in_addr));
         socklen_t in_len = sizeof(in_addr);
-        butil::fd_guard in_fd(accept(acception->fd(), &in_addr, &in_len));
+        butil::fd_guard in_fd(accept(acception->fd(), (sockaddr*)&in_addr, &in_len));
         if (in_fd < 0) {
             // no EINTR because listened fd is non-blocking.
             if (errno == EAGAIN) {
@@ -258,45 +311,64 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
         }
 
         Acceptor* am = dynamic_cast<Acceptor*>(acception->user());
-        if (NULL == am) {
+        if (nullptr == am) {
             LOG(FATAL) << "Impossible! acception->user() MUST be Acceptor";
             acception->SetFailed(EINVAL, "Impossible! acception->user() MUST be Acceptor");
             return;
         }
-        
+
+        if (!am->TryAcquireConnectionSlot()) {
+            am->_rejected_connection_count.fetch_add(
+                1, butil::memory_order_relaxed);
+            LOG_EVERY_SECOND(WARNING)
+                << "Reject connection on " << acception->local_side()
+                << ": max_connections limit reached";
+            // in_fd closes the connection before Socket::Create(), protocol
+            // parsing or TLS authentication, without a protocol-specific reply.
+            continue;
+        }
+
         SocketId socket_id;
         SocketOptions options;
         options.keytable_pool = am->_keytable_pool;
         options.fd = in_fd;
-        options.remote_side = butil::EndPoint(*(sockaddr_in*)&in_addr);
+        butil::sockaddr2endpoint(&in_addr, in_len, &options.remote_side);
         options.user = acception->user();
-        options.on_edge_triggered_events = InputMessenger::OnNewMessages;
+        options.need_on_edge_trigger = true;
+        options.force_ssl = am->_force_ssl;
         options.initial_ssl_ctx = am->_ssl_ctx;
+        options.socket_mode = am->_socket_mode;
+        options.bthread_tag = am->_bthread_tag;
         if (Socket::Create(options, &socket_id) != 0) {
+            am->ReleaseConnectionSlot();
             LOG(ERROR) << "Fail to create Socket";
             continue;
         }
         in_fd.release(); // transfer ownership to socket_id
 
-        // There's a funny race condition here. After Socket::Create, messages
-        // from the socket are already handled and a RPC is possibly done
-        // before the socket is added into _socket_map below. This is found in
-        // ChannelTest.skip_parallel in test/brpc_channel_unittest.cpp (running
-        // on machines with few cores) where the _messenger.ConnectionCount()
-        // may surprisingly be 0 even if the RPC is already done.
+        // Socket::Create() may start processing messages immediately. The
+        // connection is already counted, but this loop owns its slot until
+        // the socket is pinned and inserted into _socket_map below.
 
         SocketUniquePtr sock;
         if (Socket::AddressFailedAsWell(socket_id, &sock) >= 0) {
             bool is_running = true;
+            bool registered = false;
             {
                 BAIDU_SCOPED_LOCK(am->_map_mutex);
                 is_running = (am->status() == RUNNING);
                 // Always add this socket into `_socket_map' whether it
                 // has been `SetFailed' or not, whether `Acceptor' is
                 // running or not. Otherwise, `Acceptor::BeforeRecycle'
-                // may be called (inside Socket::OnRecycle) after `Acceptor'
+                // may be called (inside Socket::BeforeRecycled) after `Acceptor'
                 // has been destroyed
-                am->_socket_map.insert(socket_id, ConnectStatistics());
+                registered = (am->_socket_map.insert(
+                    socket_id, ConnectStatistics()) != nullptr);
+            }
+            if (!registered) {
+                am->ReleaseConnectionSlot();
+                sock->SetFailed(ENOMEM, "Fail to register accepted Socket");
+                continue;
             }
             if (!is_running) {
                 LOG(WARNING) << "Acceptor on fd=" << acception->fd()
@@ -306,8 +378,11 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
                         sock->description().c_str());
                 return;
             }
-        } // else: The socket has already been destroyed, Don't add its id
-          // into _socket_map
+        } else {
+            // The socket was recycled before insertion. BeforeRecycle() did
+            // not release its slot, which is still owned by this accept loop.
+            am->ReleaseConnectionSlot();
+        }
     }
 }
 
@@ -331,9 +406,11 @@ void Acceptor::BeforeRecycle(Socket* sock) {
         _empty_cond.Broadcast();
         return;
     }
-    // If a Socket could not be addressed shortly after its creation, it
-    // was not added into `_socket_map'.
-    _socket_map.erase(sock->id());
+    // Socket::Create() can fail or the socket can be recycled before it is
+    // inserted into the map. In those cases the accept loop releases the slot.
+    if (_socket_map.erase(sock->id()) != 0) {
+        ReleaseConnectionSlot();
+    }
     if (_socket_map.empty()) {
         _empty_cond.Broadcast();
     }

@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Tue Jul 28 18:15:57 CST 2015
 
 #ifndef  BVAR_DETAIL_SERIES_H
@@ -28,6 +30,15 @@
 
 namespace bvar {
 namespace detail {
+
+// Whether a series of `T` is worth keeping. A series is a list of numbers, which
+// /vars hands to flot.js to plot. A value that describes itself as anything else
+// (a json object, as a distribution has to) draws no plot and would only cost
+// the 174 samples that SeriesBase keeps of it. Specialize to false_type for such
+// a value type and Window<> will not sample a series of it, see
+// WindowBase::expose_impl().
+template <typename T>
+struct HasPlottableSeries : butil::true_type {};
 
 template <typename T, typename Op, typename Enabler = void>
 struct DivideOnAddition {
@@ -103,7 +114,7 @@ public:
         , _nminute(0)
         , _nhour(0)
         , _nday(0) {
-        pthread_mutex_init(&_mutex, NULL);
+        pthread_mutex_init(&_mutex, nullptr);
     }
     ~SeriesBase() {
         pthread_mutex_destroy(&_mutex);
@@ -126,7 +137,7 @@ private:
             // is_pod does not work for gcc 3.4
             if (butil::is_integral<T>::value ||
                 butil::is_floating_point<T>::value) {
-                memset(_array, 0, sizeof(_array));
+                memset(static_cast<void*>(_array), 0, sizeof(_array));
             }
         }
         
@@ -228,7 +239,7 @@ public:
 template <typename T, typename Op>
 void Series<T, Op>::describe(std::ostream& os,
                              const std::string* vector_names) const {
-    CHECK(vector_names == NULL);
+    CHECK(vector_names == nullptr);
     pthread_mutex_lock(&this->_mutex);
     const int second_begin = this->_nsecond;
     const int minute_begin = this->_nminute;

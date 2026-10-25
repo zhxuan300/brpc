@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Sep  7 22:37:39 CST 2014
 
 #include <unistd.h>                               // getpagesize
@@ -48,7 +51,7 @@ static int64_t get_stack_count(void*) {
     return s_stack_count.load(butil::memory_order_relaxed);
 }
 static bvar::PassiveStatus<int64_t> bvar_stack_count(
-    "bthread_stack_count", get_stack_count, NULL);
+    "bthread_stack_count", get_stack_count, nullptr);
 
 int allocate_stack_storage(StackStorage* s, int stacksize_in, int guardsize_in) {
     const static int PAGESIZE = getpagesize();
@@ -63,7 +66,7 @@ int allocate_stack_storage(StackStorage* s, int stacksize_in, int guardsize_in) 
 
     if (guardsize_in <= 0) {
         void* mem = malloc(stacksize);
-        if (NULL == mem) {
+        if (nullptr == mem) {
             PLOG_EVERY_SECOND(ERROR) << "Fail to malloc (size="
                                      << stacksize << ")";
             return -1;
@@ -86,7 +89,7 @@ int allocate_stack_storage(StackStorage* s, int stacksize_in, int guardsize_in) 
             ~PAGESIZE_M1;
 
         const int memsize = stacksize + guardsize;
-        void* const mem = mmap(NULL, memsize, (PROT_READ | PROT_WRITE),
+        void* const mem = mmap(nullptr, memsize, (PROT_READ | PROT_WRITE),
                                (MAP_PRIVATE | MAP_ANONYMOUS), -1, 0);
 
         if (MAP_FAILED == mem) {
@@ -136,7 +139,7 @@ void deallocate_stack_storage(StackStorage* s) {
         return;
     }
     s_stack_count.fetch_sub(1, butil::memory_order_relaxed);
-    if (s->guardsize <= 0) {
+    if (s->guardsize == 0) {
         free((char*)s->bottom - memsize);
     } else {
         munmap((char*)s->bottom - memsize, memsize);

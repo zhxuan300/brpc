@@ -1,6 +1,6 @@
 [English version](../en/redis_client.md)
 
-[redis](http://redis.io/)是最近几年比较火的缓存服务，相比memcached在server端提供了更多的数据结构和操作方法，简化了用户的开发工作。为了使用户更快捷地访问redis并充分利用bthread的并发能力，brpc直接支持redis协议。示例程序：[example/redis_c++](https://github.com/brpc/brpc/tree/master/example/redis_c++/)
+[redis](http://redis.io/)是最近几年比较火的缓存服务，相比memcached在server端提供了更多的数据结构和操作方法，简化了用户的开发工作。为了使用户更快捷地访问redis并充分利用bthread的并发能力，brpc直接支持redis协议。示例程序：[example/redis_c++](https://github.com/apache/brpc/tree/master/example/redis_c++/)
 
 相比使用[hiredis](https://github.com/redis/hiredis)(官方client)的优势有：
 
@@ -42,7 +42,7 @@ brpc::RedisRequest set_request;
 brpc::RedisResponse response;
 brpc::Controller cntl;
 set_request.AddCommand("SET %s %d", my_key.c_str(), my_number);
-redis_channel.CallMethod(NULL, &cntl, &set_request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &set_request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -63,7 +63,7 @@ brpc::RedisRequest incr_request;
 incr_request.AddCommand("INCR %s", my_key.c_str());
 response.Clear();
 cntl.Reset();
-redis_channel.CallMethod(NULL, &cntl, &incr_request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &incr_request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -88,7 +88,7 @@ request.AddCommand("INCR counter1");
 request.AddCommand("DECR counter1");
 request.AddCommand("INCRBY counter1 10");
 request.AddCommand("DECRBY counter1 20");
-redis_channel.CallMethod(NULL, &cntl, &request, &response, NULL/*done*/);
+redis_channel.CallMethod(nullptr, &cntl, &request, &response, nullptr/*done*/);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to access redis-server";
     return -1;
@@ -104,9 +104,19 @@ CHECK_EQ(10, response.reply(2).integer());
 CHECK_EQ(-10, response.reply(3).integer());
 ```
 
+# 访问带认证的Redis
+
+创建一个RedisAuthenticator，并设置到ChannelOptions里即可。
+
+```c++
+brpc::ChannelOptions options;
+brpc::policy::RedisAuthenticator* auth = new brpc::policy::RedisAuthenticator("my_password");
+options.auth = auth;
+```
+
 # RedisRequest
 
-一个[RedisRequest](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h)可包含多个Command，调用AddCommand*增加命令，成功返回true，失败返回false**并会打印调用处的栈**。
+一个[RedisRequest](https://github.com/apache/brpc/blob/master/src/brpc/redis.h)可包含多个Command，调用AddCommand*增加命令，成功返回true，失败返回false**并会打印调用处的栈**。
 
 ```c++
 bool AddCommand(const char* fmt, ...);
@@ -116,7 +126,9 @@ bool AddCommandByComponents(const butil::StringPiece* components, size_t n);
 
 格式和hiredis基本兼容：即%b对应二进制数据（指针+length)，其他和printf的参数类似。对一些细节做了改进：当某个字段包含空格时，使用单引号或双引号包围起来会被视作一个字段。比如AddCommand("Set 'a key with space' 'a value with space as well'")中的key是a key with space，value是a value with space as well。在hiredis中必须写成redisvCommand(..., "SET %s %s", "a key with space", "a value with space as well");
 
-AddCommandByComponents类似hiredis中的redisCommandArgv，用户通过数组指定命令中的每一个部分。这个方法对AddCommand和AddCommandV可能发生的转义问题免疫，且效率最高。如果你在使用AddCommand和AddCommandV时出现了“Unmatched quote”，“无效格式”等问题且无法定位，可以试下这个方法。
+> 注意，AddCommand和AddCommandV的fmt参数如果设置错误，有可能导致程序crash或者数据泄露，请谨慎设置。不应将受用户输入影响的内容作为fmt参数进行调用！
+
+AddCommandByComponents类似hiredis中的redisCommandArgv，用户可通过数组或`std::vector<butil::StringPiece>`指定命令中的每个部分。这个方法对AddCommand和AddCommandV可能发生的转义问题免疫。如果你在使用AddCommand和AddCommandV时出现“Unmatched quote”“无效格式”等问题且无法定位，可以试下这个方法。
 
 如果AddCommand\*失败，后续的AddCommand\*和CallMethod都会失败。一般来说不用判AddCommand*的结果，失败后自然会通过RPC失败体现出来。
 
@@ -126,11 +138,11 @@ command_size()可获得（成功）加入的命令个数。
 
 # RedisResponse
 
-[RedisResponse](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h)可能包含一个或多个[RedisReply](https://github.com/brpc/brpc/blob/master/src/brpc/redis_reply.h)，reply_size()可获得reply的个数，reply(i)可获得第i个reply的引用（从0计数）。注意在hiredis中，如果请求包含了N个command，获取结果也要调用N次redisGetReply。但在brpc中这是不必要的，RedisResponse已经包含了N个reply，通过reply(i)获取就行了。只要RPC成功，response.reply_size()应与request.command_size()相等，除非redis-server有bug，redis-server工作的基本前提就是reply和command按序一一对应。
+[RedisResponse](https://github.com/apache/brpc/blob/master/src/brpc/redis.h)可能包含一个或多个[RedisReply](https://github.com/apache/brpc/blob/master/src/brpc/redis_reply.h)，reply_size()可获得reply的个数，reply(i)可获得第i个reply的引用（从0计数）。注意在hiredis中，如果请求包含了N个command，获取结果也要调用N次redisGetReply。但在brpc中这是不必要的，RedisResponse已经包含了N个reply，通过reply(i)获取就行了。只要RPC成功，response.reply_size()应与request.command_size()相等，除非redis-server有bug，redis-server工作的基本前提就是reply和command按序一一对应。
 
 每个reply可能是：
 
-- REDIS_REPLY_NIL：redis中的NULL，代表值不存在。可通过is_nil()判定。
+- REDIS_REPLY_NIL：redis中的nullptr，代表值不存在。可通过is_nil()判定。
 - REDIS_REPLY_STATUS：在redis文档中称为Simple String。一般是操作的返回状态，比如SET返回的OK。可通过is_string()判定（和string相同），c_str()或data()获得值。
 - REDIS_REPLY_STRING：在redis文档中称为Bulk String。大多数值都是这个类型，包括incr返回的。可通过is_string()判定，c_str()或data()获得值。
 - REDIS_REPLY_ERROR：操作出错时的返回值，包含一段错误信息。可通过is_error()判定，error_message()获得错误信息。
@@ -148,6 +160,55 @@ response中的所有reply的ownership属于response。当response析构时，rep
 建立一个使用一致性哈希负载均衡算法(c_md5或c_murmurhash)的channel就能访问挂载在对应命名服务下的redis集群了。注意每个RedisRequest应只包含一个操作或确保所有的操作是同一个key。如果request包含了多个操作，在当前实现下这些操作总会送向同一个server，假如对应的key分布在多个server上，那么结果就不对了，这个情况下你必须把一个request分开为多个，每个包含一个操作。
 
 或者你可以沿用常见的[twemproxy](https://github.com/twitter/twemproxy)方案。这个方案虽然需要额外部署proxy，还增加了延时，但client端仍可以像访问单点一样的访问它。
+
+如果你要直接访问原生 Redis Cluster（按 slot 路由、自动处理 MOVED/ASK，并通过 `CLUSTER SLOTS`/`CLUSTER NODES` 刷新拓扑），可以使用 `brpc::RedisClusterChannel`：
+
+```c++
+#include <brpc/redis_cluster.h>
+
+brpc::RedisClusterChannel channel;
+brpc::RedisClusterChannelOptions options;
+options.max_redirect = 5;
+if (channel.Init("127.0.0.1:7000,127.0.0.1:7001", &options) != 0) {
+    LOG(ERROR) << "Fail to init redis cluster channel";
+}
+```
+
+`RedisClusterChannel` 支持同步/异步 `CallMethod`、自动重定向重试和周期性拓扑刷新。多 key 支持 `MGET/MSET/DEL/EXISTS/UNLINK/EVAL/EVALSHA`，暂不支持 `MULTI/EXEC`。
+
+## RedisClusterChannel 示例
+
+`example/redis_c++/redis_cluster_client.cpp` 覆盖了以下常见场景：
+
+- 通过多个 seed 节点初始化；
+- 自动处理 MOVED/ASK 重定向与重试；
+- 先走 `CLUSTER SLOTS`，失败后回退 `CLUSTER NODES`；
+- 同一个 channel 同时执行同步 pipeline 和异步请求。
+
+构建并运行：
+
+```bash
+cd example/redis_c++
+make redis_cluster_client
+./redis_cluster_client \
+  --seeds=127.0.0.1:7000,127.0.0.1:7001 \
+  --max_redirect=5 \
+  --timeout_ms=1000
+```
+
+常用选项：
+
+- `RedisClusterChannelOptions::max_redirect`：单个命令的最大重定向次数；
+- `RedisClusterChannelOptions::refresh_interval_s`：周期刷新拓扑的间隔；
+- `RedisClusterChannelOptions::topology_refresh_timeout_ms`：拓扑命令超时；
+- `RedisClusterChannelOptions::channel_options`：每个 redis 节点的通用 brpc 参数；
+- `RedisClusterChannelOptions::enable_periodic_refresh`：是否启用后台周期刷新。
+
+说明：
+
+- `MGET/MSET/DEL/EXISTS/UNLINK` 会按 key 分发后按请求顺序合并返回；
+- `EVAL/EVALSHA` 要求声明的 key 位于同一 slot；
+- `MULTI/EXEC` 当前会直接返回错误 reply。
 
 # 查看发出的请求和收到的回复
 
@@ -228,7 +289,9 @@ TRACE: 02-13 18:07:42:   * 0 client.cpp:180] Accessing redis server at qps=75238
 
 # Command Line Interface
 
-[example/redis_c++/redis_cli](https://github.com/brpc/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp)是一个类似于官方CLI的命令行工具，以展示brpc对redis协议的处理能力。当使用brpc访问redis-server出现不符合预期的行为时，也可以使用这个CLI进行交互式的调试。
+[example/redis_c++/redis_cli](https://github.com/apache/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp)是一个类似于官方CLI的命令行工具，以展示brpc对redis协议的处理能力。当使用brpc访问redis-server出现不符合预期的行为时，也可以使用这个CLI进行交互式的调试。
+
+如果是原生 Redis Cluster 场景，可直接参考 [example/redis_c++/redis_cluster_client.cpp](https://github.com/apache/brpc/blob/master/example/redis_c%2B%2B/redis_cluster_client.cpp)。
 
 和官方CLI类似，`redis_cli <command>`也可以直接运行命令，-server参数可以指定redis-server的地址。
 

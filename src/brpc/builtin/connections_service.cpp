@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <ostream>
 #include <iomanip>
@@ -159,7 +161,7 @@ void ConnectionsService::PrintConnections(
             if (ret < 0) {
                 continue;
             } else if (ret > 0) {
-                if (ptr->_health_check_interval_s <= 0) {
+                if (!ptr->HCEnabled()) {
                     // Sockets without HC will soon be destroyed
                     continue;
                 }
@@ -221,7 +223,7 @@ void ConnectionsService::PrintConnections(
                 // Special treatment for nshead services. Notice that
                 // pref_index is comparable to ProtocolType after r31951
                 if (pref_index == (int)PROTOCOL_NSHEAD &&
-                    server->options().nshead_service != NULL) {
+                    server->options().nshead_service != nullptr) {
                     if (nshead_service_name.empty()) {
                         nshead_service_name = BriefName(butil::class_name_str(
                                 *server->options().nshead_service));
@@ -242,7 +244,7 @@ void ConnectionsService::PrintConnections(
             ptr->GetStat(&stat);
             PrintRealDateTime(os, ptr->_reset_fd_real_us);
             int rttfd = ptr->fd();
-            if (rttfd < 0 && first_sub != NULL) {
+            if (rttfd < 0 && first_sub != nullptr) {
                 rttfd = first_sub->fd();
             }
 
@@ -255,12 +257,16 @@ void ConnectionsService::PrintConnections(
             socklen_t len = sizeof(ti);
             if (0 == getsockopt(rttfd, SOL_TCP, TCP_INFO, &ti, &len)) {
                 got_rtt = true;
+                srtt = ti.tcpi_rtt;
+                rtt_var = ti.tcpi_rttvar;
             }
 #elif defined(OS_MACOSX)
             struct tcp_connection_info ti;
             socklen_t len = sizeof(ti);
             if (0 == getsockopt(rttfd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ti, &len)) {
                 got_rtt = true;
+                srtt = ti.tcpi_srtt;
+                rtt_var = ti.tcpi_rttvar;
             }
 #endif
             char rtt_display[32];

@@ -2,7 +2,7 @@
 
 # Example
 
-[example/http_c++](https://github.com/brpc/brpc/blob/master/example/http_c++/http_client.cpp)
+[example/http_c++](https://github.com/apache/brpc/blob/master/example/http_c++/http_client.cpp)
 
 # About h2
 
@@ -32,23 +32,23 @@ http/h2 channel also support BNS address or other naming services.
 ```c++
 brpc::Controller cntl;
 cntl.http_request().uri() = "www.baidu.com/index.html";  // Request URL
-channel.CallMethod(NULL, &cntl, NULL, NULL, NULL/*done*/);
+channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr/*done*/);
 ```
 
-http/h2 does not relate to protobuf much, thus all parameters of `CallMethod` are NULL except `Controller` and `done`. Issue asynchronous RPC with non-NULL `done`.
+http/h2 does not relate to protobuf much, thus all parameters of `CallMethod` are nullptr except `Controller` and `done`. Issue asynchronous RPC with non-nullptr `done`.
 
 `cntl.response_attachment()` is body of the http/h2 response and typed `butil::IOBuf`. `IOBuf` can be converted to `std::string` by `to_string()`, which needs to allocate memory and copy all data. If performance is important, the code should consider supporting `IOBuf` directly rather than requiring continuous memory.
 
 # POST
 
-The default HTTP Method is GET, which can be changed to POST or [other http methods](https://github.com/brpc/brpc/blob/master/src/brpc/http_method.h). The data to POST should be put into `request_attachment()`, which is typed [butil::IOBuf](https://github.com/brpc/brpc/blob/master/src/butil/iobuf.h) and able to append `std :: string` or `char *` directly.
+The default HTTP Method is GET, which can be changed to POST or [other http methods](https://github.com/apache/brpc/blob/master/src/brpc/http_method.h). The data to POST should be put into `request_attachment()`, which is typed [butil::IOBuf](https://github.com/apache/brpc/blob/master/src/butil/iobuf.h) and able to append `std :: string` or `char *` directly.
 
 ```c++
 brpc::Controller cntl;
 cntl.http_request().uri() = "...";  // Request URL
 cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
 cntl.request_attachment().append("{\"message\":\"hello world!\"}");
-channel.CallMethod(NULL, &cntl, NULL, NULL, NULL/*done*/);
+channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr/*done*/);
 ```
 
 If the body needs a lot of printing to build, consider using `butil::IOBufBuilder`, which has same interfaces as `std::ostringstream`, probably simpler and more efficient than c-style printf when lots of objects need to be printed.
@@ -60,14 +60,14 @@ cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
 butil::IOBufBuilder os;
 os << "A lot of printing" << printable_objects << ...;
 os.move_to(cntl.request_attachment());
-channel.CallMethod(NULL, &cntl, NULL, NULL, NULL/*done*/);
+channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr/*done*/);
 ```
 
 # Change HTTP version
 
-brpc behaves as http 1.1 by default.
+brpc behaves as http/1.1 by default.
 
-Comparing to 1.1, http 1.0 lacks of long connections(KeepAlive). To communicate brpc client with some legacy http servers, the client may be configured as follows:
+Comparing to http/1.1, http/1.0 lacks of long connections(KeepAlive). To communicate brpc client with some legacy http servers, the client may be configured as follows:
 ```c++
 cntl.http_request().set_version(1, 0);
 ```
@@ -88,7 +88,7 @@ Genaral form of an URL:
 //   |           |               |       |                |    |            |                |
 //   |       userinfo           host    port              |    |          query          fragment
 //   |    \________________________________/\_____________|____|/ \__/        \__/
-// schema                 |                          |    |    |    |          |
+// scheme                 |                          |    |    |    |          |
 //                    authority                      |    |    |    |          |
 //                                                 path   |    |    interpretable as keys
 //                                                        |    |
@@ -115,7 +115,9 @@ If user already sets `Host` header(case insensitive), framework makes no change.
 
 If user does not set `Host` header and the URL has host, for example http://www.foo.com/path, the http request contains "Host: www.foo.com".
 
-If user does not set host header and the URL does not have host as well,  for example "/index.html?name=value", framework sets `Host` header with IP and port of the target server. A http server at 10.46.188.39:8989 should see `Host: 10.46.188.39:8989`.
+If user does not set host header and the URL does not have host either, for example "/index.html?name=value", but if the channel is initlized by a http(s) address with valid domain name. framework sets `Host` header with domain name of the target server. if this address is "http://www.foo.com", this http server should see `Host: www.foo.com`, if this address is "http://www.foo.com:8989", this http server should be see `Host: www.foo.com:8989`.
+
+If user does not set host header and the URL does not have host as well, for example "/index.html?name=value", and the address initialized by the channel doesn't contain domain name. framework sets `Host` header with IP and port of the target server. A http server at 10.46.188.39:8989 should see `Host: 10.46.188.39:8989`.
 
 The header is named ":authority" in h2.
 
@@ -125,7 +127,7 @@ Take http request as an example (similar with http response), common operations 
 
 Access an HTTP header named `Foo`
 ```c++
-const std::string* value = cntl->http_request().GetHeader("Foo"); // NULL when not exist
+const std::string* value = cntl->http_request().GetHeader("Foo"); // nullptr when not exist
 ```
 
 Set an HTTP header named `Foo`
@@ -135,7 +137,7 @@ cntl->http_request().SetHeader("Foo", "value");
 
 Access a query named `Foo`
 ```c++
-const std::string* value = cntl->http_request().uri().GetQuery("Foo"); // NULL when not exist
+const std::string* value = cntl->http_request().uri().GetQuery("Foo"); // nullptr when not exist
 ```
 
 Set a query named `Foo`
@@ -184,6 +186,8 @@ Turn on [-http_verbose](http://brpc.baidu.com:8765/flags/http_verbose) so that t
 
 When server returns a non-2xx HTTP status code, the HTTP RPC is considered to be failed and `cntl->ErrorCode()` at client-side is set to `EHTTP`, users can check `cntl-> http_response().status_code()` for more specific HTTP error. In addition, server can put html or json describing the error into `cntl->response_attachment()` which is sent back to the client as http body.
 
+If client-side wants to get the real `ErrorCode` returned by the bRPC server when the HTTP RPC fails, instead of `EHTTP`, you need to set GFlag`-use_http_error_code=true`.
+
 # Compress Request Body
 
 `Controller::set_request_compress_type(brpc::COMPRESS_TYPE_GZIP)` makes framework try to gzip the HTTP body. "try to" means the compression may not happen, because:
@@ -198,7 +202,7 @@ brpc does not decompress bodies of responses automatically due to universality. 
 #include <brpc/policy/gzip_compress.h>
 ...
 const std::string* encoding = cntl->http_response().GetHeader("Content-Encoding");
-if (encoding != NULL && *encoding == "gzip") {
+if (encoding != nullptr && *encoding == "gzip") {
     butil::IOBuf uncompressed;
     if (!brpc::policy::GzipDecompress(cntl->response_attachment(), &uncompressed)) {
         LOG(ERROR) << "Fail to un-gzip response body";
@@ -225,7 +229,7 @@ How to use:
    class ProgressiveReader {
    public:
        // Called when one part was read.
-       // Error returned is treated as *permenant* and the socket where the
+       // Error returned is treated as *permanent* and the socket where the
        // data was read will be closed.
        // A temporary error may be handled by blocking this function, which
        // may block the HTTP parsing on the socket.

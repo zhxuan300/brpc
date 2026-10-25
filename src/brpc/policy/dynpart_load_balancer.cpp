@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include "butil/macros.h"
 #include "butil/fast_rand.h"
@@ -93,9 +95,6 @@ size_t DynPartLoadBalancer::AddServersInBatch(
 size_t DynPartLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -125,13 +124,9 @@ int DynPartLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
                 && Socket::Address(id, &ptrs[nptr].first) == 0) {
                 int w = schan::GetSubChannelWeight(ptrs[nptr].first->user());
                 total_weight += w;
-                if (nptr < 8) {
-                    ptrs[nptr].second = total_weight;
-                    ++nptr;
-                } else {
-                    CHECK(false) << "Not supported yet";
-                    abort();
-                }
+                RELEASE_ASSERT_VERBOSE(nptr < 8, "Not supported yet");
+                ptrs[nptr].second = total_weight;
+                ++nptr;
             }
         }
         if (nptr != 0) {
@@ -159,8 +154,8 @@ int DynPartLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
     return EHOSTDOWN;
 }
 
-DynPartLoadBalancer* DynPartLoadBalancer::New() const {
-    return new (std::nothrow) DynPartLoadBalancer;
+DynPartLoadBalancer* DynPartLoadBalancer::New(const butil::StringPiece&) const {
+    return new DynPartLoadBalancer;
 }
 
 void DynPartLoadBalancer::Destroy() {

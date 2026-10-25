@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: chenzhangyi01@baidu.com, gejun@baidu.com
 // Date 2014/09/24 16:01:08
 
 #ifndef  BVAR_REDUCER_H
@@ -27,8 +29,180 @@
 #include "bvar/detail/sampler.h"                  // ReducerSampler
 #include "bvar/detail/series.h"
 #include "bvar/window.h"
+#if WITH_BABYLON_COUNTER
+#include <algorithm>                              // std::max std::min
+#include "babylon/concurrent/counter.h"
+#endif // WITH_BABYLON_COUNTER
 
 namespace bvar {
+
+namespace detail {
+template<typename O, typename T, typename Op>
+class SeriesSamplerImpl : public Sampler {
+public:
+    SeriesSamplerImpl(O* owner, const Op& op)
+        : _owner(owner), _series(op) {}
+    void take_sample() override { _series.append(_owner->get_value()); }
+    void describe(std::ostream& os) { _series.describe(os, nullptr); }
+
+private:
+    O* _owner;
+    Series<T, Op> _series;
+};
+
+#if WITH_BABYLON_COUNTER
+// babylon counters constrain their value type with a static_assert inside the
+// class body, which is a hard error rather than a substitution failure. Probing
+// them with std::is_constructible<> hence breaks the build for the types they
+// reject, instead of falling back to the generic implementation. Mirror the
+// constraint here (see babylon/concurrent/counter.h) so that a rejected type is
+// never used to instantiate a babylon counter.
+// NOTE: the constraint has to be checked in two steps rather than in a single
+// expression, because sizeof() can not be applied to void or to an incomplete
+// type, and `&&' does not help: short-circuiting is about evaluation, an
+// ill-formed sizeof() is still an error.
+template <typename T, bool = std::is_integral<T>::value ||
+                             std::is_floating_point<T>::value>
+struct IsBabylonCounterSupported : std::false_type {};
+
+template <typename T>
+struct IsBabylonCounterSupported<T, true>
+    : butil::integral_constant<bool, sizeof(T) <= 8> {};
+
+// `void` if the babylon counter supports T, a substitution failure otherwise.
+// Selects the babylon-backed partial specializations of Adder/Maxer/Miner below.
+// NOTE: resolving to the *type* is a MUST. std::enable_if<cond> itself is a type
+// no matter what `cond` is, and Adder<T> means Adder<T, void>, so specializing on
+// std::enable_if<cond> instead of std::enable_if_t<cond> silently never matches.
+template <typename T>
+using EnableIfBabylonCounter =
+    std::enable_if_t<IsBabylonCounterSupported<T>::value>;
+
+// babylon::GenericsConcurrentMaxer initializes its aggregation value with
+// numeric_limits<T>::min(). For floating-point types this is the smallest
+// positive normalized value, so an aggregation containing only negative values
+// is treated as empty. Keep floating-point Maxer instances on the generic
+// implementation until babylon fixes its aggregation identity.
+template <typename T>
+using EnableIfBabylonMaxerCounter = std::enable_if_t<
+    IsBabylonCounterSupported<T>::value && std::is_integral<T>::value>;
+
+template<typename T, typename Counter, typename Op, typename InvOp>
+class BabylonVariable: public Variable {
+public:
+    typedef ReducerSampler<BabylonVariable, T, Op, InvOp> sampler_type;
+    typedef SeriesSamplerImpl<BabylonVariable, T, Op> series_sampler_type;
+
+    BabylonVariable() = default;
+
+    template<typename U = T, std::enable_if_t<
+        !std::is_constructible<Counter, U>::value, bool> = false>
+    BabylonVariable(U) {}
+    // For Maxer.
+    template<typename U = T, std::enable_if_t<
+        std::is_constructible<Counter, U>::value, bool> = false>
+    BabylonVariable(U default_value) : _counter(default_value) {}
+
+    DISALLOW_COPY_AND_MOVE(BabylonVariable);
+
+    ~BabylonVariable() override {
+        hide();
+        if (nullptr != _sampler) {
+            _sampler->destroy();
+        }
+        if (nullptr != _series_sampler) {
+            _series_sampler->destroy();
+        }
+    }
+
+    BabylonVariable& operator<<(T value) {
+        _counter << value;
+        return *this;
+    }
+
+    sampler_type* get_sampler() {
+        if (nullptr == _sampler) {
+            _sampler = new sampler_type(this);
+            _sampler->set_debug_name(name());
+            _sampler->schedule();
+        }
+        return _sampler;
+    }
+
+    T get_value() const {
+        CHECK(!(butil::is_same<InvOp, VoidOp>::value) || nullptr == _sampler)
+            << "You should not call Reducer<" << butil::class_name_str<T>()
+            << ", " << butil::class_name_str<Op>() << ">::get_value() when a"
+            << " Window<> is used because the operator does not have inverse.";
+        return _counter.value();
+    }
+
+    T reset() {
+        // Unlike AgentCombiner::reset_all_agents(), reading and clearing the babylon
+        // counter are two separate steps, so values added in between are lost. This
+        // affects both explicit reset() by users and periodic sampling by the sampler
+        // thread (e.g. Window/series sampling), where concurrent additions around each
+        // reset may be dropped. This is an accepted trade-off for the babylon backend:
+        // in statistics/monitoring scenarios such minor loss does not change the overall
+        // trend, so slightly inaccurate samples are acceptable.
+        T result = _counter.value();
+        _counter.reset();
+        return result;
+    }
+
+    bool valid() const { return true; }
+
+    const Op& op() const { return _op; }
+    const InvOp& inv_op() const { return _inv_op;}
+
+    void describe(std::ostream& os, bool quote_string) const override {
+        if (butil::is_same<T, std::string>::value && quote_string) {
+            os << '"' << get_value() << '"';
+        } else {
+            os << get_value();
+        }
+    }
+
+    int describe_series(std::ostream& os, const SeriesOptions& options) const override {
+        if (nullptr == _series_sampler) {
+            return 1;
+        }
+        if (!options.test_only) {
+            _series_sampler->describe(os);
+        }
+        return 0;
+    }
+
+protected:
+    int expose_impl(const butil::StringPiece& prefix,
+                    const butil::StringPiece& name,
+                    DisplayFilter display_filter) override {
+        const int rc = Variable::expose_impl(prefix, name, display_filter);
+        if (rc != 0) {
+            return rc;
+        }
+        if (nullptr != _sampler) {
+            _sampler->set_debug_name(this->name());
+        }
+        if (nullptr == _series_sampler &&
+            !butil::is_same<InvOp, VoidOp>::value &&
+            !butil::is_same<T, std::string>::value &&
+            FLAGS_save_series) {
+            _series_sampler = new series_sampler_type(this, _op);
+            _series_sampler->schedule();
+        }
+        return rc;
+    }
+
+private:
+    Counter _counter;
+    sampler_type* _sampler{nullptr};
+    series_sampler_type* _series_sampler{nullptr};
+    Op _op;
+    InvOp _inv_op;
+};
+#endif // WITH_BABYLON_COUNTER
+} // namespace detail
 
 // Reduce multiple values into one with `Op': e1 Op e2 Op e3 ...
 // `Op' shall satisfy:
@@ -66,42 +240,28 @@ namespace bvar {
 template <typename T, typename Op, typename InvOp = detail::VoidOp>
 class Reducer : public Variable {
 public:
-    typedef typename detail::AgentCombiner<T, T, Op> combiner_type;
+    typedef detail::AgentCombiner<T, T, Op> combiner_type;
+    typedef typename combiner_type::self_shared_type shared_combiner_type;
     typedef typename combiner_type::Agent agent_type;
     typedef detail::ReducerSampler<Reducer, T, Op, InvOp> sampler_type;
-    class SeriesSampler : public detail::Sampler {
-    public:
-        SeriesSampler(Reducer* owner, const Op& op)
-            : _owner(owner), _series(op) {}
-        ~SeriesSampler() {}
-        void take_sample() { _series.append(_owner->get_value()); }
-        void describe(std::ostream& os) { _series.describe(os, NULL); }
-    private:
-        Reducer* _owner;
-        detail::Series<T, Op> _series;
-    };
+    typedef detail::SeriesSamplerImpl<Reducer, T, Op> SeriesSampler;
 
-public:
     // The `identify' must satisfy: identity Op a == a
-    Reducer(typename butil::add_cr_non_integral<T>::type identity = T(),
-            const Op& op = Op(),
-            const InvOp& inv_op = InvOp())
-        : _combiner(identity, identity, op)
-        , _sampler(NULL)
-        , _series_sampler(NULL)
-        , _inv_op(inv_op) {
-    }
+    explicit Reducer(typename butil::add_cr_non_integral<T>::type identity = T(),
+                     const Op& op = Op(), const InvOp& inv_op = InvOp())
+        : _combiner(std::make_shared<combiner_type>(identity, identity, op))
+        , _sampler(nullptr) , _series_sampler(nullptr) , _inv_op(inv_op) {}
 
-    ~Reducer() {
+    ~Reducer() override {
         // Calling hide() manually is a MUST required by Variable.
         hide();
         if (_sampler) {
             _sampler->destroy();
-            _sampler = NULL;
+            _sampler = nullptr;
         }
         if (_series_sampler) {
             _series_sampler->destroy();
-            _series_sampler = NULL;
+            _series_sampler = nullptr;
         }
     }
 
@@ -113,20 +273,19 @@ public:
     // Notice that this function walks through threads that ever add values
     // into this reducer. You should avoid calling it frequently.
     T get_value() const {
-        CHECK(!(butil::is_same<InvOp, detail::VoidOp>::value) || _sampler == NULL)
+        CHECK(!(butil::is_same<InvOp, detail::VoidOp>::value) || _sampler == nullptr)
             << "You should not call Reducer<" << butil::class_name_str<T>()
             << ", " << butil::class_name_str<Op>() << ">::get_value() when a"
             << " Window<> is used because the operator does not have inverse.";
-        return _combiner.combine_agents();
+        return _combiner->combine_agents();
     }
 
 
     // Reset the reduced value to T().
     // Returns the reduced value before reset.
-    T reset() { return _combiner.reset_all_agents(); }
+    T reset() { return _combiner->reset_all_agents(); }
 
-    // Implement Variable::describe() and Variable::get_value().
-    void describe(std::ostream& os, bool quote_string) const {
+    void describe(std::ostream& os, bool quote_string) const override {
         if (butil::is_same<T, std::string>::value && quote_string) {
             os << '"' << get_value() << '"';
         } else {
@@ -135,26 +294,32 @@ public:
     }
     
 #ifdef BAIDU_INTERNAL
-    void get_value(boost::any* value) const { *value = get_value(); }
+    void get_value(boost::any* value) const override { *value = get_value(); }
 #endif
 
     // True if this reducer is constructed successfully.
-    bool valid() const { return _combiner.valid(); }
+    bool valid() const { return _combiner->valid(); }
 
     // Get instance of Op.
-    const Op& op() const { return _combiner.op(); }
+    const Op& op() const { return _combiner->op(); }
     const InvOp& inv_op() const { return _inv_op; }
+
+    // Expose the shared data carrier, so that ReducerSampler holds it instead
+    // of `this'. Sampling then keeps reading valid memory even if this Reducer
+    // is destructed before the sampler is recycled by the sampling thread.
+    shared_combiner_type share_combiner() const { return _combiner; }
     
     sampler_type* get_sampler() {
-        if (NULL == _sampler) {
+        if (nullptr == _sampler) {
             _sampler = new sampler_type(this);
+            _sampler->set_debug_name(name());
             _sampler->schedule();
         }
         return _sampler;
     }
 
-    int describe_series(std::ostream& os, const SeriesOptions& options) const {
-        if (_series_sampler == NULL) {
+    int describe_series(std::ostream& os, const SeriesOptions& options) const override {
+        if (_series_sampler == nullptr) {
             return 1;
         }
         if (!options.test_only) {
@@ -165,22 +330,27 @@ public:
     
 protected:
     int expose_impl(const butil::StringPiece& prefix,
-                    const butil::StringPiece& name,
-                    DisplayFilter display_filter) {
-        const int rc = Variable::expose_impl(prefix, name, display_filter);
-        if (rc == 0 &&
-            _series_sampler == NULL &&
+                    const butil::StringPiece& n,
+                    DisplayFilter display_filter) override {
+        const int rc = Variable::expose_impl(prefix, n, display_filter);
+        if (rc != 0) {
+            return rc;
+        }
+        if (_sampler != nullptr) {
+            _sampler->set_debug_name(name());
+        }
+        if (_series_sampler == nullptr &&
             !butil::is_same<InvOp, detail::VoidOp>::value &&
             !butil::is_same<T, std::string>::value &&
             FLAGS_save_series) {
-            _series_sampler = new SeriesSampler(this, _combiner.op());
+            _series_sampler = new SeriesSampler(this, _combiner->op());
             _series_sampler->schedule();
         }
         return rc;
     }
 
 private:
-    combiner_type   _combiner;
+    shared_combiner_type _combiner;
     sampler_type* _sampler;
     SeriesSampler* _series_sampler;
     InvOp _inv_op;
@@ -190,12 +360,12 @@ template <typename T, typename Op, typename InvOp>
 inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(
     typename butil::add_cr_non_integral<T>::type value) {
     // It's wait-free for most time
-    agent_type* agent = _combiner.get_or_create_tls_agent();
+    agent_type* agent = _combiner->get_or_create_tls_agent();
     if (__builtin_expect(!agent, 0)) {
         LOG(FATAL) << "Fail to create agent";
         return *this;
     }
-    agent->element.modify(_combiner.op(), value);
+    agent->element.modify(_combiner->op(), value);
     return *this;
 }
 
@@ -208,34 +378,53 @@ inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(
 namespace detail {
 template <typename Tp>
 struct AddTo {
-    void operator()(Tp & lhs, 
+    void operator()(Tp & lhs,
                     typename butil::add_cr_non_integral<Tp>::type rhs) const
     { lhs += rhs; }
 };
 template <typename Tp>
 struct MinusFrom {
-    void operator()(Tp & lhs, 
+    void operator()(Tp & lhs,
                     typename butil::add_cr_non_integral<Tp>::type rhs) const
     { lhs -= rhs; }
 };
-}
-template <typename T>
+} // namespace detail
+
+template <typename T, typename = void>
 class Adder : public Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > {
 public:
     typedef Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > Base;
     typedef T value_type;
     typedef typename Base::sampler_type sampler_type;
-public:
+
     Adder() : Base() {}
-    explicit Adder(const butil::StringPiece& name) : Base() {
+    Adder(const butil::StringPiece& name) : Base() {
         this->expose(name);
     }
     Adder(const butil::StringPiece& prefix,
           const butil::StringPiece& name) : Base() {
         this->expose_as(prefix, name);
     }
-    ~Adder() { Variable::hide(); }
+    ~Adder() override { Variable::hide(); }
 };
+
+#if WITH_BABYLON_COUNTER
+// Numerical types supported by babylon counter.
+template <typename T>
+class Adder<T, detail::EnableIfBabylonCounter<T>>
+    : public detail::BabylonVariable<T, babylon::GenericsConcurrentAdder<T>,
+                                     detail::AddTo<T>, detail::MinusFrom<T>> {
+public:
+    typedef  T value_type;
+    typedef detail::BabylonVariable<T, babylon::GenericsConcurrentAdder<T>,
+                                    detail::AddTo<value_type>, detail::MinusFrom<value_type>> Base;
+    typedef detail::AddTo<value_type> Op;
+    typedef detail::MinusFrom<value_type> InvOp;
+    typedef typename Base::sampler_type sampler_type;
+
+    COMMON_VARIABLE_CONSTRUCTOR(Adder);
+};
+#endif // WITH_BABYLON_COUNTER
 
 // bvar::Maxer<int> max_value;
 // max_value << 1 << 2 << 3 << 4;
@@ -251,25 +440,28 @@ struct MaxTo {
         }
     }
 };
+
 class LatencyRecorderBase;
-}
-template <typename T>
+} // namespace detail
+
+template <typename T, typename = void>
 class Maxer : public Reducer<T, detail::MaxTo<T> > {
 public:
     typedef Reducer<T, detail::MaxTo<T> > Base;
     typedef T value_type;
     typedef typename Base::sampler_type sampler_type;
-public:
-    Maxer() : Base(std::numeric_limits<T>::min()) {}
-    explicit Maxer(const butil::StringPiece& name)
-        : Base(std::numeric_limits<T>::min()) {
+
+    Maxer() : Base(std::numeric_limits<T>::lowest()) {}
+    Maxer(const butil::StringPiece& name)
+        : Base(std::numeric_limits<T>::lowest()) {
         this->expose(name);
     }
     Maxer(const butil::StringPiece& prefix, const butil::StringPiece& name)
-        : Base(std::numeric_limits<T>::min()) {
+        : Base(std::numeric_limits<T>::lowest()) {
         this->expose_as(prefix, name);
     }
-    ~Maxer() { Variable::hide(); }
+    ~Maxer() override { Variable::hide(); }
+
 private:
     friend class detail::LatencyRecorderBase;
     // The following private funcition a now used in LatencyRecorder,
@@ -286,32 +478,81 @@ private:
     }
 };
 
+#if WITH_BABYLON_COUNTER
+namespace detail {
+template <typename T>
+class ConcurrentMaxer : public babylon::GenericsConcurrentMaxer<T> {
+    typedef babylon::GenericsConcurrentMaxer<T> Base;
+public:
+    ConcurrentMaxer() = default;
+    ConcurrentMaxer(T default_value) : _default_value(default_value) {}
+
+    T value() const {
+        // Base::value() leaves `result' untouched if nothing was counted.
+        T result = _default_value;
+        Base::value(result);
+        return std::max(result, _default_value);
+    }
+private:
+    T _default_value{std::numeric_limits<T>::lowest()};
+};
+} // namespace detail
+
+// Integral types supported by babylon counter. Floating-point Maxer uses the
+// generic implementation because babylon's aggregation identity is incorrect.
+template <typename T>
+class Maxer<T, detail::EnableIfBabylonMaxerCounter<T>>
+    : public detail::BabylonVariable<T, detail::ConcurrentMaxer<T>,
+                                     detail::MaxTo<T>, detail::VoidOp> {
+public:
+    typedef T value_type;
+    typedef detail::BabylonVariable<T, detail::ConcurrentMaxer<T>,
+                                    detail::MaxTo<value_type>, detail::VoidOp> Base;
+    typedef detail::MaxTo<value_type> Op;
+    typedef detail::VoidOp InvOp;
+    typedef typename Base::sampler_type sampler_type;
+
+    COMMON_VARIABLE_CONSTRUCTOR(Maxer);
+
+private:
+friend class detail::LatencyRecorderBase;
+
+    Maxer(T default_value) : Base(default_value) {}
+    Maxer(T default_value, const butil::StringPiece& prefix, const butil::StringPiece& name)
+        : Base(default_value) {
+        Variable::expose_as(prefix, name);
+    }
+    Maxer(T default_value, const butil::StringPiece& name)
+        : Base(default_value) {
+        Variable::expose(name);
+    }
+};
+#endif // WITH_BABYLON_COUNTER
+
 // bvar::Miner<int> min_value;
 // min_value << 1 << 2 << 3 << 4;
 // LOG(INFO) << min_value.get_value(); // 1
 namespace detail {
-
-template <typename Tp> 
+template <typename Tp>
 struct MinTo {
-    void operator()(Tp & lhs, 
+    void operator()(Tp & lhs,
                     typename butil::add_cr_non_integral<Tp>::type rhs) const {
         if (rhs < lhs) {
             lhs = rhs;
         }
     }
 };
-
 }  // namespace detail
 
-template <typename T>
+template <typename T, typename = void>
 class Miner : public Reducer<T, detail::MinTo<T> > {
 public:
     typedef Reducer<T, detail::MinTo<T> > Base;
     typedef T value_type;
     typedef typename Base::sampler_type sampler_type;
-public:
+
     Miner() : Base(std::numeric_limits<T>::max()) {}
-    explicit Miner(const butil::StringPiece& name)
+    Miner(const butil::StringPiece& name)
         : Base(std::numeric_limits<T>::max()) {
         this->expose(name);
     }
@@ -319,8 +560,46 @@ public:
         : Base(std::numeric_limits<T>::max()) {
         this->expose_as(prefix, name);
     }
-    ~Miner() { Variable::hide(); }
+    ~Miner() override { Variable::hide(); }
 };
+
+#if WITH_BABYLON_COUNTER
+namespace detail {
+// The min counterpart of ConcurrentMaxer, see there for why the default value is
+// needed.
+template <typename T>
+class ConcurrentMiner : public babylon::GenericsConcurrentMiner<T> {
+    typedef babylon::GenericsConcurrentMiner<T> Base;
+public:
+    ConcurrentMiner() = default;
+    explicit ConcurrentMiner(T default_value) : _default_value(default_value) {}
+
+    T value() const {
+        T result = _default_value;
+        Base::value(result);
+        return std::min(result, _default_value);
+    }
+private:
+    T _default_value{std::numeric_limits<T>::max()};
+};
+} // namespace detail
+
+// Numerical types supported by babylon counter.
+template <typename T>
+class Miner<T, detail::EnableIfBabylonCounter<T>>
+    : public detail::BabylonVariable<T, detail::ConcurrentMiner<T>,
+                                     detail::MinTo<T>, detail::VoidOp> {
+public:
+    typedef T value_type;
+    typedef detail::BabylonVariable<value_type, detail::ConcurrentMiner<T>,
+                                    detail::MinTo<value_type>, detail::VoidOp> Base;
+    typedef detail::MinTo<value_type> Op;
+    typedef detail::VoidOp InvOp;
+    typedef typename Base::sampler_type sampler_type;
+
+    COMMON_VARIABLE_CONSTRUCTOR(Miner);
+};
+#endif // WITH_BABYLON_COUNTER
 
 }  // namespace bvar
 

@@ -1,18 +1,20 @@
-// Copyright (c) 2010 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2010/05/29
 
 // Watch timestamp of a file
@@ -53,7 +55,7 @@ public:
     int init_from_not_exist(const char* file_path);
 
     // Check and consume change of the watched file. Write `last_timestamp'
-    // if it's not NULL.
+    // if it's not nullptr.
     // Returns:
     //   CREATE    the file is created since last call to this method.
     //   UPDATED   the file is modified since last call.
@@ -62,7 +64,7 @@ public:
     // Note: If the file is updated too frequently, this method may return 
     // UNCHANGED due to precision of stat(2) and the file system. If the file
     // is created and deleted too frequently, the event may not be detected.
-    Change check_and_consume(Timestamp* last_timestamp = NULL);
+    Change check_and_consume(Timestamp* last_timestamp = nullptr);
 
     // Set internal timestamp. User can use this method to make
     // check_and_consume() replay the change.

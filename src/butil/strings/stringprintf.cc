@@ -10,7 +10,7 @@
 #include "butil/strings/string_util.h"
 #include "butil/strings/utf_string_conversions.h"
 
-// gcc7 reports that the first arg to vsnprintfT in StringAppendVT is NULL,
+// gcc7 reports that the first arg to vsnprintfT in StringAppendVT is nullptr,
 // which I can't figure out why, turn off the warning right now.
 #if defined(__GNUC__) && __GNUC__ >= 7
 #pragma GCC diagnostic warning "-Wformat-truncation=0"
@@ -78,7 +78,7 @@ static void StringAppendVT(StringType* dst,
       // wrong and no amount of buffer-doubling is going to fix it.
       return;
 #else
-      if (errno != 0 && errno != EOVERFLOW)
+      if (errno != 0 && errno != EOVERFLOW && errno != E2BIG)
         return;
       // Try doubling the buffer size.
       mem_length *= 2;

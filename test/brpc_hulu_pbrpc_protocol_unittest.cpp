@@ -1,5 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
@@ -11,7 +27,6 @@
 #include <google/protobuf/descriptor.h>
 #include "butil/time.h"
 #include "butil/macros.h"
-#include "butil/gperftools_profiler.h"
 #include "brpc/socket.h"
 #include "brpc/acceptor.h"
 #include "brpc/server.h"
@@ -23,7 +38,7 @@
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
 
@@ -101,7 +116,7 @@ protected:
     virtual void TearDown() {};
 
     void VerifyMessage(brpc::InputMessageBase* msg) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
@@ -110,7 +125,7 @@ protected:
 
     void ProcessMessage(void (*process)(brpc::InputMessageBase*),
                         brpc::InputMessageBase* msg, bool set_eof) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket.get()->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
@@ -161,7 +176,7 @@ protected:
         butil::IOPortal buf;
         EXPECT_EQ((ssize_t)bytes_in_pipe,
                   buf.append_from_file_descriptor(_pipe_fds[0], 1024));
-        brpc::ParseResult pr = brpc::policy::ParseHuluMessage(&buf, NULL, false, NULL);
+        brpc::ParseResult pr = brpc::policy::ParseHuluMessage(&buf, nullptr, false, nullptr);
         EXPECT_EQ(brpc::PARSE_OK, pr.error());
         brpc::policy::MostCommonMessage* msg =
             static_cast<brpc::policy::MostCommonMessage*>(pr.message());
@@ -185,13 +200,13 @@ protected:
         brpc::SerializeRequestDefault(&request_buf, &cntl, &req);
         ASSERT_FALSE(cntl.Failed());
         brpc::policy::PackHuluRequest(
-            &total_buf, NULL, cntl.call_id().value,
+            &total_buf, nullptr, cntl.call_id().value,
             test::EchoService::descriptor()->method(0),
             &cntl, request_buf, &_auth);
         ASSERT_FALSE(cntl.Failed());
 
         brpc::ParseResult req_pr =
-                brpc::policy::ParseHuluMessage(&total_buf, NULL, false, NULL);
+                brpc::policy::ParseHuluMessage(&total_buf, nullptr, false, nullptr);
         ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
         brpc::InputMessageBase* req_msg = req_pr.message();
         ProcessMessage(brpc::policy::ProcessHuluRequest, req_msg, false);
@@ -250,6 +265,114 @@ TEST_F(HuluTest, process_response_after_eof) {
     ASSERT_TRUE(_socket->Failed());
 }
 
+TEST_F(HuluTest, process_response_from_foreign_socket_is_dropped) {
+    brpc::policy::HuluRpcResponseMeta meta;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    cntl._response = &res;
+    ASSERT_EQ(0, bthread_id_lock_and_reset_range(
+                     cntl.call_id(), nullptr, 2));
+    ASSERT_EQ(0, bthread_id_unlock(cntl.current_id()));
+    meta.set_correlation_id(cntl.current_id().value);
+
+    brpc::SocketId sending_id;
+    brpc::SocketOptions sending_options;
+    ASSERT_EQ(0, brpc::Socket::Create(sending_options, &sending_id));
+    ASSERT_EQ(0, brpc::Socket::Address(
+                     sending_id, &cntl._current_call.sending_sock));
+
+    brpc::policy::MostCommonMessage* msg = MakeResponseMessage(meta);
+    ProcessMessage(brpc::policy::ProcessHuluResponse, msg, false);
+
+    EXPECT_TRUE(res.message().empty());
+    EXPECT_EQ(0, cntl.ErrorCode());
+
+    // Dropping the response must leave the call available for its real peer.
+    msg = MakeResponseMessage(meta);
+    cntl._current_call.sending_sock->ReAddress(&msg->_socket);
+    ProcessMessage(brpc::policy::ProcessHuluResponse, msg, false);
+    EXPECT_EQ(EXP_RESPONSE, res.message());
+    EXPECT_EQ(0, cntl.ErrorCode());
+}
+
+TEST_F(HuluTest, process_response_from_sending_socket_is_accepted) {
+    brpc::policy::HuluRpcResponseMeta meta;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    cntl._response = &res;
+    ASSERT_EQ(0, bthread_id_lock_and_reset_range(
+                     cntl.call_id(), nullptr, 2));
+    ASSERT_EQ(0, bthread_id_unlock(cntl.current_id()));
+    meta.set_correlation_id(cntl.current_id().value);
+    _socket->ReAddress(&cntl._current_call.sending_sock);
+
+    brpc::policy::MostCommonMessage* msg = MakeResponseMessage(meta);
+    ProcessMessage(brpc::policy::ProcessHuluResponse, msg, false);
+
+    EXPECT_EQ(EXP_RESPONSE, res.message());
+    EXPECT_EQ(0, cntl.ErrorCode());
+}
+
+TEST_F(HuluTest, process_response_from_previous_retry_is_dropped) {
+    brpc::Controller cntl;
+    test::EchoResponse res;
+    cntl._response = &res;
+    ASSERT_EQ(0, bthread_id_lock_and_reset_range(
+                     cntl.call_id(), nullptr, 3));
+    const brpc::CallId previous_id = cntl.current_id();
+    cntl._current_call.nretry = 1;
+    ASSERT_EQ(0, bthread_id_unlock(cntl.current_id()));
+    _socket->ReAddress(&cntl._current_call.sending_sock);
+
+    // Even on the right socket, a completed attempt cannot supply the result.
+    brpc::policy::HuluRpcResponseMeta meta;
+    meta.set_correlation_id(previous_id.value);
+    ProcessMessage(brpc::policy::ProcessHuluResponse,
+                   MakeResponseMessage(meta), false);
+    EXPECT_TRUE(res.message().empty());
+    EXPECT_EQ(0, cntl.ErrorCode());
+
+    meta.set_correlation_id(cntl.current_id().value);
+    ProcessMessage(brpc::policy::ProcessHuluResponse,
+                   MakeResponseMessage(meta), false);
+    EXPECT_EQ(EXP_RESPONSE, res.message());
+    EXPECT_EQ(0, cntl.ErrorCode());
+}
+
+TEST_F(HuluTest, process_response_matches_unfinished_backup_socket) {
+    brpc::Controller cntl;
+    test::EchoResponse res;
+    cntl._response = &res;
+    ASSERT_EQ(0, bthread_id_lock_and_reset_range(
+                     cntl.call_id(), nullptr, 3));
+    ASSERT_EQ(0, bthread_id_unlock(cntl.current_id()));
+    const brpc::CallId previous_id = cntl.current_id();
+
+    brpc::SocketId previous_socket_id;
+    ASSERT_EQ(0, brpc::Socket::Create(
+                     brpc::SocketOptions(), &previous_socket_id));
+    ASSERT_EQ(0, brpc::Socket::Address(
+                     previous_socket_id, &cntl._current_call.sending_sock));
+    // Mirror starting a backup: preserve the first attempt and its socket.
+    cntl._unfinished_call = new brpc::Controller::Call(&cntl._current_call);
+    ++cntl._current_call.nretry;
+    _socket->ReAddress(&cntl._current_call.sending_sock);
+
+    brpc::policy::HuluRpcResponseMeta meta;
+    meta.set_correlation_id(previous_id.value);
+    ProcessMessage(brpc::policy::ProcessHuluResponse,
+                   MakeResponseMessage(meta), false);
+    EXPECT_TRUE(res.message().empty());
+    EXPECT_EQ(0, cntl.ErrorCode());
+
+    // The preserved attempt may still finish, but only on its own socket.
+    brpc::policy::MostCommonMessage* msg = MakeResponseMessage(meta);
+    cntl._unfinished_call->sending_sock->ReAddress(&msg->_socket);
+    ProcessMessage(brpc::policy::ProcessHuluResponse, msg, false);
+    EXPECT_EQ(EXP_RESPONSE, res.message());
+    EXPECT_EQ(0, cntl.ErrorCode());
+}
+
 TEST_F(HuluTest, process_response_error_code) {
     const int ERROR_CODE = 12345;
     brpc::policy::HuluRpcResponseMeta meta;
@@ -275,13 +398,13 @@ TEST_F(HuluTest, complete_flow) {
     ASSERT_FALSE(cntl.Failed());
     cntl.request_attachment().append(EXP_REQUEST);
     brpc::policy::PackHuluRequest(
-        &total_buf, NULL, cntl.call_id().value,
+        &total_buf, nullptr, cntl.call_id().value,
         test::EchoService::descriptor()->method(0), &cntl, request_buf, &_auth);
     ASSERT_FALSE(cntl.Failed());
 
     // Verify and handle request
     brpc::ParseResult req_pr =
-            brpc::policy::ParseHuluMessage(&total_buf, NULL, false, NULL);
+            brpc::policy::ParseHuluMessage(&total_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
     brpc::InputMessageBase* req_msg = req_pr.message();
     VerifyMessage(req_msg);
@@ -291,7 +414,7 @@ TEST_F(HuluTest, complete_flow) {
     butil::IOPortal response_buf;
     response_buf.append_from_file_descriptor(_pipe_fds[0], 1024);
     brpc::ParseResult res_pr =
-            brpc::policy::ParseHuluMessage(&response_buf, NULL, false, NULL);
+            brpc::policy::ParseHuluMessage(&response_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, res_pr.error());
     brpc::InputMessageBase* res_msg = res_pr.message();
     ProcessMessage(brpc::policy::ProcessHuluResponse, res_msg, false);
@@ -312,13 +435,13 @@ TEST_F(HuluTest, close_in_callback) {
     brpc::SerializeRequestDefault(&request_buf, &cntl, &req);
     ASSERT_FALSE(cntl.Failed());
     brpc::policy::PackHuluRequest(
-        &total_buf, NULL, cntl.call_id().value,
+        &total_buf, nullptr, cntl.call_id().value,
         test::EchoService::descriptor()->method(0), &cntl, request_buf, &_auth);
     ASSERT_FALSE(cntl.Failed());
 
     // Handle request
     brpc::ParseResult req_pr =
-            brpc::policy::ParseHuluMessage(&total_buf, NULL, false, NULL);
+            brpc::policy::ParseHuluMessage(&total_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
     brpc::InputMessageBase* req_msg = req_pr.message();
     ProcessMessage(brpc::policy::ProcessHuluRequest, req_msg, false);

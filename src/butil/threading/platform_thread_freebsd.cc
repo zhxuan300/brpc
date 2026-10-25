@@ -13,7 +13,6 @@
 #include "butil/safe_strerror_posix.h"
 #include "butil/threading/thread_id_name_manager.h"
 #include "butil/threading/thread_restrictions.h"
-#include "butil/tracked_objects.h"
 
 #if !defined(OS_NACL)
 #include <sys/resource.h>
@@ -46,8 +45,12 @@ int ThreadNiceValue(ThreadPriority priority) {
 // static
 void PlatformThread::SetName(const char* name) {
   ThreadIdNameManager::GetInstance()->SetName(CurrentId(), name);
-  tracked_objects::ThreadData::InitializeThreadContext(name);
 
+  SetNameSimple(name);
+}
+
+// static
+void PlatformThread::SetNameSimple(const char* name) {
 #if !defined(OS_NACL)
   // On FreeBSD we can get the thread names to show up in the debugger by
   // setting the process name for the LWP.  We don't want to do this for the

@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
-//          Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_POLICY_HTTP_RPC_PROTOCOL_H
 #define BRPC_POLICY_HTTP_RPC_PROTOCOL_H
@@ -36,11 +37,14 @@ struct CommonStrings {
     std::string CONTENT_TYPE_TEXT;
     std::string CONTENT_TYPE_JSON;
     std::string CONTENT_TYPE_PROTO;
+    std::string CONTENT_TYPE_SPRING_PROTO;
     std::string ERROR_CODE;
     std::string AUTHORIZATION;
     std::string ACCEPT_ENCODING;
     std::string CONTENT_ENCODING;
     std::string CONTENT_LENGTH;
+    std::string EXPECT;
+    std::string CONTINUE_100;
     std::string GZIP;
     std::string CONNECTION;
     std::string KEEP_ALIVE;
@@ -73,6 +77,8 @@ struct CommonStrings {
     std::string GRPC_MESSAGE;
     std::string GRPC_TIMEOUT;
 
+    std::string DEFAULT_PATH;
+
     CommonStrings();
 };
 
@@ -81,10 +87,18 @@ class HttpContext : public ReadableProgressiveAttachment
                   , public InputMessageBase
                   , public HttpMessage {
 public:
-    HttpContext(bool read_body_progressively)
+    void SetSocketId(SocketId id) {
+        _socket_id = id;
+    }
+
+    SocketId socket_id() const { return _socket_id; }
+
+    explicit HttpContext(bool read_body_progressively,
+                         HttpMethod request_method = HTTP_METHOD_GET)
         : InputMessageBase()
-        , HttpMessage(read_body_progressively)
-        , _is_stage2(false) {
+        , HttpMessage(read_body_progressively, request_method)
+        , _is_stage2(false)
+        , _socket_id(INVALID_SOCKET_ID) {
         // add one ref for Destroy
         butil::intrusive_ptr<HttpContext>(this).detach();
     }
@@ -102,17 +116,20 @@ public:
     bool is_stage2() const { return _is_stage2; }
 
     // @InputMessageBase
-    void DestroyImpl() {
+    void DestroyImpl() override {
         RemoveOneRefForStage2();
     }
 
     // @ReadableProgressiveAttachment
-    void ReadProgressiveAttachmentBy(ProgressiveReader* r) {
+    void ReadProgressiveAttachmentBy(ProgressiveReader* r) override {
         return SetBodyReader(r);
     }
 
+    void CheckProgressiveRead(const void* arg, Socket *socket);
+
 private:
     bool _is_stage2;
+    SocketId _socket_id;
 };
 
 // Implement functions required in protocol.h
@@ -139,6 +156,8 @@ enum HttpContentType {
     HTTP_CONTENT_OTHERS = 0,
     HTTP_CONTENT_JSON = 1,
     HTTP_CONTENT_PROTO = 2,
+    HTTP_CONTENT_PROTO_TEXT = 3,
+    HTTP_CONTENT_PROTO_JSON = 4,
 };
 
 // Parse from the textual content type. One type may have more than one literals.

@@ -20,7 +20,7 @@ brpc is designed to add new protocols at any time, just proceed as follows:
 
 ## add ProtocolType
 
-Add new protocol type in ProtocolType in [options.proto](https://github.com/brpc/brpc/blob/master/src/brpc/options.proto). If you need to add new protocol, please contact us to add it for you to make sure there is no conflict with protocols of others.
+Add new protocol type in ProtocolType in [options.proto](https://github.com/apache/brpc/blob/master/src/brpc/options.proto). If you need to add new protocol, please contact us to add it for you to make sure there is no conflict with protocols of others.
 
 Currently we support in ProtocolType(at the middle of 2018):
 ```c++
@@ -56,7 +56,7 @@ enum ProtocolType {
 ```
 ## Implement Callbacks
 
-All callbacks are defined in struct Protocol, which is defined in [protocol.h](https://github.com/brpc/brpc/blob/master/src/brpc/protocol.h). Among all these callbacks, `parse` is a callback that must be implemented. Besides, `process_request` must be implemented in the server side and `serialize_request`, `pack_request`, `process_response` must be implemented in the client side.
+All callbacks are defined in struct Protocol, which is defined in [protocol.h](https://github.com/apache/brpc/blob/master/src/brpc/protocol.h). Among all these callbacks, `parse` is a callback that must be implemented. Besides, `process_request` must be implemented in the server side and `serialize_request`, `pack_request`, `process_response` must be implemented in the client side.
 
 It is difficult to implement callbacks of the protocol. These codes are not like the codes that ordinary users use which has good prompts and protections. You have to figure it out how to handle similar code in other protocols and implement your own protocol, then send it to us to do code review.
 
@@ -67,7 +67,7 @@ typedef ParseResult (*Parse)(butil::IOBuf* source, Socket *socket, bool read_eof
 ```
 This function is used to cut messages from source. Client side and server side must share the same parse function. The returned message will be passed to `process_request`(server side) or `process_response`(client side).
 
-Argument: source is the binary content from remote side, socket is the corresponding connection, read_eof is true iff the connection is closed by remote, arg is a pointer to the corresponding server in server client and NULL in client side.
+Argument: source is the binary content from remote side, socket is the corresponding connection, read_eof is true iff the connection is closed by remote, arg is a pointer to the corresponding server in server client and nullptr in client side.
 
 ParseResult could be an error or a cut message, its possible value contains:
 
@@ -94,7 +94,7 @@ typedef int (*PackRequest)(butil::IOBuf* msg,
                            const butil::IOBuf& request_buf,
                            const Authenticator* auth);
 ```
-This function is used to pack request_buf into msg, which is called every time before sending messages to server(including retrying). When auth is not NULL, authentication information is also needed to be packed. Return 0 if succeed, otherwise -1.
+This function is used to pack request_buf into msg, which is called every time before sending messages to server(including retrying). When auth is not nullptr, authentication information is also needed to be packed. Return 0 if succeed, otherwise -1.
 
 ### process_request
 ```c++
@@ -112,7 +112,7 @@ This function is used to parse message response in client side that client must 
 ```c++
 typedef bool (*Verify)(const InputMessageBase* msg);
 ```
-This function is used to authenticate connections, it is called when the first message is received. It is must be implemented by servers that need authentication, otherwise the function pointer can be NULL. Return true if succeed, otherwise false.
+This function is used to authenticate connections, it is called when the first message is received. It is must be implemented by servers that need authentication, otherwise the function pointer can be nullptr. Return true if succeed, otherwise false.
 
 ### parse_server_address
 ```c++
@@ -137,7 +137,7 @@ The name of the protocol, which appears in the various configurations and displa
 
 ## Register to global
 
-RegisterProtocol should be called to [register implemented protocol](https://github.com/brpc/brpc/blob/master/src/brpc/global.cpp) to brpc, just like:
+RegisterProtocol should be called to [register implemented protocol](https://github.com/apache/brpc/blob/master/src/brpc/global.cpp) to brpc, just like:
 
 ```c++
 Protocol http_protocol = { ParseHttpMessage,

@@ -1,32 +1,38 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Jul 13 15:04:18 CST 2014
 
 #ifndef BUTIL_OBJECT_POOL_INL_H
 #define BUTIL_OBJECT_POOL_INL_H
 
-#include <iostream>                      // std::ostream
-#include <pthread.h>                     // pthread_mutex_t
-#include <algorithm>                     // std::max, std::min
+#include <iostream>                       // std::ostream
+#include <pthread.h>                      // pthread_mutex_t
+#include <algorithm>                      // std::max, std::min
+#include <vector>
+
 #include "butil/atomicops.h"              // butil::atomic
 #include "butil/macros.h"                 // BAIDU_CACHELINE_ALIGNMENT
 #include "butil/scoped_lock.h"            // BAIDU_SCOPED_LOCK
 #include "butil/thread_local.h"           // BAIDU_THREAD_LOCAL
-#include <vector>
+#include "butil/memory/aligned_memory.h"  // butil::AlignedMemory
+#include "butil/debug/address_annotations.h"
 
 #ifdef BUTIL_OBJECT_POOL_NEED_FREE_ITEM_NUM
 #define BAIDU_OBJECT_POOL_FREE_ITEM_NUM_ADD1                    \
@@ -50,7 +56,7 @@ template <typename T>
 struct ObjectPoolFreeChunk<T, 0> {
     size_t nfree;
     T* ptrs[0];
-}; 
+};
 
 struct ObjectPoolInfo {
     size_t local_pool_num;
@@ -81,6 +87,29 @@ public:
 
 template <typename T>
 class BAIDU_CACHELINE_ALIGNMENT ObjectPool {
+private:
+#ifdef BUTIL_USE_ASAN
+    static void asan_poison_memory_region(T* ptr) {
+        if (!ObjectPoolWithASanPoison<T>::value || nullptr == ptr) {
+            return;
+        }
+        // Marks the object as addressable.
+        BUTIL_ASAN_POISON_MEMORY_REGION(ptr, sizeof(T));
+    }
+    static void asan_unpoison_memory_region(T* ptr) {
+        if (!ObjectPoolWithASanPoison<T>::value || nullptr == ptr) {
+            return;
+        }
+        // Marks the object as unaddressable.
+        BUTIL_ASAN_UNPOISON_MEMORY_REGION(ptr, sizeof(T));
+    }
+#define OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr) asan_poison_memory_region(ptr)
+#define OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr) asan_unpoison_memory_region(ptr)
+#else
+#define OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr) ((void)(ptr))
+#define OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr) ((void)(ptr))
+#endif // BUTIL_USE_ASAN
+
 public:
     static const size_t BLOCK_NITEM = ObjectPoolBlockItemNum<T>::value;
     static const size_t FREE_CHUNK_NITEM = BLOCK_NITEM;
@@ -89,12 +118,20 @@ public:
     // global list(_free_chunks).
     typedef ObjectPoolFreeChunk<T, FREE_CHUNK_NITEM>    FreeChunk;
     typedef ObjectPoolFreeChunk<T, 0> DynamicFreeChunk;
+#ifdef BUTIL_USE_ASAN
+    // According to https://github.com/google/sanitizers/wiki/AddressSanitizerManualPoisoning ,
+    // The allocated chunks should start with 8-aligned addresses,
+    // so that AlignedMemory starts with at least 8-aligned addresses.
+    typedef AlignedMemory<sizeof(T), __alignof__(T) < 8 ? 8 : __alignof__(T)> BlockItem;
+#else
+    typedef AlignedMemory<sizeof(T), __alignof__(T)> BlockItem;
+#endif
 
     // When a thread needs memory, it allocates a Block. To improve locality,
     // items in the Block are only used by the thread.
     // To support cache-aligned objects, align Block.items by cacheline.
     struct BAIDU_CACHELINE_ALIGNMENT Block {
-        char items[sizeof(T) * BLOCK_NITEM];
+        BlockItem items[BLOCK_NITEM];
         size_t nitem;
 
         Block() : nitem(0) {}
@@ -110,8 +147,8 @@ public:
         BlockGroup() : nblock(0) {
             // We fetch_add nblock in add_block() before setting the entry,
             // thus address_resource() may sees the unset entry. Initialize
-            // all entries to NULL makes such address_resource() return NULL.
-            memset(blocks, 0, sizeof(butil::atomic<Block*>) * OP_GROUP_NBLOCK);
+            // all entries to nullptr makes such address_resource() return nullptr.
+            memset(static_cast<void*>(blocks), 0, sizeof(butil::atomic<Block*>) * OP_GROUP_NBLOCK);
         }
     };
 
@@ -120,7 +157,7 @@ public:
     public:
         explicit LocalPool(ObjectPool* pool)
             : _pool(pool)
-            , _cur_block(NULL)
+            , _cur_block(nullptr)
             , _cur_block_index(0) {
             _cur_free.nfree = 0;
         }
@@ -155,47 +192,52 @@ public:
             BAIDU_OBJECT_POOL_FREE_ITEM_NUM_SUB1;                       \
             return _cur_free.ptrs[--_cur_free.nfree];                   \
         }                                                               \
+        T* obj = nullptr;                                                  \
         /* Fetch memory from local block */                             \
         if (_cur_block && _cur_block->nitem < BLOCK_NITEM) {            \
-            T* obj = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
-                return NULL;                                            \
+                return nullptr;                                            \
             }                                                           \
+            /* It's poisoned prior to use. */                           \
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(obj);                 \
             ++_cur_block->nitem;                                        \
             return obj;                                                 \
         }                                                               \
         /* Fetch a Block from global */                                 \
         _cur_block = add_block(&_cur_block_index);                      \
-        if (_cur_block != NULL) {                                       \
-            T* obj = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
+        if (_cur_block != nullptr) {                                       \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
-                return NULL;                                            \
+                return nullptr;                                            \
             }                                                           \
+            /* It's poisoned prior to use. */                           \
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(obj);                 \
             ++_cur_block->nitem;                                        \
             return obj;                                                 \
         }                                                               \
-        return NULL;                                                    \
+        return nullptr;                                                    \
  
 
         inline T* get() {
             BAIDU_OBJECT_POOL_GET();
         }
 
-        template <typename A1>
-        inline T* get(const A1& a1) {
-            BAIDU_OBJECT_POOL_GET((a1));
-        }
-
-        template <typename A1, typename A2>
-        inline T* get(const A1& a1, const A2& a2) {
-            BAIDU_OBJECT_POOL_GET((a1, a2));
+        template<typename... Args>
+        inline T* get(Args&&... args) {
+            BAIDU_OBJECT_POOL_GET((std::forward<Args>(args)...));
         }
 
 #undef BAIDU_OBJECT_POOL_GET
 
         inline int return_object(T* ptr) {
+            // TODO. Refer to ASan to implement a efficient quarantine mechanism.
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr);
+
             // Return to local free list
             if (_cur_free.nfree < ObjectPool::free_chunk_nitem()) {
                 _cur_free.ptrs[_cur_free.nfree++] = ptr;
@@ -213,6 +255,10 @@ public:
             return -1;
         }
 
+        inline bool free_empty() const {
+            return 0 == _cur_free.nfree;
+        }
+
     private:
         ObjectPool* _pool;
         Block* _cur_block;
@@ -220,35 +266,28 @@ public:
         FreeChunk _cur_free;
     };
 
-    inline T* get_object() {
+    inline bool local_free_empty() {
         LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get();
+        if (BAIDU_LIKELY(lp != nullptr)) {
+            return lp->free_empty();
         }
-        return NULL;
+        return true;
     }
 
-    template <typename A1>
-    inline T* get_object(const A1& arg1) {
+    template <typename... Args>
+    inline T* get_object(Args&&... args) {
         LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get(arg1);
+        T* ptr = nullptr;
+        if (BAIDU_LIKELY(lp != nullptr)) {
+            ptr = lp->get(std::forward<Args>(args)...);
+            OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr);
         }
-        return NULL;
-    }
-
-    template <typename A1, typename A2>
-    inline T* get_object(const A1& arg1, const A2& arg2) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get(arg1, arg2);
-        }
-        return NULL;
+        return ptr;
     }
 
     inline int return_object(T* ptr) {
         LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
+        if (BAIDU_LIKELY(lp != nullptr)) {
             return lp->return_object(ptr);
         }
         return -1;
@@ -257,7 +296,7 @@ public:
     void clear_objects() {
         LocalPool* lp = _local_pool;
         if (lp) {
-            _local_pool = NULL;
+            _local_pool = nullptr;
             butil::thread_atexit_cancel(LocalPool::delete_local_pool, lp);
             delete lp;
         }
@@ -283,7 +322,7 @@ public:
 
         for (size_t i = 0; i < info.block_group_num; ++i) {
             BlockGroup* bg = _block_groups[i].load(butil::memory_order_consume);
-            if (NULL == bg) {
+            if (nullptr == bg) {
                 break;
             }
             size_t nblock = std::min(bg->nblock.load(butil::memory_order_relaxed),
@@ -291,7 +330,7 @@ public:
             info.block_num += nblock;
             for (size_t j = 0; j < nblock; ++j) {
                 Block* b = bg->blocks[j].load(butil::memory_order_consume);
-                if (NULL != b) {
+                if (nullptr != b) {
                     info.item_num += b->nitem;
                 }
             }
@@ -318,18 +357,68 @@ public:
 private:
     ObjectPool() {
         _free_chunks.reserve(OP_INITIAL_FREE_LIST_SIZE);
-        pthread_mutex_init(&_free_chunks_mutex, NULL);
+        pthread_mutex_init(&_free_chunks_mutex, nullptr);
+#if defined(BUTIL_USE_ASAN) && \
+    !defined(BAIDU_CLEAR_OBJECT_POOL_AFTER_ALL_THREADS_QUIT)
+        // Objects returned to the pool stay ASan-poisoned (see return_object()).
+        // LeakSanitizer skips poisoned memory when scanning for live pointers
+        // (its `use_poisoned' option is off by default), so heap memory that is
+        // only reachable through pointers stored inside pooled objects (e.g.
+        // std::string buffers owned by cached protobuf messages) would be
+        // falsely reported as leaked at process exit. Un-poison all pooled
+        // objects right before LSan runs. LSan registers its leak check via
+        // atexit() very early during sanitizer init, so this handler (registered
+        // lazily on the first singleton creation) runs before it because atexit
+        // handlers execute in LIFO order.
+        // Not needed when BAIDU_CLEAR_OBJECT_POOL_AFTER_ALL_THREADS_QUIT is
+        // defined: clear_from_destructor_of_local_pool() then destructs and
+        // frees all pooled objects after the last thread quits.
+        if (ObjectPoolWithASanPoison<T>::value) {
+            atexit(unpoison_all_objects_before_leak_check);
+        }
+#endif
     }
 
     ~ObjectPool() {
         pthread_mutex_destroy(&_free_chunks_mutex);
     }
 
+#if defined(BUTIL_USE_ASAN) && \
+    !defined(BAIDU_CLEAR_OBJECT_POOL_AFTER_ALL_THREADS_QUIT)
+    // Un-poison every constructed object still held by the pool so that
+    // LeakSanitizer can follow the pointers inside them. Only un-poisons, does
+    // not destruct: the pool intentionally keeps objects alive for reuse, and
+    // they remain reachable from the singleton, so they are not real leaks.
+    static void unpoison_all_objects_before_leak_check() {
+        if (nullptr == _singleton.load(butil::memory_order_consume)) {
+            return;
+        }
+        const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
+        for (size_t i = 0; i < ngroup; ++i) {
+            BlockGroup* bg = _block_groups[i].load(butil::memory_order_consume);
+            if (nullptr == bg) {
+                break;
+            }
+            const size_t nblock = std::min(
+                bg->nblock.load(butil::memory_order_relaxed), OP_GROUP_NBLOCK);
+            for (size_t j = 0; j < nblock; ++j) {
+                Block* b = bg->blocks[j].load(butil::memory_order_consume);
+                if (nullptr == b) {
+                    continue;
+                }
+                for (size_t k = 0; k < b->nitem; ++k) {
+                    asan_unpoison_memory_region((T*)&b->items[k]);
+                }
+            }
+        }
+    }
+#endif
+
     // Create a Block and append it to right-most BlockGroup.
     static Block* add_block(size_t* index) {
         Block* const new_block = new(std::nothrow) Block;
-        if (NULL == new_block) {
-            return NULL;
+        if (nullptr == new_block) {
+            return nullptr;
         }
         size_t ngroup;
         do {
@@ -351,13 +440,13 @@ private:
 
         // Fail to add_block_group.
         delete new_block;
-        return NULL;
+        return nullptr;
     }
 
     // Create a BlockGroup and append it to _block_groups.
     // Shall be called infrequently because a BlockGroup is pretty big.
     static bool add_block_group(size_t old_ngroup) {
-        BlockGroup* bg = NULL;
+        BlockGroup* bg = nullptr;
         BAIDU_SCOPED_LOCK(_block_group_mutex);
         const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
         if (ngroup != old_ngroup) {
@@ -366,27 +455,24 @@ private:
         }
         if (ngroup < OP_MAX_BLOCK_NGROUP) {
             bg = new(std::nothrow) BlockGroup;
-            if (NULL != bg) {
+            if (nullptr != bg) {
                 // Release fence is paired with consume fence in add_block()
                 // to avoid un-constructed bg to be seen by other threads.
                 _block_groups[ngroup].store(bg, butil::memory_order_release);
                 _ngroup.store(ngroup + 1, butil::memory_order_release);
             }
         }
-        return bg != NULL;
+        return bg != nullptr;
     }
 
     inline LocalPool* get_or_new_local_pool() {
-        LocalPool* lp = _local_pool;
-        if (__builtin_expect(lp != NULL, 1)) {
+	    LocalPool* lp = BAIDU_GET_VOLATILE_THREAD_LOCAL(_local_pool);
+        if (BAIDU_LIKELY(lp != nullptr)) {
             return lp;
         }
-        lp = new(std::nothrow) LocalPool(this);
-        if (NULL == lp) {
-            return NULL;
-        }
+        lp = new LocalPool(this);
         BAIDU_SCOPED_LOCK(_change_thread_mutex); //avoid race with clear()
-        _local_pool = lp;
+	    BAIDU_SET_VOLATILE_THREAD_LOCAL(_local_pool, lp);
         butil::thread_atexit(LocalPool::delete_local_pool, lp);
         _nlocal.fetch_add(1, butil::memory_order_relaxed);
         return lp;
@@ -394,7 +480,7 @@ private:
 
     void clear_from_destructor_of_local_pool() {
         // Remove tls
-        _local_pool = NULL;
+        _local_pool = nullptr;
 
         // Do nothing if there're active threads.
         if (_nlocal.fetch_sub(1, butil::memory_order_relaxed) != 1) {
@@ -423,19 +509,21 @@ private:
         const size_t ngroup = _ngroup.exchange(0, butil::memory_order_relaxed);
         for (size_t i = 0; i < ngroup; ++i) {
             BlockGroup* bg = _block_groups[i].load(butil::memory_order_relaxed);
-            if (NULL == bg) {
+            if (nullptr == bg) {
                 break;
             }
             size_t nblock = std::min(bg->nblock.load(butil::memory_order_relaxed),
                                      OP_GROUP_NBLOCK);
             for (size_t j = 0; j < nblock; ++j) {
                 Block* b = bg->blocks[j].load(butil::memory_order_relaxed);
-                if (NULL == b) {
+                if (nullptr == b) {
                     continue;
                 }
                 for (size_t k = 0; k < b->nitem; ++k) {
-                    T* const objs = (T*)b->items;
-                    objs[k].~T();
+                    T* obj = (T*)&b->items[k];
+                    // Unpoison to avoid affecting other allocator.
+                    OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(obj);
+                    obj->~T();
                 }
                 delete b;
             }
@@ -483,7 +571,7 @@ private:
     
     static butil::static_atomic<ObjectPool*> _singleton;
     static pthread_mutex_t _singleton_mutex;
-    static BAIDU_THREAD_LOCAL LocalPool* _local_pool;
+    STATIC_MEMBER_BAIDU_VOLATILE_THREAD_LOCAL(LocalPool*, _local_pool);
     static butil::static_atomic<long> _nlocal;
     static butil::static_atomic<size_t> _ngroup;
     static pthread_mutex_t _block_group_mutex;
@@ -505,10 +593,10 @@ const size_t ObjectPool<T>::FREE_CHUNK_NITEM;
 
 template <typename T>
 BAIDU_THREAD_LOCAL typename ObjectPool<T>::LocalPool*
-ObjectPool<T>::_local_pool = NULL;
+ObjectPool<T>::_local_pool = nullptr;
 
 template <typename T>
-butil::static_atomic<ObjectPool<T>*> ObjectPool<T>::_singleton = BUTIL_STATIC_ATOMIC_INIT(NULL);
+butil::static_atomic<ObjectPool<T>*> ObjectPool<T>::_singleton = BUTIL_STATIC_ATOMIC_INIT(nullptr);
 
 template <typename T>
 pthread_mutex_t ObjectPool<T>::_singleton_mutex = PTHREAD_MUTEX_INITIALIZER;

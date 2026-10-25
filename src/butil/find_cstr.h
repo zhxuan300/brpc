@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Tue Jun 23 15:03:24 CST 2015
 
 #ifndef BUTIL_FIND_CSTR_H
@@ -22,6 +24,7 @@
 #include <map>
 #include <algorithm>
 #include "butil/thread_local.h"
+#include "butil/debug/leak_annotations.h"
 
 // Find c-string in maps with std::string as keys without memory allocations.
 // Example:
@@ -55,6 +58,11 @@ struct StringMapThreadLocalTemp {
     }
 
     inline std::string* get_string(const char* key) {
+        // This thread-local string (and any buffer it reallocates) is reclaimed
+        // via thread_atexit when the thread exits. If a thread is still alive at
+        // leak-check time the allocation would be reported; it is a thread-local
+        // cache, so mark its allocations as intentional non-leaks.
+        ANNOTATE_SCOPED_MEMORY_LEAK;
         if (!initialized) {
             initialized = true;
             std::string* tmp = new (buf) std::string(key);
@@ -68,6 +76,8 @@ struct StringMapThreadLocalTemp {
     }
 
     inline std::string* get_string(const char* key, size_t length) {
+        // See the note in the other get_string overload.
+        ANNOTATE_SCOPED_MEMORY_LEAK;
         if (!initialized) {
             initialized = true;
             std::string* tmp = new (buf) std::string(key, length);
@@ -93,7 +103,7 @@ struct StringMapThreadLocalTemp {
     }
 };
 
-extern __thread StringMapThreadLocalTemp tls_stringmap_temp;
+extern thread_local StringMapThreadLocalTemp tls_stringmap_temp;
 
 template <typename T, typename C, typename A>
 typename std::map<std::string, T, C, A>::const_iterator

@@ -45,6 +45,8 @@
 #include "butil/third_party/symbolize/symbolize.h"
 #endif
 
+extern int BAIDU_WEAK GetStackTrace(void** result, int max_depth, int skip_count);
+
 namespace butil {
 namespace debug {
 
@@ -96,7 +98,7 @@ void DemangleSymbols(std::string* text) {
     // Try to demangle the mangled symbol candidate.
     int status = 0;
     scoped_ptr<char, butil::FreeDeleter> demangled_symbol(
-        abi::__cxa_demangle(mangled_symbol.c_str(), NULL, 0, &status));
+        abi::__cxa_demangle(mangled_symbol.c_str(), nullptr, 0, &status));
     if (status == 0) {  // Demangling is successful.
       // Remove the mangled symbol.
       text->erase(mangled_start, mangled_end - mangled_start);
@@ -427,6 +429,23 @@ class StreamBacktraceOutputHandler : public BacktraceOutputHandler {
   DISALLOW_COPY_AND_ASSIGN(StreamBacktraceOutputHandler);
 };
 
+class StringBacktraceOutputHandler : public BacktraceOutputHandler {
+public:
+    explicit StringBacktraceOutputHandler(std::string& str) : _str(str) {}
+
+    DISALLOW_COPY_AND_ASSIGN(StringBacktraceOutputHandler);
+
+    void HandleOutput(const char* output) OVERRIDE {
+        if (nullptr == output) {
+            return;
+        }
+        _str.append(output);
+    }
+
+private:
+    std::string& _str;
+};
+
 void WarmUpBacktrace() {
   // Warm up stack trace infrastructure. It turns out that on the first
   // call glibc initializes some internal data structures using pthread_once,
@@ -644,7 +663,7 @@ class SandboxSymbolizeHelper {
         if (modules_.find(region.path) == modules_.end()) {
           int fd = open(region.path.c_str(), O_RDONLY | O_CLOEXEC);
           if (fd >= 0) {
-            modules_.insert(std::make_pair(region.path, fd));
+            modules_.emplace(region.path, fd);
           } else {
             LOG(WARNING) << "Failed to open file: " << region.path
                          << "\n  Error: " << strerror(errno);
@@ -667,7 +686,7 @@ class SandboxSymbolizeHelper {
   // Unregister symbolization callback.
   void UnregisterCallback() {
     if (is_initialized_) {
-      google::InstallSymbolizeOpenObjectFileCallback(NULL);
+      google::InstallSymbolizeOpenObjectFileCallback(nullptr);
       is_initialized_ = false;
     }
   }
@@ -720,7 +739,7 @@ bool EnableInProcessStackDumping() {
   memset(&sigpipe_action, 0, sizeof(sigpipe_action));
   sigpipe_action.sa_handler = SIG_IGN;
   sigemptyset(&sigpipe_action.sa_mask);
-  bool success = (sigaction(SIGPIPE, &sigpipe_action, NULL) == 0);
+  bool success = (sigaction(SIGPIPE, &sigpipe_action, nullptr) == 0);
 
   // Avoid hangs during backtrace initialization, see above.
   WarmUpBacktrace();
@@ -731,30 +750,57 @@ bool EnableInProcessStackDumping() {
   action.sa_sigaction = &StackDumpSignalHandler;
   sigemptyset(&action.sa_mask);
 
-  success &= (sigaction(SIGILL, &action, NULL) == 0);
-  success &= (sigaction(SIGABRT, &action, NULL) == 0);
-  success &= (sigaction(SIGFPE, &action, NULL) == 0);
-  success &= (sigaction(SIGBUS, &action, NULL) == 0);
-  success &= (sigaction(SIGSEGV, &action, NULL) == 0);
+  success &= (sigaction(SIGILL, &action, nullptr) == 0);
+  success &= (sigaction(SIGABRT, &action, nullptr) == 0);
+  success &= (sigaction(SIGFPE, &action, nullptr) == 0);
+  success &= (sigaction(SIGBUS, &action, nullptr) == 0);
+  success &= (sigaction(SIGSEGV, &action, nullptr) == 0);
 // On Linux, SIGSYS is reserved by the kernel for seccomp-bpf sandboxing.
 #if !defined(OS_LINUX)
-  success &= (sigaction(SIGSYS, &action, NULL) == 0);
+  success &= (sigaction(SIGSYS, &action, nullptr) == 0);
 #endif  // !defined(OS_LINUX)
 
   return success;
 }
 
-StackTrace::StackTrace() {
+StackTrace::StackTrace(bool exclude_self) {
   // NOTE: This code MUST be async-signal safe (it's used by in-process
   // stack dumping signal handler). NO malloc or stdio is allowed here.
 
+  if (GetStackTrace) {
+    count_ = GetStackTrace(trace_, arraysize(trace_), exclude_self ? 1 : 0);
+  } else {
 #if !defined(__UCLIBC__)
-  // Though the backtrace API man page does not list any possible negative
-  // return values, we take no chance.
-  count_ = butil::saturated_cast<size_t>(backtrace(trace_, arraysize(trace_)));
+    // Though the backtrace API man page does not list any possible negative
+    // return values, we take no chance.
+    count_ = butil::saturated_cast<size_t>(backtrace(trace_, arraysize(trace_)));
+    if (exclude_self && count_ > 1) {
+      // Skip the top frame.
+      memmove(trace_, trace_ + 1, (count_ - 1) * sizeof(void*));
+      count_--;
+    }
 #else
-  count_ = 0;
+    count_ = 0;
 #endif
+  }
+}
+
+bool StackTrace::FindSymbol(void* symbol) const {
+#if !defined(__UCLIBC__)
+  for (size_t i = 0; i < count_; ++i) {
+    uint64_t saddr;
+    // Subtract by one as return address of function may be in the next
+    // function when a function is annotated as noreturn.
+    void* address = static_cast<char*>(trace_[i]) - 1;
+    if (!google::SymbolizeAddress(address, &saddr)) {
+      continue;
+    }
+    if ((void*)saddr == symbol) {
+      return true;
+    }
+  }
+#endif
+  return false;
 }
 
 void StackTrace::Print() const {
@@ -772,6 +818,11 @@ void StackTrace::OutputToStream(std::ostream* os) const {
   StreamBacktraceOutputHandler handler(os);
   ProcessBacktrace(trace_, count_, &handler);
 }
+
+void StackTrace::OutputToString(std::string& str) const {
+    StringBacktraceOutputHandler handler(str);
+    ProcessBacktrace(trace_, count_, &handler);
+}
 #endif
 
 namespace internal {
@@ -781,11 +832,11 @@ char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
   // Make sure we can write at least one NUL byte.
   size_t n = 1;
   if (n > sz)
-    return NULL;
+    return nullptr;
 
   if (base < 2 || base > 16) {
     buf[0] = '\000';
-    return NULL;
+    return nullptr;
   }
 
   char *start = buf;
@@ -799,7 +850,7 @@ char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
     // Make sure we can write the '-' character.
     if (++n > sz) {
       buf[0] = '\000';
-      return NULL;
+      return nullptr;
     }
     *start++ = '-';
   }
@@ -811,7 +862,7 @@ char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
     // Make sure there is still enough space left in our output buffer.
     if (++n > sz) {
       buf[0] = '\000';
-      return NULL;
+      return nullptr;
     }
 
     // Output the next digit.

@@ -1,18 +1,20 @@
-// Copyright (c) 2017 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #ifndef  BRPC_HPACK_H
 #define  BRPC_HPACK_H
@@ -130,6 +132,11 @@ private:
 
     IndexTable* _encode_table;
     IndexTable* _decode_table;
+    // The max dynamic table size this decoder was initialized with, i.e.
+    // the SETTINGS_HEADER_TABLE_SIZE we advertised to the peer. Per RFC
+    // 7541 section 4.2/6.3 a dynamic table size update exceeding it must
+    // be treated as a decoding error.
+    size_t _max_table_size;
 };
 
 // Lowercase the input string, a fast implementation.

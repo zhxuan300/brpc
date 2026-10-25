@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Thu Aug  7 18:56:27 CST 2014
 
 #include "butil/compat.h"
@@ -28,15 +31,20 @@
 #include "butil/fd_utility.h"                     // make_non_blocking
 #include "butil/logging.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"   // fmix32
+#include "butil/memory/scope_guard.h"
 #include "bthread/butex.h"                       // butex_*
 #include "bthread/task_group.h"                  // TaskGroup
 #include "bthread/bthread.h"                             // bthread_start_urgent
+
+namespace butil {
+extern int pthread_fd_wait(int fd, unsigned events, const timespec* abstime);
+}
 
 // Implement bthread functions on file descriptors
 
 namespace bthread {
 
-extern BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
+EXTERN_BAIDU_VOLATILE_THREAD_LOCAL(TaskGroup*, tls_task_group);
 
 template <typename T, size_t NBLOCK, size_t BLOCK_SIZE>
 class LazyArray {
@@ -46,27 +54,23 @@ class LazyArray {
 
 public:
     LazyArray() {
-        memset(_blocks, 0, sizeof(butil::atomic<Block*>) * NBLOCK);
+        memset(static_cast<void*>(_blocks), 0, sizeof(butil::atomic<Block*>) * NBLOCK);
     }
 
     butil::atomic<T>* get_or_new(size_t index) {
         const size_t block_index = index / BLOCK_SIZE;
         if (block_index >= NBLOCK) {
-            return NULL;
+            return nullptr;
         }
         const size_t block_offset = index - block_index * BLOCK_SIZE;
         Block* b = _blocks[block_index].load(butil::memory_order_consume);
-        if (b != NULL) {
+        if (b != nullptr) {
             return b->items + block_offset;
         }
-        b = new (std::nothrow) Block;
-        if (NULL == b) {
-            b = _blocks[block_index].load(butil::memory_order_consume);
-            return (b ? b->items + block_offset : NULL);
-        }
+        b = new Block;
         // Set items to default value of T.
         std::fill(b->items, b->items + BLOCK_SIZE, T());
-        Block* expected = NULL;
+        Block* expected = nullptr;
         if (_blocks[block_index].compare_exchange_strong(
                 expected, b, butil::memory_order_release,
                 butil::memory_order_consume)) {
@@ -81,11 +85,11 @@ public:
         if (__builtin_expect(block_index < NBLOCK, 1)) {
             const size_t block_offset = index - block_index * BLOCK_SIZE;
             Block* const b = _blocks[block_index].load(butil::memory_order_consume);
-            if (__builtin_expect(b != NULL, 1)) {
+            if (__builtin_expect(b != nullptr, 1)) {
                 return b->items + block_offset;
             }
         }
-        return NULL;
+        return nullptr;
     }
 
 private:
@@ -133,8 +137,10 @@ public:
             PLOG(FATAL) << "Fail to epoll_create/kqueue";
             return -1;
         }
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "EpollThread::run_this");
         if (bthread_start_background(
-                &_tid, NULL, EpollThread::run_this, this) != 0) {
+                &_tid, &attr, EpollThread::run_this, this) != 0) {
             close(_epfd);
             _epfd = -1;
             LOG(FATAL) << "Fail to create epoll bthread";
@@ -168,21 +174,21 @@ public:
             return -1;
         }
 #if defined(OS_LINUX)
-        epoll_event evt = { EPOLLOUT, { NULL } };
+        epoll_event evt = { EPOLLOUT, { nullptr } };
         if (epoll_ctl(saved_epfd, EPOLL_CTL_ADD,
                       closing_epoll_pipe[1], &evt) < 0) {
 #elif defined(OS_MACOSX)
         struct kevent kqueue_event;
         EV_SET(&kqueue_event, closing_epoll_pipe[1], EVFILT_WRITE, EV_ADD | EV_ENABLE,
-                0, 0, NULL);
-        if (kevent(saved_epfd, &kqueue_event, 1, NULL, 0, NULL) < 0) {
+                0, 0, nullptr);
+        if (kevent(saved_epfd, &kqueue_event, 1, nullptr, 0, nullptr) < 0) {
 #endif
             PLOG(FATAL) << "Fail to add closing_epoll_pipe into epfd="
                         << saved_epfd;
             return -1;
         }
 
-        const int rc = bthread_join(_tid, NULL);
+        const int rc = bthread_join(_tid, nullptr);
         if (rc) {
             LOG(FATAL) << "Fail to join EpollThread, " << berror(rc);
             return -1;
@@ -195,19 +201,19 @@ public:
 
     int fd_wait(int fd, unsigned events, const timespec* abstime) {
         butil::atomic<EpollButex*>* p = fd_butexes.get_or_new(fd);
-        if (NULL == p) {
+        if (nullptr == p) {
             errno = ENOMEM;
             return -1;
         }
 
         EpollButex* butex = p->load(butil::memory_order_consume);
-        if (NULL == butex) {
+        if (nullptr == butex) {
             // It is rare to wait on one file descriptor from multiple threads
             // simultaneously. Creating singleton by optimistic locking here
             // saves mutexes for each butex.
             butex = butex_create_checked<EpollButex>();
             butex->store(0, butil::memory_order_relaxed);
-            EpollButex* expected = NULL;
+            EpollButex* expected = nullptr;
             if (!p->compare_exchange_strong(expected, butex,
                                             butil::memory_order_release,
                                             butil::memory_order_consume)) {
@@ -251,14 +257,16 @@ public:
         struct kevent kqueue_event;
         EV_SET(&kqueue_event, fd, events, EV_ADD | EV_ENABLE | EV_ONESHOT,
                 0, 0, butex);
-        if (kevent(_epfd, &kqueue_event, 1, NULL, 0, NULL) < 0) {
+        if (kevent(_epfd, &kqueue_event, 1, nullptr, 0, nullptr) < 0) {
             PLOG(FATAL) << "Fail to add fd=" << fd << " into kqueuefd=" << _epfd;
             return -1;
         }
 #endif
-        if (butex_wait(butex, expected_val, abstime) < 0 &&
-            errno != EWOULDBLOCK && errno != EINTR) {
-            return -1;
+        while (butex->load(butil::memory_order_relaxed) == expected_val) {
+            if (butex_wait(butex, expected_val, abstime) < 0 &&
+                errno != EWOULDBLOCK && errno != EINTR) {
+                return -1;
+            }
         }
         return 0;
     }
@@ -270,7 +278,7 @@ public:
             return -1;
         }
         butil::atomic<EpollButex*>* pbutex = bthread::fd_butexes.get(fd);
-        if (NULL == pbutex) {
+        if (nullptr == pbutex) {
             // Did not call bthread_fd functions, close directly.
             return close(fd);
         }
@@ -281,18 +289,18 @@ public:
             errno = EBADF;
             return -1;
         }
-        if (butex != NULL) {
+        if (butex != nullptr) {
             butex->fetch_add(1, butil::memory_order_relaxed);
             butex_wake_all(butex);
         }
 #if defined(OS_LINUX)
-        epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, NULL);
+        epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
 #elif defined(OS_MACOSX)
         struct kevent evt;
-        EV_SET(&evt, fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-        kevent(_epfd, &evt, 1, NULL, 0, NULL);
-        EV_SET(&evt, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        kevent(_epfd, &evt, 1, NULL, 0, NULL);
+        EV_SET(&evt, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        kevent(_epfd, &evt, 1, nullptr, 0, nullptr);
+        EV_SET(&evt, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        kevent(_epfd, &evt, 1, nullptr, 0, nullptr);
 #endif
         const int rc = close(fd);
         pbutex->exchange(butex, butil::memory_order_relaxed);
@@ -312,15 +320,11 @@ private:
         const int initial_epfd = _epfd;
         const size_t MAX_EVENTS = 32;
 #if defined(OS_LINUX)
-        epoll_event* e = new (std::nothrow) epoll_event[MAX_EVENTS];
+        epoll_event* e = new epoll_event[MAX_EVENTS];
 #elif defined(OS_MACOSX)
         typedef struct kevent KEVENT;
-        struct kevent* e = new (std::nothrow) KEVENT[MAX_EVENTS];
+        struct kevent* e = new KEVENT[MAX_EVENTS];
 #endif
-        if (NULL == e) {
-            LOG(FATAL) << "Fail to new epoll_event";
-            return NULL;
-        }
 
 #if defined(OS_LINUX)
 # ifndef BAIDU_KERNEL_FIXED_EPOLLONESHOT_BUG
@@ -332,7 +336,7 @@ private:
 #if defined(OS_LINUX)
             const int n = epoll_wait(epfd, e, MAX_EVENTS, -1);
 #elif defined(OS_MACOSX)
-            const int n = kevent(epfd, NULL, 0, e, MAX_EVENTS, NULL);
+            const int n = kevent(epfd, nullptr, 0, e, MAX_EVENTS, nullptr);
 #endif
             if (_stop) {
                 break;
@@ -358,7 +362,7 @@ private:
 #if defined(OS_LINUX)
 # ifndef BAIDU_KERNEL_FIXED_EPOLLONESHOT_BUG
             for (int i = 0; i < n; ++i) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, e[i].data.fd, NULL);
+                epoll_ctl(epfd, EPOLL_CTL_DEL, e[i].data.fd, nullptr);
             }
 # endif
 #endif
@@ -369,12 +373,12 @@ private:
 # else
                 butil::atomic<EpollButex*>* pbutex = fd_butexes.get(e[i].data.fd);
                 EpollButex* butex = pbutex ?
-                    pbutex->load(butil::memory_order_consume) : NULL;
+                    pbutex->load(butil::memory_order_consume) : nullptr;
 # endif
 #elif defined(OS_MACOSX)
                 EpollButex* butex = static_cast<EpollButex*>(e[i].udata);
 #endif
-                if (butex != NULL && butex != CLOSING_GUARD) {
+                if (butex != nullptr && butex != CLOSING_GUARD) {
                     butex->fetch_add(1, butil::memory_order_relaxed);
                     butex_wake_all(butex);
                 }
@@ -384,7 +388,7 @@ private:
         delete [] e;
         DLOG(INFO) << "EpollThread=" << _tid << "(epfd="
                    << initial_epfd << ") is about to stop";
-        return NULL;
+        return nullptr;
     }
 
     int _epfd;
@@ -419,69 +423,10 @@ int stop_and_join_epoll_threads() {
     return rc;
 }
 
-#if defined(OS_LINUX)
-short epoll_to_poll_events(uint32_t epoll_events) {
-    // Most POLL* and EPOLL* are same values.
-    short poll_events = (epoll_events &
-                         (EPOLLIN | EPOLLPRI | EPOLLOUT |
-                          EPOLLRDNORM | EPOLLRDBAND |
-                          EPOLLWRNORM | EPOLLWRBAND |
-                          EPOLLMSG | EPOLLERR | EPOLLHUP));
-    CHECK_EQ((uint32_t)poll_events, epoll_events);
-    return poll_events;
-}
-#elif defined(OS_MACOSX)
-short kqueue_to_poll_events(uint32_t kqueue_events) {
-    //TODO: add more values?
-    short poll_events = 0;
-    if (kqueue_events == EVFILT_READ) {
-        poll_events |= POLLIN;
-    }
-    if (kqueue_events == EVFILT_WRITE) {
-        poll_events |= POLLOUT;
-    }
-    return poll_events;
-}
-#endif
-
 // For pthreads.
 int pthread_fd_wait(int fd, unsigned events,
                     const timespec* abstime) {
-    int diff_ms = -1;
-    if (abstime) {
-        timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
-        int64_t now_us = butil::timespec_to_microseconds(now);
-        int64_t abstime_us = butil::timespec_to_microseconds(*abstime);
-        if (abstime_us <= now_us) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-        diff_ms = (abstime_us - now_us + 999L) / 1000L;
-    }
-#if defined(OS_LINUX)
-    const short poll_events = bthread::epoll_to_poll_events(events);
-#elif defined(OS_MACOSX)
-    const short poll_events = bthread::kqueue_to_poll_events(events);
-#endif
-    if (poll_events == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    pollfd ufds = { fd, poll_events, 0 };
-    const int rc = poll(&ufds, 1, diff_ms);
-    if (rc < 0) {
-        return -1;
-    }
-    if (rc == 0) {
-        errno = ETIMEDOUT;
-        return -1;
-    }
-    if (ufds.revents & POLLNVAL) {
-        errno = EBADF;
-        return -1;
-    }
-    return 0;
+    return butil::pthread_fd_wait(fd, events, abstime);
 }
 
 }  // namespace bthread
@@ -493,25 +438,25 @@ int bthread_fd_wait(int fd, unsigned events) {
         errno = EINVAL;
         return -1;
     }
-    bthread::TaskGroup* g = bthread::tls_task_group;
-    if (NULL != g && !g->is_current_pthread_task()) {
+    bthread::TaskGroup* g = bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+    if (nullptr != g && !g->is_current_pthread_task()) {
         return bthread::get_epoll_thread(fd).fd_wait(
-            fd, events, NULL);
+            fd, events, nullptr);
     }
-    return bthread::pthread_fd_wait(fd, events, NULL);
+    return bthread::pthread_fd_wait(fd, events, nullptr);
 }
 
 int bthread_fd_timedwait(int fd, unsigned events,
                          const timespec* abstime) {
-    if (NULL == abstime) {
+    if (nullptr == abstime) {
         return bthread_fd_wait(fd, events);
     }
     if (fd < 0) {
         errno = EINVAL;
         return -1;
     }
-    bthread::TaskGroup* g = bthread::tls_task_group;
-    if (NULL != g && !g->is_current_pthread_task()) {
+    bthread::TaskGroup* g = bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+    if (nullptr != g && !g->is_current_pthread_task()) {
         return bthread::get_epoll_thread(fd).fd_wait(
             fd, events, abstime);
     }
@@ -520,13 +465,23 @@ int bthread_fd_timedwait(int fd, unsigned events,
 
 int bthread_connect(int sockfd, const sockaddr* serv_addr,
                     socklen_t addrlen) {
-    bthread::TaskGroup* g = bthread::tls_task_group;
-    if (NULL == g || g->is_current_pthread_task()) {
+    bthread::TaskGroup* g = bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+    if (nullptr == g || g->is_current_pthread_task()) {
         return ::connect(sockfd, serv_addr, addrlen);
     }
-    // FIXME: Scoped non-blocking?
-    butil::make_non_blocking(sockfd);
-    const int rc = connect(sockfd, serv_addr, addrlen);
+
+    bool is_blocking = butil::is_blocking(sockfd);
+    if (is_blocking) {
+        butil::make_non_blocking(sockfd);
+    }
+    // Scoped non-blocking.
+    auto guard = butil::MakeScopeGuard([is_blocking, sockfd]() {
+        if (is_blocking) {
+            butil::make_blocking(sockfd);
+        }
+    });
+
+    const int rc = ::connect(sockfd, serv_addr, addrlen);
     if (rc == 0 || errno != EINPROGRESS) {
         return rc;
     }
@@ -537,17 +492,47 @@ int bthread_connect(int sockfd, const sockaddr* serv_addr,
 #endif
         return -1;
     }
-    int err;
-    socklen_t errlen = sizeof(err);
-    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
-        PLOG(FATAL) << "Fail to getsockopt";
+
+    if (butil::is_connected(sockfd) != 0) {
         return -1;
     }
-    if (err != 0) {
-        CHECK(err != EINPROGRESS);
-        errno = err;
+
+    return 0;
+}
+
+int bthread_timed_connect(int sockfd, const struct sockaddr* serv_addr,
+                          socklen_t addrlen, const timespec* abstime) {
+    if (!abstime) {
+        return bthread_connect(sockfd, serv_addr, addrlen);
+    }
+
+    bool is_blocking = butil::is_blocking(sockfd);
+    if (is_blocking) {
+        butil::make_non_blocking(sockfd);
+    }
+    // Scoped non-blocking.
+    auto guard = butil::MakeScopeGuard([is_blocking, sockfd]() {
+        if (is_blocking) {
+            butil::make_blocking(sockfd);
+        }
+    });
+
+    const int rc = ::connect(sockfd, serv_addr, addrlen);
+    if (rc == 0 || errno != EINPROGRESS) {
+        return rc;
+    }
+#if defined(OS_LINUX)
+    if (bthread_fd_timedwait(sockfd, EPOLLOUT, abstime) < 0) {
+#elif defined(OS_MACOSX)
+    if (bthread_fd_timedwait(sockfd, EVFILT_WRITE, abstime) < 0) {
+#endif
         return -1;
     }
+
+    if (butil::is_connected(sockfd) != 0) {
+        return -1;
+    }
+
     return 0;
 }
 

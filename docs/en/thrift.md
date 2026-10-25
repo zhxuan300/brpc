@@ -2,7 +2,7 @@
 
 [thrift](https://thrift.apache.org/) is a RPC framework used widely in various environments, which was developed by Facebook and adopted by Apache later. In order to interact with thrift servers and solves issues on thread-safety, usabilities and concurrencies, brpc directly supports the thrift protocol that is used by thrift in NonBlocking mode.
 
-Example: [example/thrift_extension_c++](https://github.com/brpc/brpc/tree/master/example/thrift_extension_c++/).
+Example: [example/thrift_extension_c++](https://github.com/apache/brpc/tree/master/example/thrift_extension_c++/).
 
 Advantages compared to the official solution:
 - Thread safety. No need to set up separate clients for each thread.
@@ -18,10 +18,11 @@ brpc does not enable thrift support or depend on the thrift lib by default. If t
 Install thrift under Linux
 Read [Official wiki](https://thrift.apache.org/docs/install/debian) to install depended libs and tools, then download thrift source code from [official site](https://thrift.apache.org/download), uncompress and compile。
 ```bash
-wget http://www.us.apache.org/dist/thrift/0.11.0/thrift-0.11.0.tar.gz
-tar -xf thrift-0.11.0.tar.gz
-cd thrift-0.11.0/
-./configure --prefix=/usr --with-ruby=no --with-python=no --with-java=no --with-go=no --with-perl=no --with-php=no --with-csharp=no --with-erlang=no --with-lua=no --with-nodejs=no
+wget https://downloads.apache.org/thrift/0.22.0/thrift-0.22.0.tar.gz
+tar -xf thrift-0.22.0.tar.gz
+cd thrift-0.22.0/
+./bootstrap.sh
+./configure --prefix=/usr --with-ruby=no --with-python=no --with-java=no --with-go=no --with-perl=no --with-php=no --with-csharp=no --with-erlang=no --with-lua=no --with-nodejs=no --with-rs=no --with-py3=no CXXFLAGS='-Wno-error'
 make CPPFLAGS=-DFORCE_BOOST_SMART_PTR -j 4 -s
 sudo make install
 ```
@@ -33,9 +34,9 @@ sh config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-thrift
 # Fedora/CentOS
 sh config_brpc.sh --headers=/usr/include --libs=/usr/lib64 --with-thrift
 # Or use cmake
-mkdir bld && cd bld && cmake ../ -DWITH_THRIFT=ON
+mkdir build && cd build && cmake ../ -DWITH_THRIFT=ON
 ```
-Read [Getting Started](../cn/getting_started.md) for more compilation options.
+Read [Getting Started](getting_started.md) for more compilation options.
 
 # Client accesses thrift server
 Steps：
@@ -69,7 +70,7 @@ example::EchoRequest req;
 example::EchoResponse res;
 req.data = "hello";
 
-stub.CallMethod("Echo", &cntl, &req, &res, NULL);
+stub.CallMethod("Echo", &cntl, &req, &res, nullptr);
 if (cntl.Failed()) {
     LOG(ERROR) << "Fail to send thrift request, " << cntl.ErrorText();
     return -1;

@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Tue Jul 22 17:30:12 CST 2014
 
 #ifndef BTHREAD_BUTEX_H
@@ -26,9 +29,14 @@
 
 namespace bthread {
 
+// If a thread would suspend for less than so many microseconds, return
+// ETIMEDOUT directly.
+// Use 1: sleeping for less than 2 microsecond is inefficient and useless.
+static const int64_t MIN_SLEEP_US = 2;
+
 // Create a butex which is a futex-like 32-bit primitive for synchronizing
 // bthreads/pthreads.
-// Returns a pointer to 32-bit data, NULL on failure.
+// Returns a pointer to 32-bit data, nullptr on failure.
 // NOTE: all butexes are private(not inter-process).
 void* butex_create();
 
@@ -43,11 +51,16 @@ void butex_destroy(void* butex);
 
 // Wake up at most 1 thread waiting on |butex|.
 // Returns # of threads woken up.
-int butex_wake(void* butex);
+int butex_wake(void* butex, bool nosignal = false);
+
+// Wake up all threads waiting on |butex| if n is zero,
+// Otherwise, wake up at most n thread waiting on |butex|.
+// Returns # of threads woken up.
+int butex_wake_n(void* butex, size_t n, bool nosignal = false);
 
 // Wake up all threads waiting on |butex|.
 // Returns # of threads woken up.
-int butex_wake_all(void* butex);
+int butex_wake_all(void* butex, bool nosignal = false);
 
 // Wake up all threads waiting on |butex| except a bthread whose identifier
 // is |excluded_bthread|. This function does not yield.
@@ -61,11 +74,16 @@ int butex_requeue(void* butex1, void* butex2);
 
 // Atomically wait on |butex| if *butex equals |expected_value|, until the
 // butex is woken up by butex_wake*, or CLOCK_REALTIME reached |abstime| if
-// abstime is not NULL.
+// abstime is not nullptr.
 // About |abstime|:
 //   Different from FUTEX_WAIT, butex_wait uses absolute time.
+// About |prepend|:
+//   If |prepend| is true, queue the bthread at the head of the queue,
+//   otherwise at the tail.
 // Returns 0 on success, -1 otherwise and errno is set.
-int butex_wait(void* butex, int expected_value, const timespec* abstime);
+int butex_wait(void* butex, int expected_value,
+               const timespec* abstime,
+               bool prepend = false);
 
 }  // namespace bthread
 

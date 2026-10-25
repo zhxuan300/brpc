@@ -1,22 +1,26 @@
-// Copyright (c) 2015 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
+//          Jiashun Zhu(zhujiashun2010@gmail.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
 #include <gflags/gflags.h>
+#include "brpc/policy/redis_authenticator.h"
 #include "butil/logging.h"                       // LOG()
 #include "butil/time.h"
 #include "butil/iobuf.h"                         // butil::IOBuf
@@ -27,12 +31,13 @@
 #include "brpc/details/server_private_accessor.h"
 #include "brpc/span.h"
 #include "brpc/redis.h"
+#include "brpc/redis_command.h"
 #include "brpc/policy/redis_protocol.h"
-
 
 namespace brpc {
 
 DECLARE_bool(enable_rpcz);
+DECLARE_bool(usercode_in_pthread);
 
 namespace policy {
 
@@ -49,61 +54,188 @@ struct InputResponse : public InputMessageBase {
     }
 };
 
-// "Message" = "Response" as we only implement the client for redis.
+
+int ConsumeCommand(RedisConnContext* ctx,
+                   const std::vector<butil::StringPiece>& args,
+                   bool flush_batched,
+                   butil::IOBufAppender* appender) {
+    RedisReply output(&ctx->arena);
+    RedisCommandHandlerResult result = REDIS_CMD_HANDLED;
+    if (ctx->transaction_handler) {
+        result = ctx->transaction_handler->Run(ctx, args, &output, flush_batched);
+        if (result == REDIS_CMD_HANDLED) {
+            ctx->transaction_handler.reset(nullptr);
+        } else if (result == REDIS_CMD_BATCHED) {
+            LOG(ERROR) << "BATCHED should not be returned by a transaction handler.";
+            return -1;
+        }
+    } else {
+        RedisCommandHandler* ch = ctx->redis_service->FindCommandHandler(args[0]);
+        if (!ch) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "ERR unknown command `%s`", args[0].as_string().c_str());
+            output.SetError(buf);
+        } else {
+            result = ch->Run(ctx, args, &output, flush_batched);
+            if (result == REDIS_CMD_CONTINUE) {
+                if (ctx->batched_size != 0) {
+                    LOG(ERROR) << "CONTINUE should not be returned in a batched process.";
+                    return -1;
+                }
+                ctx->transaction_handler.reset(ch->NewTransactionHandler());
+            } else if (result == REDIS_CMD_BATCHED) {
+                ctx->batched_size++;
+            }
+        }
+    }
+    if (result == REDIS_CMD_HANDLED) {
+        if (ctx->batched_size) {
+            if ((int)output.size() != (ctx->batched_size + 1)) {
+                LOG(ERROR) << "reply array size can't be matched with batched size, "
+                    << " expected=" << ctx->batched_size + 1 << " actual=" << output.size();
+                return -1;
+            }
+            for (int i = 0; i < (int)output.size(); ++i) {
+                output[i].SerializeTo(appender);
+            }
+            ctx->batched_size = 0;
+        } else {
+            output.SerializeTo(appender);
+        }
+    } else if (result == REDIS_CMD_CONTINUE) {
+        output.SerializeTo(appender);
+    } else if (result == REDIS_CMD_BATCHED) {
+        // just do nothing and wait handler to return OK.
+    } else {
+        LOG(ERROR) << "unknown status=" << result;
+        return -1;
+    }
+    return 0;
+}
+
+
 ParseResult ParseRedisMessage(butil::IOBuf* source, Socket* socket,
-                              bool /*read_eof*/, const void* /*arg*/) {
-    if (source->empty()) {
+                              bool read_eof, const void* arg) {
+    if (read_eof || source->empty()) {
         return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
-    // NOTE(gejun): PopPipelinedInfo() is actually more contended than what
-    // I thought before. The Socket._pipeline_q is a SPSC queue pushed before
-    // sending and popped when response comes back, being protected by a
-    // mutex. Previously the mutex is shared with Socket._id_wait_list. When
-    // 200 bthreads access one redis-server, ~1.5s in total is spent on
-    // contention in 10-second duration. If the mutex is separated, the time
-    // drops to ~0.25s. I further replaced PeekPipelinedInfo() with
-    // GivebackPipelinedInfo() to lock only once(when receiving response)
-    // in most cases, and the time decreases to ~0.14s.
-    PipelinedInfo pi;
-    if (!socket->PopPipelinedInfo(&pi)) {
-        LOG(WARNING) << "No corresponding PipelinedInfo in socket";
-        return MakeParseError(PARSE_ERROR_TRY_OTHERS);
-    }
+    const Server* server = static_cast<const Server*>(arg);
+    if (server) {
+        const RedisService* const rs = server->options().redis_service;
+        if (!rs) {
+            return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+        }
+        if (IsInternalPort(*server, socket->local_side())) {
+            // ServerOptions.internal_port serves builtin and Tabbed services
+            // only and a RedisService is neither. The command handlers run
+            // right here rather than in ProcessRedisRequest(), there is no
+            // Controller to reject the request with, so behave as if redis
+            // was not enabled on this port at all.
+            return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+        }
+        if (server->options().auth != nullptr && !socket->IsAuthenticated()) {
+            // Redis commands are handled right here rather than in
+            // ProcessRedisRequest(), so they never reach InputMessenger's
+            // authentication hook, and the protocol carries no credential
+            // that ServerOptions.auth could verify.
+            LOG(WARNING) << "Reject redis request from unauthenticated "
+                         << *socket;
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+        RedisConnContext* ctx = static_cast<RedisConnContext*>(socket->parsing_context());
+        if (ctx == nullptr) {
+            ctx = new RedisConnContext(rs);
+            socket->reset_parsing_context(ctx);
+        }
+        std::vector<butil::StringPiece> current_args;
+        butil::IOBufAppender appender;
+        ParseError err = PARSE_OK;
 
-    do {
-        InputResponse* msg = static_cast<InputResponse*>(socket->parsing_context());
-        if (msg == NULL) {
-            msg = new InputResponse;
-            socket->reset_parsing_context(msg);
+        err = ctx->parser.Consume(*source, &current_args, &ctx->arena);
+        if (err != PARSE_OK) {
+            return MakeParseError(err);
+        }
+        while (true) {
+            std::vector<butil::StringPiece> next_args;
+            err = ctx->parser.Consume(*source, &next_args, &ctx->arena);
+            if (err != PARSE_OK) {
+                break;
+            }
+            if (ConsumeCommand(ctx, current_args, false, &appender) != 0) {
+                return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+            }
+            current_args.swap(next_args);
+        }
+        if (ConsumeCommand(ctx, current_args,
+                    true /*must be the last message*/, &appender) != 0) {
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+        butil::IOBuf sendbuf;
+        appender.move_to(sendbuf);
+        CHECK(!sendbuf.empty());
+        Socket::WriteOptions wopt;
+        wopt.ignore_eovercrowded = true;
+        LOG_IF(WARNING, socket->Write(&sendbuf, &wopt) != 0)
+            << "Fail to send redis reply";
+        if(ctx->parser.ParsedArgsSize() == 0) {
+            ctx->arena.clear();
+        }
+        return MakeParseError(err);
+    } else {
+        // NOTE(gejun): PopPipelinedInfo() is actually more contended than what
+        // I thought before. The Socket._pipeline_q is a SPSC queue pushed before
+        // sending and popped when response comes back, being protected by a
+        // mutex. Previously the mutex is shared with Socket._id_wait_list. When
+        // 200 bthreads access one redis-server, ~1.5s in total is spent on
+        // contention in 10-second duration. If the mutex is separated, the time
+        // drops to ~0.25s. I further replaced PeekPipelinedInfo() with
+        // GivebackPipelinedInfo() to lock only once(when receiving response)
+        // in most cases, and the time decreases to ~0.14s.
+        PipelinedInfo pi;
+        if (!socket->PopPipelinedInfo(&pi)) {
+            LOG(WARNING) << "No corresponding PipelinedInfo in socket";
+            return MakeParseError(PARSE_ERROR_TRY_OTHERS);
         }
 
-        const int consume_count = (pi.with_auth ? 1 : pi.count);
-
-        if (!msg->response.ConsumePartialIOBuf(*source, consume_count)) {
-            socket->GivebackPipelinedInfo(pi);
-            return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
-        }
-
-        if (pi.with_auth) {
-            if (msg->response.reply_size() != 1 ||
-                !(msg->response.reply(0).type() == brpc::REDIS_REPLY_STATUS &&
-                  msg->response.reply(0).data().compare("OK") == 0)) {
-                LOG(ERROR) << "Redis Auth failed: " << msg->response;
-                return MakeParseError(PARSE_ERROR_NO_RESOURCE,
-                                      "Fail to authenticate with Redis");
+        do {
+            InputResponse* msg = static_cast<InputResponse*>(socket->parsing_context());
+            if (msg == nullptr) {
+                msg = new InputResponse;
+                socket->reset_parsing_context(msg);
             }
 
-            DestroyingPtr<InputResponse> auth_msg(
-                 static_cast<InputResponse*>(socket->release_parsing_context()));
-            pi.with_auth = false;
-            continue;
-        }
+            const int consume_count = (pi.auth_flags ? pi.auth_flags : pi.count);
 
-        CHECK_EQ((uint32_t)msg->response.reply_size(), pi.count);
-        msg->id_wait = pi.id_wait;
-        socket->release_parsing_context();
-        return MakeMessage(msg);
-    } while(true);
+            ParseError err = msg->response.ConsumePartialIOBuf(*source, consume_count);
+            if (err != PARSE_OK) {
+                socket->GivebackPipelinedInfo(pi);
+                return MakeParseError(err);
+            }
+
+            if (pi.auth_flags) {
+                for (int i = 0; i < (int)pi.auth_flags; ++i) {
+                    if (i >= msg->response.reply_size() ||
+                        !(msg->response.reply(i).type() ==
+                              brpc::REDIS_REPLY_STATUS &&
+                          msg->response.reply(i).data().compare("OK") == 0)) {
+                        LOG(ERROR) << "Redis Auth failed: " << msg->response;
+                        return MakeParseError(PARSE_ERROR_NO_RESOURCE,
+                            "Fail to authenticate with Redis");
+                    }
+                }
+
+                DestroyingPtr<InputResponse> auth_msg(
+                     static_cast<InputResponse*>(socket->release_parsing_context()));
+                pi.auth_flags = 0;
+                continue;
+            }
+
+            CHECK_EQ((uint32_t)msg->response.reply_size(), pi.count);
+            msg->id_wait = pi.id_wait;
+            socket->release_parsing_context();
+            return MakeMessage(msg);
+        } while(true);
+    }
 
     return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
 }
@@ -113,7 +245,7 @@ void ProcessRedisResponse(InputMessageBase* msg_base) {
     DestroyingPtr<InputResponse> msg(static_cast<InputResponse*>(msg_base));
 
     const bthread_id_t cid = msg->id_wait;
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -122,15 +254,14 @@ void ProcessRedisResponse(InputMessageBase* msg_base) {
     }
 
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->response.ByteSize());
         span->set_start_parse_us(start_parse_us);
     }
     const int saved_error = cntl->ErrorCode();
-    if (cntl->response() != NULL) {
+    if (cntl->response() != nullptr) {
         if (cntl->response()->GetDescriptor() != RedisResponse::descriptor()) {
             cntl->SetFailed(ERESPONSE, "Must be RedisResponse");
         } else {
@@ -150,20 +281,27 @@ void ProcessRedisResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
+
+void ProcessRedisRequest(InputMessageBase* msg_base) { }
 
 void SerializeRedisRequest(butil::IOBuf* buf,
                            Controller* cntl,
                            const google::protobuf::Message* request) {
-    if (request == NULL) {
+    if (request == nullptr) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
     if (request->GetDescriptor() != RedisRequest::descriptor()) {
         return cntl->SetFailed(EREQUEST, "The request is not a RedisRequest");
     }
     const RedisRequest* rr = (const RedisRequest*)request;
+    // If redis byte size is zero, brpc call will fail with E22. Continuous E22 may cause E112 in the end.
+    // So set failed and return useful error message
+    if (GetProtobufByteSize(*rr) == 0) {
+        return cntl->SetFailed(EREQUEST, "request byte size is empty");
+    }
     // We work around SerializeTo of pb which is just a placeholder.
     if (!rr->SerializeTo(buf)) {
         return cntl->SetFailed(EREQUEST, "Fail to serialize RedisRequest");
@@ -187,7 +325,15 @@ void PackRedisRequest(butil::IOBuf* buf,
             return cntl->SetFailed(EREQUEST, "Fail to generate credential");
         }
         buf->append(auth_str);
-        ControllerPrivateAccessor(cntl).add_with_auth();
+        const RedisAuthenticator* redis_auth =
+            dynamic_cast<const RedisAuthenticator*>(auth);
+        if (redis_auth == nullptr) {
+            return cntl->SetFailed(EREQUEST, "Fail to generate credential");
+        }
+        ControllerPrivateAccessor(cntl).set_auth_flags(
+            redis_auth->GetAuthFlags());
+    } else {
+        ControllerPrivateAccessor(cntl).clear_auth_flags();
     }
 
     buf->append(request);

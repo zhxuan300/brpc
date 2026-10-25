@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: wangxuefeng (wangxuefeng@didichuxing.com)
 
 #ifndef BRPC_THRIFT_SERVICE_H
 #define BRPC_THRIFT_SERVICE_H
@@ -20,6 +22,7 @@
 #include "brpc/controller.h"                        // Controller
 #include "brpc/thrift_message.h"                    // ThriftFramedMessage
 #include "brpc/describable.h"
+#include "brpc/adaptive_max_concurrency.h"
 
 namespace brpc {
 
@@ -36,7 +39,7 @@ void ProcessThriftRequest(InputMessageBase* msg_base);
 class ThriftService : public Describable {
 public:
     ThriftService();
-    virtual ~ThriftService();
+    ~ThriftService() override;
 
     // Implement this method to handle thrift_binary requests.
     // Parameters:
@@ -51,7 +54,7 @@ public:
         ::google::protobuf::Closure* done) = 0;
 
     // Put descriptions into the stream.
-    void Describe(std::ostream &os, const DescribeOptions&) const;
+    void Describe(std::ostream &os, const DescribeOptions&) const override;
 
 private:
 DISALLOW_COPY_AND_ASSIGN(ThriftService);
@@ -64,6 +67,7 @@ private:
     void Expose(const butil::StringPiece& prefix);
     
     MethodStatus* _status;
+    AdaptiveMaxConcurrency _max_concurrency;
 };
 
 } // namespace brpc

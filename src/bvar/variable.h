@@ -1,29 +1,36 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2014/09/22 11:57:43
 
 #ifndef  BVAR_VARIABLE_H
 #define  BVAR_VARIABLE_H
 
 #include <ostream>                     // std::ostream
+#include <initializer_list>            // std::initializer_list
 #include <string>                      // std::string
 #include <vector>                      // std::vector
+#include <memory>                      // std::shared_ptr
+#include <utility>                     // std::declval
 #include <gflags/gflags_declare.h>
 #include "butil/macros.h"               // DISALLOW_COPY_AND_ASSIGN
 #include "butil/strings/string_piece.h" // butil::StringPiece
+#include "butil/type_traits.h"
+#include "bvar/detail/exposed_ref.h"     // detail::ExposedRef
 
 #ifdef BAIDU_INTERNAL
 #include <boost/any.hpp>
@@ -37,6 +44,16 @@ namespace bvar {
 
 DECLARE_bool(save_series);
 
+#define COMMON_VARIABLE_CONSTRUCTOR(TypeName)                                    \
+    TypeName() = default;                                                        \
+    TypeName(const butil::StringPiece& name) {                                   \
+        this->expose(name);                                                      \
+    }                                                                            \
+    TypeName(const butil::StringPiece& prefix, const butil::StringPiece& name) { \
+        this->expose_as(prefix, name);                                           \
+    }                                                                            \
+
+
 // Bitwise masks of displayable targets 
 enum DisplayFilter {
     DISPLAY_ON_HTML = 1,
@@ -45,13 +62,111 @@ enum DisplayFilter {
 };
 
 // Implement this class to write variables into different places.
-// If dump() returns false, Variable::dump_exposed() stops and returns -1.
 class Dumper {
 public:
-    virtual ~Dumper() { }
+    virtual ~Dumper() = default;
+    // Dump one variable under its exposed `name`. `description` is produced by
+    // Variable::describe(). Returning false stops Variable::dump_exposed(),
+    // which then returns -1.
     virtual bool dump(const std::string& name,
                       const butil::StringPiece& description) = 0;
+    // Dump one metric of a variable that maps to several of them, namely a
+    // multiple dimension var or a Histogram. `name` already carries the labels
+    // if there're any, as in `foo_bucket{le="10"}`.
+    // Unlike dump(), implementations must NOT emit any per-metric preamble:
+    // the whole family is described by a single preceding dump_comment().
+    virtual bool dump_mvar(const std::string& /*name*/,
+                           const butil::StringPiece& /*description*/) {
+        return true;
+    }
+    // Dump the comment describing the type of the metric family `name`, which
+    // precedes the dump_mvar() of all the metrics inside. Only meaningful to
+    // the prometheus service, ignored by default.
+    virtual bool dump_comment(const std::string&, const std::string& /*type*/) {
+        return true;
+    }
 };
+
+// One prometheus metric family exported by a composite metric, see the
+// dump_samples() contract below.
+struct MetricFamily {
+    // Appended to the name the metric is exposed under. Empty for the main
+    // family, as a Histogram has: it exports foo_bucket/foo_sum/foo_count,
+    // which are the series of the single family `foo`. A LatencyRecorder in
+    // contrast exports five families, "_latency", "_avg_latency" and so on.
+    const char* suffix;
+    // "gauge" / "counter" / "histogram" / "summary".
+    const char* type;
+    // Label names emitted by samples in this family. An enclosing
+    // MultiDimension must not use any of them, otherwise one sample would
+    // contain the same label more than once and be invalid prometheus text.
+    std::vector<std::string> reserved_labels;
+};
+
+// The contract of a composite metric inside a MultiDimension
+//
+// A type that maps to more than one prometheus metric (Histogram,
+// LatencyRecorder, or one of your own) cannot be dumped as a MultiDimension
+// value the default way, which writes describe() as a single number. Declare
+// these two members on it instead and MultiDimension will pick them up:
+//
+//   // The families this type exports, in the order they should be dumped.
+//   // Each family also declares the label names it emits, if any.
+//   // Return a reference to immutable storage with static lifetime.
+//   static const std::vector<bvar::MetricFamily>& list_metric_families();
+//
+//   // Emit the samples of the family at `family_index` and nothing else: the
+//   // "# TYPE" line belongs to the whole family, so the caller writes it once
+//   // for all the label sets. `name' is the exposed name with the family's
+//   // suffix already appended. `labels` is the labels of the enclosing
+//   // MultiDimension as `k="v",k="v"` with no enclosing braces, empty when
+//   // there is no MultiDimension; merge it into the brace group of every
+//   // sample, before any label of your own:
+//   //     foo_bucket{method="echo",le="10"} 3
+//   // Return false to stop, as Dumper::dump() does.
+//   bool dump_samples(bvar::Dumper* dumper, size_t family_index,
+//                     const std::string& name,
+//                     butil::StringPiece labels) const;
+//
+// Neither a base class nor a template specialization is involved: the members
+// travel with the type, so they cannot go missing in a translation unit that
+// forgot an include, which is exactly what would make a traits class dangerous
+// here: the value would silently fall back to json.
+namespace detail {
+
+// A double as the prometheus text format spells it, used both for sample
+// values and for the numbers inside a label such as `le` or `quantile`.
+// Neither of the two obvious ways of writing one will do:
+//   - printf("%g") is locale dependent, and an application that called
+//     setlocale under a de_DE environment gets `quantile="0,99"`, where the
+//     comma ends the label and starts another one;
+//   - butil::DoubleToString is locale free but spells the non finite values
+//     "Infinity" and "NaN", while the sample value grammar only takes `+Inf`,
+//     `-Inf` and `NaN`, and a line it cannot parse is dropped from the scrape.
+//     It also leaves out the integer part, and `.5` reads worse than `0.5`
+//     next to the values the scalar path prints through an ostream.
+std::string prometheus_double_to_string(double value);
+
+// True if `T` declares both members of the contract above.
+template <typename T>
+class IsCompositeMetric {
+    template <typename U>
+    static auto probe(int) -> decltype(
+        U::list_metric_families(),
+        std::declval<const U&>().dump_samples(
+            (Dumper*)nullptr, (size_t)0, std::declval<const std::string&>(),
+            butil::StringPiece()),
+        butil::true_type());
+    template <typename>
+    static butil::false_type probe(...);
+public:
+    // An enum rather than `static const bool`: the latter is odr-used as soon as
+    // it is bound to a reference, and C++14 would then ask for an out-of-class
+    // definition of it. An enumerator never does.
+    enum { value = decltype(probe<T>(0))::value };
+};
+
+}  // namespace detail
 
 // Options for Variable::dump_exposed().
 struct DumpOptions {
@@ -96,7 +211,14 @@ struct SeriesOptions {
 //     safely (provided that there's no non-const methods going on).
 class Variable {
 public:
-    Variable() {}
+    using SharedExposedRef = detail::SharedExposedRef<Variable>;
+
+    Variable() = default;
+
+    // bvar uses TLS, thus copying/assignment need to copy TLS stuff as well,
+    // which is heavy. We disable copying/assignment now.
+    DISALLOW_COPY_AND_ASSIGN(Variable);
+
     virtual ~Variable();
 
     // Implement this method to print the variable into ostream.
@@ -117,6 +239,16 @@ public:
     // Returns 0 on success, 1 otherwise(this variable does not save series).
     virtual int describe_series(std::ostream&, const SeriesOptions&) const
     { return 1; }
+
+    // Send this variable to `dumper` under the exposed name `name`.
+    // The default implementation sends describe() as a single metric, which is
+    // what almost every variable wants. Variables mapping to several metrics
+    // (Histogram maps to one metric per bucket plus `_sum` and `_count`) override
+    // this to drive `dumper' themselves: one dump_comment() describing the
+    // family followed by a dump_mvar() per metric.
+    // Returns false to stop dump_exposed(), as Dumper::dump() does.
+    virtual bool dump(Dumper* dumper, const DumpOptions& options,
+                      const std::string& name) const;
 
     // Expose this variable globally so that it's counted in following
     // functions:
@@ -156,6 +288,9 @@ public:
     // CAUTION!! Subclasses must call hide() manually to avoid displaying
     // a variable that is just destructing.
     bool hide();
+
+    // Check if this variable is is_hidden.
+    bool is_hidden() const;
 
     // Get exposed name. If this variable is not exposed, the name is empty.
     const std::string& name() const { return _name; }
@@ -199,7 +334,7 @@ public:
 
     // Find all exposed variables matching `white_wildcards' but
     // `black_wildcards' and send them to `dumper'.
-    // Use default options when `options' is NULL.
+    // Use default options when `options' is nullptr.
     // Return number of dumped variables, -1 on error.
     static int dump_exposed(Dumper* dumper, const DumpOptions* options);
 
@@ -210,10 +345,8 @@ protected:
 
 private:
     std::string _name;
-
-    // bvar uses TLS, thus copying/assignment need to copy TLS stuff as well,
-    // which is heavy. We disable copying/assignment now.
-    DISALLOW_COPY_AND_ASSIGN(Variable);
+    // Shared indirection handle for calling describe() outside the VarMap lock.
+    SharedExposedRef _ref;
 };
 
 // Make name only use lowercased alphabets / digits / underscores, and append

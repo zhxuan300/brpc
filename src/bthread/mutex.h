@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: 2015/12/14 18:17:04
 
 #ifndef  BTHREAD_MUTEX_H
@@ -25,13 +28,14 @@
 
 __BEGIN_DECLS
 extern int bthread_mutex_init(bthread_mutex_t* __restrict mutex,
-                              const bthread_mutexattr_t* __restrict mutex_attr);
+                              const bthread_mutexattr_t* __restrict attr);
 extern int bthread_mutex_destroy(bthread_mutex_t* mutex);
 extern int bthread_mutex_trylock(bthread_mutex_t* mutex);
 extern int bthread_mutex_lock(bthread_mutex_t* mutex);
 extern int bthread_mutex_timedlock(bthread_mutex_t* __restrict mutex,
                                    const struct timespec* __restrict abstime);
 extern int bthread_mutex_unlock(bthread_mutex_t* mutex);
+extern bthread_t bthread_self(void);
 __END_DECLS
 
 namespace bthread {
@@ -42,12 +46,27 @@ namespace bthread {
 class Mutex {
 public:
     typedef bthread_mutex_t* native_handler_type;
-    Mutex() { CHECK_EQ(0, bthread_mutex_init(&_mutex, NULL)); }
+    Mutex() {
+        int ec = bthread_mutex_init(&_mutex, nullptr);
+        if (ec != 0) {
+            throw std::system_error(std::error_code(ec, std::system_category()),
+                                    "Mutex constructor failed");
+        }
+    }
     ~Mutex() { CHECK_EQ(0, bthread_mutex_destroy(&_mutex)); }
     native_handler_type native_handler() { return &_mutex; }
-    void lock() { bthread_mutex_lock(&_mutex); }
+    void lock() {
+        int ec = bthread_mutex_lock(&_mutex);
+        if (ec != 0) {
+            throw std::system_error(std::error_code(ec, std::system_category()),
+                                    "Mutex lock failed");
+        }
+    }
     void unlock() { bthread_mutex_unlock(&_mutex); }
-    bool try_lock() { return !bthread_mutex_trylock(&_mutex); }
+    bool try_lock() { return 0 == bthread_mutex_trylock(&_mutex); }
+    bool timed_lock(const struct timespec* abstime) {
+        return !bthread_mutex_timedlock(&_mutex, abstime);
+    }
     // TODO(chenzhangyi01): Complement interfaces for C++11
 private:
     DISALLOW_COPY_AND_ASSIGN(Mutex);
@@ -58,20 +77,42 @@ namespace internal {
 #ifdef BTHREAD_USE_FAST_PTHREAD_MUTEX
 class FastPthreadMutex {
 public:
-    FastPthreadMutex() : _futex(0) {}
-    ~FastPthreadMutex() {}
+    FastPthreadMutex();
     void lock();
     void unlock();
     bool try_lock();
+    bool timed_lock(const struct timespec* abstime);
 private:
     DISALLOW_COPY_AND_ASSIGN(FastPthreadMutex);
-    int lock_contended();
+    int lock_contended(const struct timespec* abstime);
+
     unsigned _futex;
+    // Note: Owner detection of the mutex comes with average execution
+    // slowdown of about 50%., so it is only used for debugging and is
+    // only available when the macro `BRPC_DEBUG_LOCK' = 1.
+    mutex_owner_t _owner;
 };
 #else
 typedef butil::Mutex FastPthreadMutex;
 #endif
 }
+
+class FastPthreadMutex {
+public:
+    FastPthreadMutex() = default;
+    ~FastPthreadMutex() = default;
+    DISALLOW_COPY_AND_ASSIGN(FastPthreadMutex);
+
+    void lock();
+    void unlock();
+    bool try_lock() { return _mutex.try_lock(); }
+#if defined(BTHREAD_USE_FAST_PTHREAD_MUTEX) || HAS_PTHREAD_MUTEX_TIMEDLOCK
+    bool timed_lock(const struct timespec* abstime);
+#endif // BTHREAD_USE_FAST_PTHREAD_MUTEX  HAS_PTHREAD_MUTEX_TIMEDLOCK
+
+private:
+    internal::FastPthreadMutex _mutex;
+};
 
 }  // namespace bthread
 
@@ -81,12 +122,12 @@ namespace std {
 
 template <> class lock_guard<bthread_mutex_t> {
 public:
-    explicit lock_guard(bthread_mutex_t & mutex) : _pmutex(&mutex) {
+    explicit lock_guard(bthread_mutex_t& mutex) : _pmutex(&mutex) {
 #if !defined(NDEBUG)
         const int rc = bthread_mutex_lock(_pmutex);
         if (rc) {
             LOG(FATAL) << "Fail to lock bthread_mutex_t=" << _pmutex << ", " << berror(rc);
-            _pmutex = NULL;
+            _pmutex = nullptr;
         }
 #else
         bthread_mutex_lock(_pmutex);
@@ -112,7 +153,7 @@ template <> class unique_lock<bthread_mutex_t> {
     DISALLOW_COPY_AND_ASSIGN(unique_lock);
 public:
     typedef bthread_mutex_t         mutex_type;
-    unique_lock() : _mutex(NULL), _owns_lock(false) {}
+    unique_lock() : _mutex(nullptr), _owns_lock(false) {}
     explicit unique_lock(mutex_type& mutex)
         : _mutex(&mutex), _owns_lock(false) {
         lock();
@@ -177,7 +218,7 @@ public:
 
     mutex_type* release() {
         mutex_type* saved_mutex = _mutex;
-        _mutex = NULL;
+        _mutex = nullptr;
         _owns_lock = false;
         return saved_mutex;
     }
@@ -198,7 +239,7 @@ namespace bvar {
 template <>
 struct MutexConstructor<bthread_mutex_t> {
     bool operator()(bthread_mutex_t* mutex) const { 
-        return bthread_mutex_init(mutex, NULL) == 0;
+        return bthread_mutex_init(mutex, nullptr) == 0;
     }
 };
 

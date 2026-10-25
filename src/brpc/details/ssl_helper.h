@@ -1,30 +1,45 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
 
 #ifndef BRPC_SSL_HELPER_H
 #define BRPC_SSL_HELPER_H
 
 #include <string.h>
+#ifndef USE_MESALINK
 #include <openssl/ssl.h>
 // For some versions of openssl, SSL_* are defined inside this header
 #include <openssl/ossl_typ.h>
-#include "brpc/socket_id.h"            // SocketId
-#include "brpc/ssl_options.h"          // ServerSSLOptions
+#include <openssl/opensslv.h>
+#else
+#include <mesalink/openssl/ssl.h>
+#include <mesalink/openssl/err.h>
+#include <mesalink/openssl/x509.h>
+#endif
+#include "brpc/socket_id.h"                 // SocketId
+#include "brpc/ssl_options.h"               // ServerSSLOptions
+#include "brpc/adaptive_protocol_type.h"    // AdaptiveProtocolType
 
 namespace brpc {
+
+// The calculation method is the same as OPENSSL_VERSION_NUMBER in the openssl/crypto.h file.
+// SSL_VERSION_NUMBER can pass parameter calculation instead of using fixed macro.
+#define SSL_VERSION_NUMBER(major, minor, patch) \
+    ( (major << 28) | (minor << 20) | (patch << 4) )
 
 enum SSLState {
     SSL_UNKNOWN = 0,
@@ -38,11 +53,14 @@ enum SSLProtocol {
     TLSv1 = 1 << 1,
     TLSv1_1 = 1 << 2,
     TLSv1_2 = 1 << 3,
+    TLSv1_3 = 1 << 4,
 };
+
+bool SupportsPeerNameVerification();
 
 struct FreeSSLCTX {
     inline void operator()(SSL_CTX* ctx) const {
-        if (ctx != NULL) {
+        if (ctx != nullptr) {
             SSL_CTX_free(ctx);
         }
     }
@@ -70,12 +88,14 @@ int SSLDHInit();
 SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options);
 
 // Create a new SSL_CTX in server mode using `certificate_file'
-// and `private_key_file' and then set the right options onto it
-// according `options'. Finally, extract hostnames from CN/subject
+// and `private_key_file' and then set the right options and alpn
+// onto it according `options'.Finally, extract hostnames from CN/subject
 // fields into `hostnames'
+// Attention: ensure that the life cycle of function return is greater than alpns param.
 SSL_CTX* CreateServerSSLContext(const std::string& certificate_file,
                                 const std::string& private_key_file,
                                 const ServerSSLOptions& options,
+                                const std::string* alpns,
                                 std::vector<std::string>* hostnames);
 
 // Create a new SSL (per connection object) using configurations in `ctx'.
@@ -93,6 +113,15 @@ SSLState DetectSSLState(int fd, int* error_code);
 
 void Print(std::ostream& os, SSL* ssl, const char* sep);
 void Print(std::ostream& os, X509* cert, const char* sep);
+
+std::string ALPNProtocolToString(const AdaptiveProtocolType& protocol);
+
+// Build a binary formatted ALPN protocol list that OpenSSL's
+// `SSL_CTX_set_alpn_protos` accepts from a C++ string vector.
+bool BuildALPNProtocolList(
+    const std::vector<std::string>& alpn_protocols,
+    std::vector<unsigned char>& result
+);
 
 } // namespace brpc
 

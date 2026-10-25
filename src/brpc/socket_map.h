@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_SOCKET_MAP_H
 #define BRPC_SOCKET_MAP_H
@@ -78,11 +80,30 @@ struct SocketMapKeyHasher {
 // successfully, SocketMapRemove() MUST be called when the Socket is not needed.
 // Return 0 on success, -1 otherwise.
 int SocketMapInsert(const SocketMapKey& key, SocketId* id,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+                    SocketOptions& opt);
+
+inline int SocketMapInsert(const SocketMapKey& key, SocketId* id,
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    SocketMode socket_mode,
+                    const HealthCheckOption& hc_option) {
+    SocketOptions opt;
+    opt.remote_side = key.peer.addr;
+    opt.initial_ssl_ctx = ssl_ctx;
+    opt.socket_mode = socket_mode;
+    opt.hc_option = hc_option;
+    return SocketMapInsert(key, id, opt);
+}
+
+inline int SocketMapInsert(const SocketMapKey& key, SocketId* id,
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+    HealthCheckOption hc_option;
+    return SocketMapInsert(key, id, ssl_ctx, SOCKET_MODE_TCP, hc_option);
+}
 
 inline int SocketMapInsert(const SocketMapKey& key, SocketId* id) {
     std::shared_ptr<SocketSSLContext> empty_ptr;
-    return SocketMapInsert(key, id, empty_ptr);
+    HealthCheckOption hc_option;
+    return SocketMapInsert(key, id, empty_ptr, SOCKET_MODE_TCP, hc_option);
 }
 
 // Find the SocketId associated with `key'.
@@ -111,16 +132,16 @@ struct SocketMapOptions {
     SocketMapOptions();
     
     // For creating sockets by need. Owned and deleted by SocketMap.
-    // Default: NULL (must be set by user).
+    // Default: nullptr (must be set by user).
     SocketCreator* socket_creator;
 
     // Initial size of the map (proper size reduces number of resizes)
     // Default: 1024
     size_t suggested_map_size;
-    
+  
     // Pooled connections without data transmission for so many seconds will
     // be closed. No effect for non-positive values.
-    // If idle_timeout_second_dynamic is not NULL, use the dereferenced value
+    // If idle_timeout_second_dynamic is not nullptr, use the dereferenced value
     // each time instead of idle_timeout_second.
     // Default: 0 (disabled)
     const int* idle_timeout_second_dynamic;
@@ -128,11 +149,19 @@ struct SocketMapOptions {
 
     // Defer close of connections for so many seconds even if the connection
     // is not used by anyone. Close immediately for non-positive values.
-    // If defer_close_second_dynamic is not NULL, use the dereferenced value
+    // If defer_close_second_dynamic is not nullptr, use the dereferenced value
     // each time instead of defer_close_second.
     // Default: 0 (disabled)
     const int* defer_close_second_dynamic;
     int defer_close_second;
+
+    // When defer_close_second > 0 and this flag is true, close a connection
+    // immediately when the last reference is removed and the socket has already
+    // been idle for longer than defer_close_second.
+    // If defer_close_respect_idle_dynamic is not nullptr, use the dereferenced
+    // value each time.
+    // Default: nullptr (treated as false)
+    const bool* defer_close_respect_idle_dynamic;
 };
 
 // Share sockets to the same EndPoint.
@@ -142,11 +171,28 @@ public:
     ~SocketMap();
     int Init(const SocketMapOptions&);
     int Insert(const SocketMapKey& key, SocketId* id,
-               const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+               SocketMode socket_mode,
+               const HealthCheckOption& hc_option) {
+        SocketOptions opt;
+        opt.remote_side = key.peer.addr;
+        opt.initial_ssl_ctx = ssl_ctx;
+        opt.socket_mode = socket_mode;
+        opt.hc_option = hc_option;
+        return Insert(key, id, opt);
+}
+
+    int Insert(const SocketMapKey& key, SocketId* id,
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+        HealthCheckOption hc_option;
+        return Insert(key, id, ssl_ctx, SOCKET_MODE_TCP, hc_option);
+    }
     int Insert(const SocketMapKey& key, SocketId* id) {
         std::shared_ptr<SocketSSLContext> empty_ptr;
-        return Insert(key, id, empty_ptr);
+        HealthCheckOption hc_option;
+        return Insert(key, id, empty_ptr, SOCKET_MODE_TCP, hc_option);
     }
+    int Insert(const SocketMapKey& key, SocketId* id, SocketOptions& opt);
 
     void Remove(const SocketMapKey& key, SocketId expected_id);
     int Find(const SocketMapKey& key, SocketId* id);
@@ -157,11 +203,13 @@ public:
 private:
     void RemoveInternal(const SocketMapKey& key, SocketId id,
                         bool remove_orphan);
+    static void ReleaseReference(Socket* s);
     void ListOrphans(int64_t defer_us, std::vector<SocketMapKey>* out);
     void WatchConnections();
     static void* RunWatchConnections(void*);
     void Print(std::ostream& os);
     static void PrintSocketMap(std::ostream& os, void* arg);
+    void ShowSocketMapInBvarIfNeed();
 
 private:
     struct SingleConnection {
@@ -177,7 +225,7 @@ private:
     SocketMapOptions _options;
     butil::Mutex _mutex;
     Map _map;
-    bool _exposed_in_bvar;
+    butil::atomic<bool> _exposed_in_bvar;
     bvar::PassiveStatus<std::string>* _this_map_bvar;
     bool _has_close_idle_thread;
     bthread_t _close_idle_thread;

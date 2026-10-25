@@ -1,32 +1,30 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_MEMCACHE_H
 #define BRPC_MEMCACHE_H
 
 #include <string>
-#include <google/protobuf/stubs/common.h>
-#include <google/protobuf/generated_message_util.h>
-#include <google/protobuf/repeated_field.h>
-#include <google/protobuf/extension_set.h>
-#include <google/protobuf/generated_message_reflection.h>
-#include "google/protobuf/descriptor.pb.h"
 
 #include "butil/iobuf.h"
 #include "butil/strings/string_piece.h"
+#include "brpc/nonreflectable_message.h"
+#include "brpc/pb_compat.h"
 
 namespace brpc {
 
@@ -41,11 +39,11 @@ namespace brpc {
 //   ...
 //   MemcacheResponse response;
 //   // 2 GET and 1 SET are sent to the server together.
-//   channel.CallMethod(&controller, &request, &response, NULL/*done*/);
-class MemcacheRequest : public ::google::protobuf::Message {
+//   channel.CallMethod(&controller, &request, &response, nullptr/*done*/);
+class MemcacheRequest : public NonreflectableMessage<MemcacheRequest> {
 public:
     MemcacheRequest();
-    virtual ~MemcacheRequest();
+    ~MemcacheRequest() override;
     MemcacheRequest(const MemcacheRequest& from);
     inline MemcacheRequest& operator=(const MemcacheRequest& from) {
         CopyFrom(from);
@@ -87,29 +85,23 @@ public:
 
     int pipelined_count() const { return _pipelined_count; }
 
-    // Protobuf methods.
-    MemcacheRequest* New() const;
-    void CopyFrom(const ::google::protobuf::Message& from);
-    void MergeFrom(const ::google::protobuf::Message& from);
-    void CopyFrom(const MemcacheRequest& from);
-    void MergeFrom(const MemcacheRequest& from);
-    void Clear();
-    bool IsInitialized() const;
-  
-    int ByteSize() const;
-    bool MergePartialFromCodedStream(
-        ::google::protobuf::io::CodedInputStream* input);
-    void SerializeWithCachedSizes(
-        ::google::protobuf::io::CodedOutputStream* output) const;
-    ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
-    int GetCachedSize() const { return _cached_size_; }
-    
-    static const ::google::protobuf::Descriptor* descriptor();
-    static const MemcacheRequest& default_instance();
-    ::google::protobuf::Metadata GetMetadata() const;
-
     butil::IOBuf& raw_buffer() { return _buf; }
     const butil::IOBuf& raw_buffer() const { return _buf; }
+
+public:
+    // Protobuf methods.
+    void MergeFrom(const MemcacheRequest& from) override;
+    void Clear() override;
+    bool IsInitialized() const PB_527_OVERRIDE;
+  
+    size_t ByteSizeLong() const override;
+    bool MergePartialFromCodedStream(
+        ::google::protobuf::io::CodedInputStream* input) PB_310_OVERRIDE;
+    void SerializeWithCachedSizes(
+        ::google::protobuf::io::CodedOutputStream* output) const PB_310_OVERRIDE;
+    int GetCachedSize() const PB_425_OVERRIDE { return _cached_size_; }
+
+    ::google::protobuf::Metadata GetMetadata() const PB_527_OVERRIDE;
     
 private:
     bool GetOrDelete(uint8_t command, const butil::StringPiece& key);
@@ -122,19 +114,11 @@ private:
 
     void SharedCtor();
     void SharedDtor();
-    void SetCachedSize(int size) const;
+    void SetCachedSize(int size) const PB_425_OVERRIDE;
 
     int _pipelined_count;
     butil::IOBuf _buf;
     mutable int _cached_size_;
-
-friend void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_impl();
-friend void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-friend void protobuf_AssignDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-friend void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto();
-  
-    void InitAsDefaultInstance();
-    static MemcacheRequest* default_instance_;
 };
 
 // Response from Memcache.
@@ -143,7 +127,7 @@ friend void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto();
 // of operations in corresponding MemcacheRequest.
 // Example:
 //   MemcacheResponse response;
-//   channel.CallMethod(&controller, &request, &response, NULL/*done*/);
+//   channel.CallMethod(&controller, &request, &response, nullptr/*done*/);
 //   ...
 //   if (!response.PopGet(&my_value1, &flags1, &cas1)) {
 //       LOG(FATAL) << "Fail to pop GET: " << response.LastError();
@@ -160,7 +144,7 @@ friend void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto();
 //   } else {
 //       // the SET was successful.
 //   }
-class MemcacheResponse : public ::google::protobuf::Message {
+class MemcacheResponse : public NonreflectableMessage<MemcacheResponse> {
 public:
     // Definition of the valid response status numbers.
     // See section 3.2 Response Status
@@ -179,7 +163,7 @@ public:
     };
 
     MemcacheResponse();
-    virtual ~MemcacheResponse();
+    ~MemcacheResponse() override;
     MemcacheResponse(const MemcacheResponse& from);
     inline MemcacheResponse& operator=(const MemcacheResponse& from) {
         CopyFrom(from);
@@ -202,33 +186,24 @@ public:
     bool PopDecrement(uint64_t* new_value, uint64_t* cas_value);
     bool PopTouch();
     bool PopVersion(std::string* version);
-      
-    // implements Message ----------------------------------------------
-  
-    MemcacheResponse* New() const;
-    void CopyFrom(const ::google::protobuf::Message& from);
-    void MergeFrom(const ::google::protobuf::Message& from);
-    void CopyFrom(const MemcacheResponse& from);
-    void MergeFrom(const MemcacheResponse& from);
-    void Clear();
-    bool IsInitialized() const;
-  
-    int ByteSize() const;
-    bool MergePartialFromCodedStream(
-        ::google::protobuf::io::CodedInputStream* input);
-    void SerializeWithCachedSizes(
-        ::google::protobuf::io::CodedOutputStream* output) const;
-    ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
-    int GetCachedSize() const { return _cached_size_; }
-
-    static const ::google::protobuf::Descriptor* descriptor();
-    static const MemcacheResponse& default_instance();
-    ::google::protobuf::Metadata GetMetadata() const;
-
     butil::IOBuf& raw_buffer() { return _buf; }
     const butil::IOBuf& raw_buffer() const { return _buf; }
-
     static const char* status_str(Status);
+
+public:
+    // implements Message ----------------------------------------------
+    void MergeFrom(const MemcacheResponse& from) override;
+    void Clear() override;
+    bool IsInitialized() const PB_527_OVERRIDE;
+  
+    size_t ByteSizeLong() const override;
+    bool MergePartialFromCodedStream(
+        ::google::protobuf::io::CodedInputStream* input) PB_310_OVERRIDE;
+    void SerializeWithCachedSizes(
+        ::google::protobuf::io::CodedOutputStream* output) const PB_310_OVERRIDE;
+    int GetCachedSize() const PB_425_OVERRIDE { return _cached_size_; }
+
+    ::google::protobuf::Metadata GetMetadata() const PB_527_OVERRIDE;
 
 private:
     bool PopCounter(uint8_t command, uint64_t* new_value, uint64_t* cas_value);
@@ -236,22 +211,13 @@ private:
 
     void SharedCtor();
     void SharedDtor();
-    void SetCachedSize(int size) const;
+    void SetCachedSize(int size) const PB_425_OVERRIDE;
 
     std::string _err;
     butil::IOBuf _buf;
     mutable int _cached_size_;
-
-friend void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto_impl();
-friend void protobuf_AddDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-friend void protobuf_AssignDesc_baidu_2frpc_2fmemcache_5fbase_2eproto();
-friend void protobuf_ShutdownFile_baidu_2frpc_2fmemcache_5fbase_2eproto();
-  
-    void InitAsDefaultInstance();
-    static MemcacheResponse* default_instance_;
 };
 
 } // namespace brpc
-
 
 #endif  // BRPC_MEMCACHE_H

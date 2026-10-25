@@ -1,5 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
@@ -10,6 +26,7 @@
 #include "brpc/reloadable_flags.h"
 
 namespace brpc {
+DECLARE_int32(health_check_interval);
 DECLARE_int32(idle_timeout_second);
 DECLARE_int32(defer_close_second);
 DECLARE_int32(max_connection_pool_size);
@@ -32,7 +49,7 @@ void* worker(void*) {
             }
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 class SocketMapTest : public ::testing::Test{
@@ -43,16 +60,41 @@ protected:
     virtual void TearDown(){};
 };
 
+TEST_F(SocketMapTest, disable_health_check) {
+    int32_t old_interval = brpc::FLAGS_health_check_interval;
+    brpc::FLAGS_health_check_interval = 0;
+    brpc::SocketId id;
+    ASSERT_EQ(-1, brpc::SocketMapFind(g_key, &id));
+    ASSERT_EQ(0, brpc::SocketMapInsert(g_key, &id));
+    ASSERT_EQ(0, brpc::SocketMapFind(g_key, &id));
+    {
+        brpc::SocketUniquePtr ptr;
+        ASSERT_EQ(0, brpc::Socket::Address(id, &ptr));
+    }
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id));
+
+    brpc::SocketUniquePtr ptr;
+    // The socket should not be recycled,
+    // because SocketMap holds a reference to it.
+    ASSERT_EQ(1, brpc::Socket::AddressFailedAsWell(id, &ptr));
+    ASSERT_EQ(2, ptr->nref());
+    brpc::SocketMapRemove(g_key);
+    // After removing the socket, `ptr' holds the last reference.
+    ASSERT_EQ(1, ptr->nref());
+    ASSERT_EQ(-1, brpc::SocketMapFind(g_key, &id));
+    brpc::FLAGS_health_check_interval = old_interval;
+}
+
 TEST_F(SocketMapTest, idle_timeout) {
     const int TIMEOUT = 1;
     const int NTHREAD = 10;
     brpc::FLAGS_defer_close_second = TIMEOUT;
     pthread_t tids[NTHREAD];
     for (int i = 0; i < NTHREAD; ++i) {
-        ASSERT_EQ(0, pthread_create(&tids[i], NULL, worker, NULL));
+        ASSERT_EQ(0, pthread_create(&tids[i], nullptr, worker, nullptr));
     }
     for (int i = 0; i < NTHREAD; ++i) {
-        ASSERT_EQ(0, pthread_join(tids[i], NULL));
+        ASSERT_EQ(0, pthread_join(tids[i], nullptr));
     }
     brpc::SocketId id;
     // Socket still exists since it has not reached timeout yet
@@ -82,7 +124,7 @@ TEST_F(SocketMapTest, idle_timeout) {
     main_ptr.reset();
     id = ptr->id();
     ptr->ReturnToPool();
-    ptr.reset(NULL);
+    ptr.reset(nullptr);
     usleep(TIMEOUT * 1000000L + 2000000L);
     // Pooled connection should be `ReleaseAdditionalReference',
     // which destroyed the Socket. As a result `GetSocketFromPool'
@@ -124,6 +166,7 @@ TEST_F(SocketMapTest, max_pool_size) {
         EXPECT_TRUE(ptrs[i]->Failed());
     }
 }
+
 } //namespace
 
 int main(int argc, char* argv[]) {

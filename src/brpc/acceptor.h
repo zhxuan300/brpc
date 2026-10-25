@@ -1,27 +1,29 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Authors: Rujie Jiang(jiangrujie@baidu.com)
-//          Ge,Jun(gejun@baidu.com)
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BRPC_ACCEPTOR_H
 #define BRPC_ACCEPTOR_H
 
 #include "bthread/bthread.h"                       // bthread_t
+#include "butil/atomicops.h"                       // butil::atomic
 #include "butil/synchronization/condition_variable.h"
 #include "butil/containers/flat_map.h"
 #include "brpc/input_messenger.h"
+#include "brpc/socket_mode.h"
 
 
 namespace brpc {
@@ -32,6 +34,7 @@ struct ConnectStatistics {
 // Accept connections from a specific port and then
 // process messages from which it reads
 class Acceptor : public InputMessenger {
+friend class Server;
 public:
     typedef butil::FlatMap<SocketId, ConnectStatistics> SocketMap;
 
@@ -43,7 +46,7 @@ public:
     };
 
 public:
-    explicit Acceptor(bthread_keytable_pool_t* pool = NULL);
+    explicit Acceptor(bthread_keytable_pool_t* pool = nullptr);
     ~Acceptor();
 
     // [thread-safe] Accept connections from `listened_fd'. Ownership of
@@ -54,7 +57,14 @@ public:
     // `idle_timeout_sec' > 0
     // Return 0 on success, -1 otherwise.
     int StartAccept(int listened_fd, int idle_timeout_sec,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    bool force_ssl);
+    // Limit simultaneous connections on this listener. 0 means unlimited.
+    // Excess connections are closed before protocol parsing or TLS.
+    int StartAccept(int listened_fd, int idle_timeout_sec,
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    bool force_ssl,
+                    size_t max_connections);
 
     // [thread-safe] Stop accepting connections.
     // `closewait_ms' is not used anymore.
@@ -68,6 +78,10 @@ public:
 
     // Get number of existing connections.
     size_t ConnectionCount() const;
+
+    // Get the cumulative number of connections rejected by this listener's
+    // connection limit.
+    size_t RejectedConnectionCount() const;
 
     // Clear `conn_list' and append all connections into it.
     void ListConnections(std::vector<SocketId>* conn_list);
@@ -88,7 +102,11 @@ private:
     int Initialize();
 
     // Remove the accepted socket `sock' from inside
-    virtual void BeforeRecycle(Socket* sock);
+    void BeforeRecycle(Socket* sock) override;
+
+    bool TryAcquireConnectionSlot();
+    void ReleaseConnectionSlot();
+    void SetMaxConnections(size_t max_connections);
 
     bthread_keytable_pool_t* _keytable_pool; // owned by Server
     Status _status;
@@ -105,7 +123,23 @@ private:
     // The map containing all the accepted sockets
     SocketMap _socket_map;
 
+    // A slot is reserved before Socket::Create(), closing the race where a
+    // socket starts processing before it is inserted into _socket_map. Until
+    // insertion, the accept loop owns the slot; afterwards BeforeRecycle()
+    // releases it. These atomics publish no socket state, so relaxed memory
+    // ordering is sufficient.
+    butil::atomic<size_t> _connection_count;
+    butil::atomic<size_t> _rejected_connection_count;
+    butil::atomic<size_t> _max_connections;
+
+    bool _force_ssl;
     std::shared_ptr<SocketSSLContext> _ssl_ctx;
+
+    // Choose to use a certain socket: 0 TCP, 1 RDMA
+    SocketMode _socket_mode;
+
+    // Acceptor belongs to this tag
+    bthread_tag_t _bthread_tag;
 };
 
 } // namespace brpc

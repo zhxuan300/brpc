@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
 
 #include <google/protobuf/descriptor.h>            // MethodDescriptor
 #include <google/protobuf/message.h>               // Message
@@ -72,7 +74,7 @@ void PublicPbrpcServiceAdaptor::ParseNsheadMeta(
     const RequestBody& body = pbreq.requestbody(0);
     const Server::MethodProperty *sp = ServerPrivateAccessor(&svr)
         .FindMethodPropertyByNameAndIndex(body.service(), body.method_id());
-    if (NULL == sp) {
+    if (nullptr == sp) {
         cntl->SetFailed(ENOMETHOD, "Fail to find method by service=%s method_id=%u",
                         body.service().c_str(), body.method_id());
         return;
@@ -163,7 +165,7 @@ void ProcessPublicPbrpcResponse(InputMessageBase* msg_base) {
     const ResponseHead& head = pbres.responsehead();
     const ResponseBody& body = pbres.responsebody(0);
     const bthread_id_t cid = { static_cast<uint64_t>(body.id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -171,9 +173,17 @@ void ProcessPublicPbrpcResponse(InputMessageBase* msg_base) {
         return;
     }
     
+    if (cntl == nullptr || !ControllerPrivateAccessor(cntl)
+            .does_response_match_request_socket(cid, msg->socket()->id())) {
+        LOG(WARNING) << "correlation_id=" << cid.value
+                     << " of the response from " << *msg->socket()
+                     << " does not match a request sent over it, drop it";
+        CHECK_EQ(0, bthread_id_unlock(cid));
+        return;
+    }
+
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size());
@@ -207,7 +217,7 @@ void ProcessPublicPbrpcResponse(InputMessageBase* msg_base) {
     }
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 
@@ -240,7 +250,7 @@ void PackPublicPbrpcRequest(butil::IOBuf* buf,
     head->set_connection(!short_connection);
     head->set_charset(CHARSET);
     char time_buf[128];
-    time_t now = time(NULL);
+    time_t now = time(nullptr);
     strftime(time_buf, sizeof(time_buf), TIME_FORMAT, localtime(&now));
     head->set_create_time(time_buf);
     if (controller->has_log_id()) {
@@ -264,10 +274,10 @@ void PackPublicPbrpcRequest(butil::IOBuf* buf,
     nshead.magic_num = NSHEAD_MAGICNUM;
     snprintf(nshead.provider, sizeof(nshead.provider), "%s", PROVIDER);
     nshead.version = NSHEAD_VERSION;
-    nshead.body_len = pbreq.ByteSize();
+    nshead.body_len = GetProtobufByteSize(pbreq);
     buf->append(&nshead, sizeof(nshead));
 
-    Span* span = ControllerPrivateAccessor(controller).span();
+    auto span = ControllerPrivateAccessor(controller).span();
     if (span) {
         // TODO: Nowhere to set tracing ids.
         // request_meta->set_trace_id(span->trace_id());
@@ -283,4 +293,3 @@ void PackPublicPbrpcRequest(butil::IOBuf* buf,
 
 }  // namespace policy
 } // namespace brpc
-

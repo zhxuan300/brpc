@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_EXTENSION_INL_H
 #define BRPC_EXTENSION_INL_H
@@ -28,22 +30,13 @@ Extension<T>* Extension<T>::instance() {
 }
 
 template <typename T>
-Extension<T>::Extension() {
-    _instance_map.init(29);
-}
-
-template <typename T>
-Extension<T>::~Extension() {
-}
-
-template <typename T>
 int Extension<T>::Register(const std::string& name, T* instance) {
-    if (NULL == instance) {
+    if (nullptr == instance) {
         LOG(ERROR) << "instance to \"" << name << "\" is NULL";
         return -1;
     }
     BAIDU_SCOPED_LOCK(_map_mutex);
-    if (_instance_map.seek(name) != NULL) {
+    if (_instance_map.seek(name) != nullptr) {
         LOG(ERROR) << "\"" << name << "\" was registered";
         return -1;
     }
@@ -61,15 +54,15 @@ int Extension<T>::RegisterOrDie(const std::string& name, T* instance) {
 
 template <typename T>
 T* Extension<T>::Find(const char* name) {
-    if (NULL == name) {
-        return NULL;
+    if (nullptr == name) {
+        return nullptr;
     }
     BAIDU_SCOPED_LOCK(_map_mutex);
     T** p = _instance_map.seek(name);
     if (p) {
         return *p;
     }
-    return NULL;
+    return nullptr;
 }
 
 template <typename T>

@@ -1,18 +1,20 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>
 #include "brpc/log.h"
@@ -193,7 +195,7 @@ bool ParseRestfulPath(butil::StringPiece path,
 
 bool ParseRestfulMappings(const butil::StringPiece& mappings,
                           std::vector<RestfulMapping>* list) {
-    if (list == NULL) {
+    if (list == nullptr) {
         LOG(ERROR) << "Param[list] is NULL";
         return false;
     }
@@ -260,13 +262,13 @@ bool RestfulMap::AddMethod(const RestfulMethodPath& path,
                            const Server::MethodProperty::OpaqueParams& params,
                            const std::string& method_name,
                            MethodStatus* status) {
-    if (service == NULL) {
+    if (service == nullptr) {
         LOG(ERROR) << "Param[service] is NULL";
         return false;
     }
     const google::protobuf::MethodDescriptor* md =
         service->GetDescriptor()->FindMethodByName(method_name);
-    if (md == NULL) {
+    if (md == nullptr) {
         LOG(ERROR) << service->GetDescriptor()->full_name()
                    << " has no method called `" << method_name << '\'';
         return false;
@@ -312,29 +314,22 @@ void RestfulMap::ClearMethods() {
 struct CompareItemInPathList {
     bool operator()(const RestfulMethodProperty* e1,
                     const RestfulMethodProperty* e2) const {
-        const int rc1 = e1->path.prefix.compare(e2->path.prefix);
+        const RestfulMethodPath& path1 = e1->path;
+        const RestfulMethodPath& path2 = e2->path;
+        const int rc1 = path1.prefix.compare(path2.prefix);
         if (rc1 != 0) {
             return rc1 < 0;
         }
         // /A/*/B is put before /A/B so that we try exact patterns first
         // (the matching is in reversed order)
-        if (e1->path.has_wildcard != e2->path.has_wildcard) {
-            return e1->path.has_wildcard > e2->path.has_wildcard;
+        if (path1.has_wildcard != path2.has_wildcard) {
+            return path1.has_wildcard > path2.has_wildcard;
         }
         // Compare postfix from back to front.
-        // TODO: Optimize this.
-        std::string::const_reverse_iterator it1 = e1->path.postfix.rbegin();
-        std::string::const_reverse_iterator it2 = e2->path.postfix.rbegin();
-        while (it1 != e1->path.postfix.rend() &&
-               it2 != e2->path.postfix.rend()) {
-            if (*it1 != *it2) {
-                return (*it1 < *it2);
-            }
-            ++it1;
-            ++it2;
-        }
-        return (it1 == e1->path.postfix.rend())
-            > (it2 == e2->path.postfix.rend());
+        const bool postfix_result = std::lexicographical_compare(
+            path1.postfix.rbegin(), path1.postfix.rend(),
+            path2.postfix.rbegin(), path2.postfix.rend());
+        return postfix_result;
     }
 };
 
@@ -410,14 +405,14 @@ RestfulMap::FindMethodProperty(const butil::StringPiece& method_path,
                                std::string* unresolved_path) const {
     if (_sorted_paths.empty()) {
         LOG(ERROR) << "_sorted_paths is empty, method_path=" << method_path;
-        return NULL;
+        return nullptr;
     }
     const std::string full_path = NormalizeSlashes(method_path);
     butil::StringPiece sub_path = full_path;
     PathList::const_iterator last_find_pos = _sorted_paths.end();
     do {
         if (last_find_pos == _sorted_paths.begin()) {
-            return NULL;
+            return nullptr;
         }
         // Note: stop trying places that we already visited or skipped.
         PathList::const_iterator it =
@@ -480,7 +475,7 @@ RestfulMap::FindMethodProperty(const butil::StringPiece& method_path,
                     << "Hit beginning, sub_path=" << sub_path
                     << " full_path=" << full_path
                     << " candidate=" << DebugPrinter(rpath);
-                return NULL;
+                return nullptr;
             }
             // Matched with prefix but postfix or wildcard, moving forward
             --it;
@@ -505,7 +500,7 @@ RestfulMap::FindMethodProperty(const butil::StringPiece& method_path,
     } while (RemoveLastComponent(&sub_path));
     //                            ^^^^^^^^
     // sub_path can be / to match patterns like "*.flv => M" whose prefix is /
-    return NULL;
+    return nullptr;
 }
 
 } // namespace brpc

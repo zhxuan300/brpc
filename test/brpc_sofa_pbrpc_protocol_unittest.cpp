@@ -1,5 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
@@ -22,7 +38,7 @@
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
 
@@ -93,7 +109,7 @@ protected:
     virtual void TearDown() {};
 
     void VerifyMessage(brpc::InputMessageBase* msg) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
@@ -102,7 +118,7 @@ protected:
 
     void ProcessMessage(void (*process)(brpc::InputMessageBase*),
                         brpc::InputMessageBase* msg, bool set_eof) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
@@ -153,7 +169,7 @@ protected:
         butil::IOPortal buf;
         EXPECT_EQ((ssize_t)bytes_in_pipe,
                   buf.append_from_file_descriptor(_pipe_fds[0], 1024));
-        brpc::ParseResult pr = brpc::policy::ParseSofaMessage(&buf, NULL, false, NULL);
+        brpc::ParseResult pr = brpc::policy::ParseSofaMessage(&buf, nullptr, false, nullptr);
         EXPECT_EQ(brpc::PARSE_OK, pr.error());
         brpc::policy::MostCommonMessage* msg =
             static_cast<brpc::policy::MostCommonMessage*>(pr.message());
@@ -177,13 +193,13 @@ protected:
         brpc::SerializeRequestDefault(&request_buf, &cntl, &req);
         ASSERT_FALSE(cntl.Failed());
         brpc::policy::PackSofaRequest(
-            &total_buf, NULL, cntl.call_id().value,
+            &total_buf, nullptr, cntl.call_id().value,
             test::EchoService::descriptor()->method(0),
             &cntl, request_buf, &_auth);
         ASSERT_FALSE(cntl.Failed());
 
         brpc::ParseResult req_pr =
-                brpc::policy::ParseSofaMessage(&total_buf, NULL, false, NULL);
+                brpc::policy::ParseSofaMessage(&total_buf, nullptr, false, nullptr);
         ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
         brpc::InputMessageBase* req_msg = req_pr.message();
         ProcessMessage(brpc::policy::ProcessSofaRequest, req_msg, false);
@@ -197,6 +213,26 @@ protected:
     MyEchoService _svc;
     MyAuthenticator _auth;
 };
+
+// Build a SOFA header without a real SocketMessage. Fields are stored in host
+// byte order (see PackSofaHeader), each 64-bit field is stored as low 32-bit
+// word followed by high 32-bit word.
+static void AppendSofaTestHeader(butil::IOBuf* buf, uint32_t meta_size,
+                                 uint64_t body_size, uint64_t msg_size) {
+    char header[24];
+    memcpy(header, "SOFA", 4);
+    const uint32_t meta = meta_size;
+    const uint32_t body_words[2] = {
+        static_cast<uint32_t>(body_size & 0xFFFFFFFFULL),
+        static_cast<uint32_t>(body_size >> 32)};
+    const uint32_t msg_words[2] = {
+        static_cast<uint32_t>(msg_size & 0xFFFFFFFFULL),
+        static_cast<uint32_t>(msg_size >> 32)};
+    memcpy(header + 4, &meta, sizeof(meta));
+    memcpy(header + 8, body_words, sizeof(body_words));
+    memcpy(header + 16, msg_words, sizeof(msg_words));
+    buf->append(header, sizeof(header));
+}
 
 TEST_F(SofaTest, process_request_failed_socket) {
     brpc::policy::SofaRpcMeta meta;
@@ -246,6 +282,46 @@ TEST_F(SofaTest, process_response_after_eof) {
     ASSERT_TRUE(_socket->Failed());
 }
 
+TEST_F(SofaTest, reject_huge_meta_size) {
+    // A header declaring a huge meta_size must be rejected up front,
+    // otherwise the parser keeps buffering meta_size bytes although the
+    // body itself passes the -max_body_size check.
+    butil::IOBuf buf;
+    const uint32_t meta_size = 0xFFFFFFFFu;
+    const uint64_t body_size = 0;
+    const uint64_t msg_size = meta_size + body_size;
+    AppendSofaTestHeader(&buf, meta_size, body_size, msg_size);
+    brpc::ParseResult pr =
+            brpc::policy::ParseSofaMessage(&buf, _socket.get(), false, nullptr);
+    ASSERT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA, pr.error());
+}
+
+TEST_F(SofaTest, process_response_requires_sending_socket) {
+    brpc::Controller cntl;
+    test::EchoResponse res;
+    cntl._response = &res;
+    ASSERT_EQ(0, bthread_id_lock_and_reset_range(
+                     cntl.call_id(), nullptr, 2));
+    ASSERT_EQ(0, bthread_id_unlock(cntl.current_id()));
+    brpc::SocketId sending_id;
+    ASSERT_EQ(0, brpc::Socket::Create(brpc::SocketOptions(), &sending_id));
+    ASSERT_EQ(0, brpc::Socket::Address(
+                     sending_id, &cntl._current_call.sending_sock));
+
+    brpc::policy::SofaRpcMeta meta;
+    meta.set_type(brpc::policy::SofaRpcMeta::RESPONSE);
+    meta.set_sequence_id(cntl.current_id().value);
+    ProcessMessage(brpc::policy::ProcessSofaResponse, MakeResponseMessage(meta), false);
+    EXPECT_TRUE(res.message().empty());
+    EXPECT_EQ(0, cntl.ErrorCode());
+
+    brpc::policy::MostCommonMessage* msg = MakeResponseMessage(meta);
+    cntl._current_call.sending_sock->ReAddress(&msg->_socket);
+    ProcessMessage(brpc::policy::ProcessSofaResponse, msg, false);
+    EXPECT_EQ(EXP_RESPONSE, res.message());
+    EXPECT_EQ(0, cntl.ErrorCode());
+}
+
 TEST_F(SofaTest, process_response_error_code) {
     const int ERROR_CODE = 12345;
     brpc::policy::SofaRpcMeta meta;
@@ -271,13 +347,13 @@ TEST_F(SofaTest, complete_flow) {
     brpc::SerializeRequestDefault(&request_buf, &cntl, &req);
     ASSERT_FALSE(cntl.Failed());
     brpc::policy::PackSofaRequest(
-        &total_buf, NULL, cntl.call_id().value,
+        &total_buf, nullptr, cntl.call_id().value,
         test::EchoService::descriptor()->method(0), &cntl, request_buf, &_auth);
     ASSERT_FALSE(cntl.Failed());
 
     // Verify and handle request
     brpc::ParseResult req_pr =
-            brpc::policy::ParseSofaMessage(&total_buf, NULL, false, NULL);
+            brpc::policy::ParseSofaMessage(&total_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
     brpc::InputMessageBase* req_msg = req_pr.message();
     VerifyMessage(req_msg);
@@ -287,7 +363,7 @@ TEST_F(SofaTest, complete_flow) {
     butil::IOPortal response_buf;
     response_buf.append_from_file_descriptor(_pipe_fds[0], 1024);
     brpc::ParseResult res_pr =
-            brpc::policy::ParseSofaMessage(&response_buf, NULL, false, NULL);
+            brpc::policy::ParseSofaMessage(&response_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, res_pr.error());
     brpc::InputMessageBase* res_msg = res_pr.message();
     ProcessMessage(brpc::policy::ProcessSofaResponse, res_msg, false);
@@ -308,13 +384,13 @@ TEST_F(SofaTest, close_in_callback) {
     brpc::SerializeRequestDefault(&request_buf, &cntl, &req);
     ASSERT_FALSE(cntl.Failed());
     brpc::policy::PackSofaRequest(
-        &total_buf, NULL, cntl.call_id().value,
+        &total_buf, nullptr, cntl.call_id().value,
         test::EchoService::descriptor()->method(0), &cntl, request_buf, &_auth);
     ASSERT_FALSE(cntl.Failed());
 
     // Handle request
     brpc::ParseResult req_pr =
-            brpc::policy::ParseSofaMessage(&total_buf, NULL, false, NULL);
+            brpc::policy::ParseSofaMessage(&total_buf, nullptr, false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
     brpc::InputMessageBase* req_msg = req_pr.message();
     ProcessMessage(brpc::policy::ProcessSofaRequest, req_msg, false);
@@ -327,5 +403,27 @@ TEST_F(SofaTest, sofa_compress) {
     TestSofaCompress(brpc::COMPRESS_TYPE_SNAPPY);
     TestSofaCompress(brpc::COMPRESS_TYPE_GZIP);
     TestSofaCompress(brpc::COMPRESS_TYPE_ZLIB);
+}
+
+TEST_F(SofaTest, reject_oversized_body) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 1024;
+    const uint64_t body_size = 8 * 1024 * 1024;
+    butil::IOBuf buf;
+    AppendSofaTestHeader(&buf, 0, body_size, body_size);
+    brpc::ParseResult pr =
+        brpc::policy::ParseSofaMessage(&buf, _socket.get(), false, nullptr);
+    ASSERT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA, pr.error());
+}
+
+TEST_F(SofaTest, reject_oversized_meta) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 1024;
+    const uint32_t meta_size = 8 * 1024 * 1024;
+    butil::IOBuf buf;
+    AppendSofaTestHeader(&buf, meta_size, 0, meta_size);
+    brpc::ParseResult pr =
+        brpc::policy::ParseSofaMessage(&buf, _socket.get(), false, nullptr);
+    ASSERT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA, pr.error());
 }
 } //namespace

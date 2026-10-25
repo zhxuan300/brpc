@@ -1,22 +1,25 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_PARSE_RESULT_H
 #define BRPC_PARSE_RESULT_H
 
+#include <stddef.h>
 
 namespace brpc {
 
@@ -48,13 +51,13 @@ class ParseResult {
 public:
     // Create a failed parsing result.
     explicit ParseResult(ParseError err)
-        : _msg(NULL), _err(err), _user_desc(NULL) {}
+        : _msg(nullptr), _err(err), _user_desc(nullptr) {}
     // The `user_desc' must be string constant or always valid.
     explicit ParseResult(ParseError err, const char* user_desc)
-        : _msg(NULL), _err(err), _user_desc(user_desc) {}
+        : _msg(nullptr), _err(err), _user_desc(user_desc) {}
     // Create a successful parsing result.
     explicit ParseResult(InputMessageBase* msg)
-        : _msg(msg), _err(PARSE_OK), _user_desc(NULL) {}
+        : _msg(msg), _err(PARSE_OK), _user_desc(nullptr) {}
     
     // Return PARSE_OK when the result is successful.
     ParseError error() const { return _err; }
@@ -62,7 +65,7 @@ public:
     { return _user_desc ? _user_desc : ParseErrorToString(_err); }
     bool is_ok() const { return error() == PARSE_OK; }
 
-    // definitely NULL when result is failed.
+    // definitely nullptr when result is failed.
     InputMessageBase* message() const { return _msg; }
  
 private:

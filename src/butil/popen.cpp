@@ -1,18 +1,20 @@
-// Copyright (c) 2017 Baidu.com, Inc. All Rights Reserved
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2017/11/04 17:37:43
 
 #include <gflags/gflags.h>
@@ -27,7 +29,7 @@
 #include <sys/wait.h>
 
 extern "C" {
-uint64_t BAIDU_WEAK bthread_usleep(uint64_t microseconds);
+int BAIDU_WEAK bthread_usleep(uint64_t microseconds);
 }
 #endif
 
@@ -48,7 +50,7 @@ int launch_child_process(void* args) {
     dup2(cargs->pipe_fd1, STDOUT_FILENO);
     close(cargs->pipe_fd0);
     close(cargs->pipe_fd1);
-    execl("/bin/sh", "sh", "-c", cargs->cmd, NULL);
+    execl("/bin/sh", "sh", "-c", cargs->cmd, nullptr);
     _exit(1);
 }
 
@@ -65,7 +67,7 @@ int read_command_output_through_clone(std::ostream& os, const char* cmd) {
     ChildArgs args = { cmd, pipe_fd[0], pipe_fd[1] };
     char buffer[1024];
 
-    char* child_stack = NULL;
+    char* child_stack = nullptr;
     char* child_stack_mem = (char*)malloc(CHILD_STACK_SIZE);
     if (!child_stack_mem) {
         LOG(ERROR) << "Fail to alloc stack for the child process";
@@ -106,7 +108,7 @@ int read_command_output_through_clone(std::ostream& os, const char* cmd) {
             break;
         }
         if (wpid == 0) {
-            if (bthread_usleep != NULL) {
+            if (bthread_usleep != nullptr) {
                 bthread_usleep(1000);
             } else {
                 usleep(1000);
@@ -155,7 +157,7 @@ DEFINE_bool(run_command_through_clone, false,
 
 int read_command_output_through_popen(std::ostream& os, const char* cmd) {
     FILE* pipe = popen(cmd, "r");
-    if (pipe == NULL) {
+    if (pipe == nullptr) {
         return -1;
     }
     char buffer[1024];

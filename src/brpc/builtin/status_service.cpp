@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <ostream>
 #include <google/protobuf/descriptor.h>     // ServiceDescriptor
@@ -107,7 +109,25 @@ void StatusService::default_method(::google::protobuf::RpcController* cntl_base,
         os << mc;
     }
     os << '\n';
-    
+
+    // concurrency
+    if (use_html) {
+        os << "<p class=\"variable\">";
+    }
+    os << "concurrency: ";
+    if (use_html) {
+        os << "<span id=\"value-" << server->ServerPrefix()
+           << "_concurrency\">";
+    }
+    os << server->Concurrency();
+    if (use_html) {
+        os << "</span></p><div class=\"detail\"><div id=\""
+           << server->ServerPrefix()
+           << "_concurrency\" class=\"flot-placeholder\"></div></div>";
+    }
+    os << '\n';
+
+
     const Server::ServiceMap &services = server->_fullname_service_map;
     std::ostringstream desc;
     DescribeOptions desc_options;
@@ -179,6 +199,17 @@ void StatusService::default_method(::google::protobuf::RpcController* cntl_base,
                 os << '\n';
             }
         }
+    }
+    const BaiduMasterService* baidu_master_service = server->options().baidu_master_service;
+    if (baidu_master_service && baidu_master_service->_status) {
+        DescribeOptions options;
+        options.verbose = false;
+        options.use_html = use_html;
+        os << (use_html ? "<h3>" : "[");
+        baidu_master_service->Describe(os, options);
+        os << (use_html ? "</h3>\n" : "]\n");
+        baidu_master_service->_status->Describe(os, desc_options);
+        os << '\n';
     }
     const NsheadService* nshead_svc = server->options().nshead_service;
     if (nshead_svc && nshead_svc->_status) {

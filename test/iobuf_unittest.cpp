@@ -1,27 +1,43 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Ge,Jun (gejun@baidu.com)
-// Date: 2010-12-04 11:59
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <gtest/gtest.h>
 #include <sys/types.h>
 #include <sys/socket.h>                // socketpair
 #include <errno.h>                     // errno
 #include <fcntl.h>                     // O_RDONLY
+#include <stdlib.h>
+#include <memory>
+#include <cstring>
+#if HAS_NLOHMANN_JSON
+#include <nlohmann/json.hpp>
+#endif // HAS_NLOHMANN_JSON
 #include <butil/files/temp_file.h>      // TempFile
 #include <butil/containers/flat_map.h>
 #include <butil/macros.h>
 #include <butil/time.h>                 // Timer
 #include <butil/fd_utility.h>           // make_non_blocking
 #include <butil/iobuf.h>
+#include <butil/single_iobuf.h>
 #include <butil/logging.h>
 #include <butil/fd_guard.h>
 #include <butil/errno.h>
 #include <butil/fast_rand.h>
-#if BAZEL_TEST
-#include "test/iobuf.pb.h"
-#else
 #include "iobuf.pb.h"
-#endif   // BAZEL_TEST
 
 namespace butil {
 namespace iobuf {
@@ -33,17 +49,22 @@ extern uint32_t block_cap(butil::IOBuf::Block const* b);
 extern IOBuf::Block* get_tls_block_head();
 extern int get_tls_block_count();
 extern void remove_tls_block_chain();
-IOBuf::Block* get_portal_next(IOBuf::Block const* b);
-}
-}
+extern IOBuf::Block* acquire_tls_block();
+extern IOBuf::Block* share_tls_block();
+extern void release_tls_block_chain(IOBuf::Block* b);
+extern uint32_t block_cap(IOBuf::Block const* b);
+extern uint32_t block_size(IOBuf::Block const* b);
+extern IOBuf::Block* get_portal_next(IOBuf::Block const* b);
+} // namespace iobuf
+} // namespace butil
 
 namespace {
 
 const size_t BLOCK_OVERHEAD = 32; //impl dependent
-const size_t DEFAULT_PAYLOAD = butil::IOBuf::DEFAULT_BLOCK_SIZE - BLOCK_OVERHEAD;
+const size_t DEFAULT_PAYLOAD = butil::GetDefaultBlockSize() - BLOCK_OVERHEAD;
 
 void check_tls_block() {
-    ASSERT_EQ((butil::IOBuf::Block*)NULL, butil::iobuf::get_tls_block_head());
+    ASSERT_EQ((butil::IOBuf::Block*)nullptr, butil::iobuf::get_tls_block_head());
     printf("tls_block of butil::IOBuf was deleted\n");
 }
 const int ALLOW_UNUSED check_dummy = butil::thread_atexit(check_tls_block);
@@ -214,10 +235,10 @@ TEST_F(IOBufTest, append) {
     butil::IOBuf b;
     ASSERT_EQ(0UL, b.length());
     ASSERT_TRUE(b.empty());
-    ASSERT_EQ(-1, b.append(NULL));
+    ASSERT_EQ(-1, b.append(nullptr));
     ASSERT_EQ(0, b.append(""));
     ASSERT_EQ(0, b.append(std::string()));
-    ASSERT_EQ(-1, b.append(NULL, 1));
+    ASSERT_EQ(-1, b.append(nullptr, 1));
     ASSERT_EQ(0, b.append("dummy", 0));
     ASSERT_EQ(0UL, b.length());
     ASSERT_TRUE(b.empty());
@@ -275,6 +296,7 @@ TEST_F(IOBufTest, appendv) {
     ASSERT_EQ(0, b.appendv(vec2, arraysize(vec2)));
     ASSERT_EQ(full_len, b.size());
     ASSERT_EQ(0, memcmp(str, b.to_string().data(), full_len));
+    free(str);
 }
 
 TEST_F(IOBufTest, reserve) {
@@ -329,6 +351,8 @@ TEST_F(IOBufTest, reserve) {
     ASSERT_EQ("orang" + s2 + s1, b.to_string());
 }
 
+#ifndef BUTIL_USE_ASAN
+// ASan will detect heap-buffer-overflow error casued by FakeBlock.
 struct FakeBlock {
     int nshared;
     FakeBlock() : nshared(1) {}
@@ -435,6 +459,7 @@ TEST_F(IOBufTest, iobuf_as_queue) {
         delete blocks[i];
     }
 }
+#endif // BUTIL_USE_ASAN
 
 TEST_F(IOBufTest, iobuf_sanity) {
     install_debug_allocator();
@@ -512,7 +537,7 @@ TEST_F(IOBufTest, iobuf_sanity) {
 TEST_F(IOBufTest, copy_and_assign) {
     install_debug_allocator();
 
-    const size_t TARGET_SIZE = butil::IOBuf::DEFAULT_BLOCK_SIZE * 2;
+    const size_t TARGET_SIZE = butil::GetDefaultBlockSize() * 2;
     butil::IOBuf buf0;
     buf0.append("hello");
     ASSERT_EQ(1u, buf0._ref_num());
@@ -768,7 +793,7 @@ TEST_F(IOBufTest, cut_multiple_into_fd_tiny) {
     for (size_t j = 0; j < ARRAY_SIZE(b1); ++j) {
         ASSERT_TRUE(b1[j]->empty());
         delete (butil::IOPortal*)b1[j];
-        b1[j] = NULL;
+        b1[j] = nullptr;
     }
     ASSERT_EQ((ssize_t)ref.length(),
               b2.append_from_file_descriptor(fds[0], LONG_MAX));
@@ -1009,7 +1034,9 @@ TEST_F(IOBufTest, append_store_append_cut) {
         if (!write_to_dev_null) {
             ASSERT_EQ(0, system(cmd));
         }
-        remove(name);
+	if (!write_to_dev_null) {
+           remove(name);
+	}
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(w); ++i) {
@@ -1047,13 +1074,13 @@ TEST_F(IOBufTest, conversion_with_protobuf) {
     butil::IOBufAsZeroCopyInputStream in_wrapper(buf);
     ASSERT_EQ(0, in_wrapper.ByteCount());
     {
-        const void* dummy_blk = NULL;
+        const void* dummy_blk = nullptr;
         int dummy_size = 0;
         ASSERT_TRUE(in_wrapper.Next(&dummy_blk, &dummy_size));
         ASSERT_EQ(dummy_size, in_wrapper.ByteCount());
         in_wrapper.BackUp(1);
         ASSERT_EQ(dummy_size - 1, in_wrapper.ByteCount());
-        const void* dummy_blk2 = NULL;
+        const void* dummy_blk2 = nullptr;
         int dummy_size2 = 0;
         ASSERT_TRUE(in_wrapper.Next(&dummy_blk2, &dummy_size2));
         ASSERT_EQ(1, dummy_size2);
@@ -1091,18 +1118,18 @@ TEST_F(IOBufTest, extended_backup) {
         // Consume the left TLS block so that cases are easier to check.
         butil::iobuf::remove_tls_block_chain();
         butil::IOBuf src;
-        const int BLKSIZE = (i == 0 ? 1024 : butil::IOBuf::DEFAULT_BLOCK_SIZE);
+        const int BLKSIZE = (i == 0 ? 1024 : butil::GetDefaultBlockSize());
         const int PLDSIZE = BLKSIZE - BLOCK_OVERHEAD;
         butil::IOBufAsZeroCopyOutputStream out_stream1(&src, BLKSIZE);
         butil::IOBufAsZeroCopyOutputStream out_stream2(&src);
         butil::IOBufAsZeroCopyOutputStream & out_stream =
             (i == 0 ? out_stream1 : out_stream2);
-        void* blk1 = NULL;
+        void* blk1 = nullptr;
         int size1 = 0;
         ASSERT_TRUE(out_stream.Next(&blk1, &size1));
         ASSERT_EQ(PLDSIZE, size1);
         ASSERT_EQ(size1, out_stream.ByteCount());
-        void* blk2 = NULL;
+        void* blk2 = nullptr;
         int size2 = 0;
         ASSERT_TRUE(out_stream.Next(&blk2, &size2));
         ASSERT_EQ(PLDSIZE, size2);
@@ -1110,7 +1137,7 @@ TEST_F(IOBufTest, extended_backup) {
         // BackUp a size that's valid for all ZeroCopyOutputStream
         out_stream.BackUp(PLDSIZE / 2);
         ASSERT_EQ(size1 + size2 - PLDSIZE / 2, out_stream.ByteCount());
-        void* blk3 = NULL;
+        void* blk3 = nullptr;
         int size3 = 0;
         ASSERT_TRUE(out_stream.Next(&blk3, &size3));
         ASSERT_EQ((char*)blk2 + PLDSIZE / 2, blk3);
@@ -1120,7 +1147,7 @@ TEST_F(IOBufTest, extended_backup) {
         // BackUp a size that's undefined in regular ZeroCopyOutputStream
         out_stream.BackUp(PLDSIZE * 2);
         ASSERT_EQ(0, out_stream.ByteCount());
-        void* blk4 = NULL;
+        void* blk4 = nullptr;
         int size4 = 0;
         ASSERT_TRUE(out_stream.Next(&blk4, &size4));
         ASSERT_EQ(PLDSIZE, size4);
@@ -1128,7 +1155,7 @@ TEST_F(IOBufTest, extended_backup) {
         if (i == 1) {
             ASSERT_EQ(blk1, blk4);
         }
-        void* blk5 = NULL;
+        void* blk5 = nullptr;
         int size5 = 0;
         ASSERT_TRUE(out_stream.Next(&blk5, &size5));
         ASSERT_EQ(PLDSIZE, size5);
@@ -1145,7 +1172,7 @@ TEST_F(IOBufTest, backup_iobuf_never_called_next) {
         // to check.
         butil::IOBuf dummy;
         butil::IOBufAsZeroCopyOutputStream dummy_stream(&dummy);
-        void* dummy_data = NULL;
+        void* dummy_data = nullptr;
         int dummy_size = 0;
         ASSERT_TRUE(dummy_stream.Next(&dummy_data, &dummy_size));
     }
@@ -1159,19 +1186,19 @@ TEST_F(IOBufTest, backup_iobuf_never_called_next) {
     ASSERT_EQ(-1, out_stream.ByteCount());
     ASSERT_EQ(DEFAULT_PAYLOAD * 2 - 1, src.size());
     ASSERT_EQ(2u, src.backing_block_num());
-    void* data0 = NULL;
+    void* data0 = nullptr;
     int size0 = 0;
     ASSERT_TRUE(out_stream.Next(&data0, &size0));
     ASSERT_EQ(1, size0);
     ASSERT_EQ(0, out_stream.ByteCount());
     ASSERT_EQ(2u, src.backing_block_num());
-    void* data1 = NULL;
+    void* data1 = nullptr;
     int size1 = 0;
     ASSERT_TRUE(out_stream.Next(&data1, &size1));
     ASSERT_EQ(size1, out_stream.ByteCount());
     ASSERT_EQ(3u, src.backing_block_num());
     ASSERT_EQ(N + size1, src.size());
-    void* data2 = NULL;
+    void* data2 = nullptr;
     int size2 = 0;    
     ASSERT_TRUE(out_stream.Next(&data2, &size2));
     ASSERT_EQ(size1 + size2, out_stream.ByteCount());
@@ -1192,7 +1219,7 @@ void *backup_thread(void *arg) {
     butil::IOBufAsZeroCopyOutputStream *wrapper = 
         (butil::IOBufAsZeroCopyOutputStream *)arg;
     wrapper->BackUp(1024);
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(IOBufTest, backup_in_another_thread) {
@@ -1212,8 +1239,8 @@ TEST_F(IOBufTest, backup_in_another_thread) {
         ASSERT_TRUE(wrapper.Next(&data, &len));
         alloc_size += len;
         pthread_t tid;
-        pthread_create(&tid, NULL, backup_thread, &wrapper);
-        pthread_join(tid, NULL);
+        pthread_create(&tid, nullptr, backup_thread, &wrapper);
+        pthread_join(tid, nullptr);
     }
     ASSERT_EQ(alloc_size - 1024 * 10, buf.length()); 
 }
@@ -1334,7 +1361,7 @@ void* cut_into_fd(void* arg) {
         CHECK_EQ(out.pcut_into_file_descriptor(fd, offset + sizeof(int) * i), 
                  (ssize_t)sizeof(int));
     }
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(IOBufTest, cut_into_fd_with_offset_multithreaded) {
@@ -1344,15 +1371,15 @@ TEST_F(IOBufTest, cut_into_fd_with_offset_multithreaded) {
     long fd = open(".out.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
     ASSERT_TRUE(fd >= 0) << berror();
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, cut_into_fd, (void*)fd));
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, cut_into_fd, (void*)fd));
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
     }
     for (int i = 0; i < number_per_thread * (int)ARRAY_SIZE(threads); ++i) {
         off_t offset = i * sizeof(int);
         butil::IOPortal in;
-        ASSERT_EQ(sizeof(int), in.pappend_from_file_descriptor(fd, offset, sizeof(int)));
+        ASSERT_EQ((ssize_t)sizeof(int), in.pappend_from_file_descriptor(fd, offset, sizeof(int)));
         int j;
         ASSERT_EQ(sizeof(j), in.cutn(&j, sizeof(j)));
         ASSERT_EQ(i, j);
@@ -1410,7 +1437,7 @@ TEST_F(IOBufTest, iterate_bytes) {
     std::string saved_a = a.to_string();
     size_t n = 0;
     butil::IOBufBytesIterator it(a);
-    for (; it != NULL; ++it, ++n) {
+    for (; it != nullptr; ++it, ++n) {
         ASSERT_EQ(saved_a[n], *it);
     }
     ASSERT_EQ(saved_a.size(), n);
@@ -1418,7 +1445,7 @@ TEST_F(IOBufTest, iterate_bytes) {
 
     // append more to the iobuf, iterator should still be ended.
     a.append(", this is iobuf");
-    ASSERT_TRUE(it == NULL);
+    ASSERT_TRUE(it == nullptr);
 
     // append more-than-one-block data to the iobuf
     for (int i = 0; i < 1024; ++i) {
@@ -1426,7 +1453,7 @@ TEST_F(IOBufTest, iterate_bytes) {
     }
     saved_a = a.to_string();
     n = 0;
-    for (butil::IOBufBytesIterator it2(a); it2 != NULL; it2++/*intended post++*/, ++n) {
+    for (butil::IOBufBytesIterator it2(a); it2 != nullptr; it2++/*intended post++*/, ++n) {
         ASSERT_EQ(saved_a[n], *it2);
     }
     ASSERT_EQ(saved_a.size(), n);
@@ -1560,7 +1587,7 @@ TEST_F(IOBufTest, copy_to_string_from_iterator) {
     ASSERT_EQ(nc, b0.length());
 }
 
-static void* my_free_params = NULL;
+static void* my_free_params = nullptr;
 static void my_free(void* m) {
     free(m);
     my_free_params = m;
@@ -1569,14 +1596,14 @@ static void my_free(void* m) {
 TEST_F(IOBufTest, append_user_data_and_consume) {
     butil::IOBuf b0;
     const int REP = 16;
-    const int len = REP * 256;
+    const size_t len = REP * 256;
     char* data = (char*)malloc(len);
     for (int i = 0; i < 256; ++i) {
         for (int j = 0; j < REP; ++j) {
             data[i * REP + j] = (char)i;
         }
     }
-    my_free_params = NULL;
+    my_free_params = nullptr;
     ASSERT_EQ(0, b0.append_user_data(data, len, my_free));
     ASSERT_EQ(1UL, b0._ref_num());
     butil::IOBuf::BlockRef r = b0._front_ref();
@@ -1596,17 +1623,74 @@ TEST_F(IOBufTest, append_user_data_and_consume) {
     }
 }
 
+TEST_F(IOBufTest, append_stateful_user_data) {
+    butil::IOBuf b0;
+    const int REP = 16;
+    const size_t len = REP * 256;
+    std::shared_ptr<char> mem(new char[len], std::default_delete<char[]>());
+    std::weak_ptr<char> weaker = mem;
+    ASSERT_EQ(1, mem.use_count());
+    char* data = mem.get();
+    for (int i = 0; i < 256; ++i) {
+        for (int j = 0; j < REP; ++j) {
+            data[i * REP + j] = (char)i;
+        }
+    }
+
+    int incr_upon_destructrion = 0;
+
+    struct Deleter {
+        Deleter(std::shared_ptr<char> partial, int& incr) : partial(std::move(partial)), incr(&incr), allow_incr(false) {}
+        ~Deleter() {
+            if (allow_incr) (*incr)++;
+        }
+        Deleter(const Deleter&) { std::abort(); /*if copy, then crash*/ }
+        Deleter(Deleter&&) noexcept = default;
+        void operator()(void*) {
+            partial.reset();
+            allow_incr = true;
+        }
+        std::shared_ptr<char> partial;
+        int* incr;
+        bool allow_incr;
+    };
+
+    for (int i = 0; i < 256; i++) {
+        std::shared_ptr<char> ptr(mem, data + i * REP);
+        ASSERT_EQ(0, b0.append_user_data(data + i * REP, REP, Deleter{std::move(ptr), incr_upon_destructrion}));
+    }
+    ASSERT_EQ(256, b0._ref_num());
+    ASSERT_EQ(257, mem.use_count());
+    mem.reset();
+    butil::IOBuf::BlockRef r = b0._front_ref();
+    ASSERT_EQ(1, butil::iobuf::block_shared_count(r.block));
+    ASSERT_EQ(len, b0.size());
+    std::string out;
+    ASSERT_EQ(len, b0.cutn(&out, len));
+    ASSERT_TRUE(b0.empty());
+    ASSERT_TRUE(weaker.expired());
+    ASSERT_EQ(256, incr_upon_destructrion);
+
+    ASSERT_EQ(len, out.size());
+    // note: cannot memcmp with data which is already free-ed
+    for (int i = 0; i < 256; ++i) {
+        for (int j = 0; j < REP; ++j) {
+            ASSERT_EQ((char)i, out[i * REP + j]);
+        }
+    }
+}
+
 TEST_F(IOBufTest, append_user_data_and_share) {
     butil::IOBuf b0;
     const int REP = 16;
-    const int len = REP * 256;
+    const size_t len = REP * 256;
     char* data = (char*)malloc(len);
     for (int i = 0; i < 256; ++i) {
         for (int j = 0; j < REP; ++j) {
             data[i * REP + j] = (char)i;
         }
     }
-    my_free_params = NULL;
+    my_free_params = nullptr;
     ASSERT_EQ(0, b0.append_user_data(data, len, my_free));
     ASSERT_EQ(1UL, b0._ref_num());
     butil::IOBuf::BlockRef r = b0._front_ref();
@@ -1616,7 +1700,7 @@ TEST_F(IOBufTest, append_user_data_and_share) {
     {
         butil::IOBuf bufs[256];
         for (int i = 0; i < 256; ++i) {
-            ASSERT_EQ(REP, b0.cutn(&bufs[i], REP));
+            ASSERT_EQ((size_t)REP, b0.cutn(&bufs[i], REP));
             ASSERT_EQ(len - (i+1) * REP, b0.size());
             if (i != 255) {
                 ASSERT_EQ(1UL, b0._ref_num());
@@ -1627,10 +1711,10 @@ TEST_F(IOBufTest, append_user_data_and_share) {
                 ASSERT_TRUE(b0.empty());
             }
         }
-        ASSERT_EQ(NULL, my_free_params);
+        ASSERT_EQ(nullptr, my_free_params);
         for (int i = 0; i < 256; ++i) {
             std::string out = bufs[i].to_string();
-            ASSERT_EQ(REP, out.size());
+            ASSERT_EQ((size_t)REP, out.size());
             for (int j = 0; j < REP; ++j) {
                 ASSERT_EQ((char)i, out[j]);
             }
@@ -1639,4 +1723,565 @@ TEST_F(IOBufTest, append_user_data_and_share) {
     ASSERT_EQ(data, my_free_params);
 }
 
+TEST_F(IOBufTest, append_user_data_with_meta) {
+    butil::IOBuf b0;
+    const int REP = 16;
+    const size_t len = 256;
+    char* data[REP];
+    for (int i = 0; i < REP; ++i) {
+        data[i] = (char*)malloc(len);
+        ASSERT_EQ(0, b0.append_user_data_with_meta(data[i], len, my_free, i));
+    }
+    for (int i = 0; i < REP; ++i) {
+        ASSERT_EQ(i, b0.get_first_data_meta());
+        butil::IOBuf out;
+        ASSERT_EQ(len / 2, b0.cutn(&out, len / 2));
+        ASSERT_EQ(i, b0.get_first_data_meta());
+        ASSERT_EQ(len / 2, b0.cutn(&out, len / 2));
+    }
+}
+
+TEST_F(IOBufTest, share_tls_block) {
+    butil::iobuf::remove_tls_block_chain();
+    butil::IOBuf::Block* b = butil::iobuf::acquire_tls_block();
+    ASSERT_EQ(0u, butil::iobuf::block_size(b));
+
+    butil::IOBuf::Block* b2 = butil::iobuf::share_tls_block();
+    butil::IOBuf buf;
+    for (size_t i = 0; i < butil::iobuf::block_cap(b2); i++) {
+        buf.push_back('x');
+    }
+    // after pushing to b2, b2 is full but it is still head of tls block.
+    ASSERT_NE(b, b2);
+    butil::iobuf::release_tls_block_chain(b);
+    ASSERT_EQ(b, butil::iobuf::share_tls_block());
+    // After releasing b, now tls block is b(not full) -> b2(full) -> nullptr
+    for (size_t i = 0; i < butil::iobuf::block_cap(b); i++) {
+        buf.push_back('x');
+    }
+    // now tls block is b(full) -> b2(full) -> nullptr
+    butil::IOBuf::Block* head_block = butil::iobuf::share_tls_block();
+    ASSERT_EQ(0u, butil::iobuf::block_size(head_block));
+    ASSERT_NE(b, head_block);
+    ASSERT_NE(b2, head_block);
+}
+
+TEST_F(IOBufTest, acquire_tls_block) {
+    butil::iobuf::remove_tls_block_chain();
+    butil::IOBuf::Block* b = butil::iobuf::acquire_tls_block();
+    const size_t block_cap = butil::iobuf::block_cap(b);
+    butil::IOBuf buf;
+    for (size_t i = 0; i < block_cap; i++) {
+        buf.append("x");
+    }
+    ASSERT_EQ(1, butil::iobuf::get_tls_block_count());
+    butil::IOBuf::Block* head = butil::iobuf::get_tls_block_head();
+    ASSERT_EQ(butil::iobuf::block_cap(head), butil::iobuf::block_size(head));
+    butil::iobuf::release_tls_block_chain(b);
+    ASSERT_EQ(2, butil::iobuf::get_tls_block_count());
+    for (size_t i = 0; i < block_cap; i++) {
+        buf.append("x");
+    }
+    ASSERT_EQ(2, butil::iobuf::get_tls_block_count());
+    head = butil::iobuf::get_tls_block_head();
+    ASSERT_EQ(butil::iobuf::block_cap(head), butil::iobuf::block_size(head));
+    b = butil::iobuf::acquire_tls_block();
+    ASSERT_EQ(0, butil::iobuf::get_tls_block_count());
+    ASSERT_NE(butil::iobuf::block_cap(b), butil::iobuf::block_size(b));
+    // acquire_tls_block() transfers ownership of a non-full block to the
+    // caller; return it to TLS so it is not leaked.
+    butil::iobuf::release_tls_block_chain(b);
+}
+
+TEST_F(IOBufTest, reserve_aligned) {
+    {
+        butil::IOReserveAlignedBuf buf(16);
+        auto area = buf.reserve(1024);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 16, 0);
+            ASSERT_EQ(size % 16, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 1024);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(1024);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(8191);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 8192);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(4096 * 10 - 1);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096 * 10);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4095);
+        auto area = buf.reserve(4096);
+        ASSERT_EQ(area, butil::IOBuf::INVALID_AREA);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(8192);
+        auto area = buf.reserve(4096 * 10 + 1);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096 * 10 + 8192);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(1024 * 1024 * 3);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int count = 0;
+        int total_size = 0;
+        std::stringstream ss;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            std::string str(size, 'A' + count++);
+            ss << str;
+            std::memcpy(const_cast<void*>(data), str.data(), str.size());
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 3145728);
+        ASSERT_EQ(ss.str(), buf.to_string());
+    }
+}
+
+TEST_F(IOBufTest, single_iobuf) {
+    butil::IOBuf buf1;
+    // It will be freed by IOBuf.
+    char *usr_str = (char *)malloc(16);
+    memset(usr_str, 0, 16);
+    char src_str[] = "abcdefgh12345678";
+    size_t total_len = sizeof(src_str);
+    strncpy(usr_str, src_str + 8, total_len - 8);
+    buf1.append(src_str, 8);
+    buf1.append_user_data(usr_str, total_len - 8, nullptr);
+    ASSERT_EQ(2, buf1.backing_block_num());
+    butil::SingleIOBuf sbuf;
+    ASSERT_EQ(0, sbuf.backing_block_num());
+    sbuf.assign(buf1, total_len);
+    ASSERT_EQ(1, sbuf.backing_block_num());
+    size_t s_len = sbuf.get_length();
+    ASSERT_EQ(s_len, total_len);
+    const char* str = (const char*) sbuf.get_begin();
+    int ret = strcmp(str, src_str);
+    ASSERT_EQ(0, ret);
+    butil::IOBuf buf2;
+    sbuf.append_to(&buf2);
+    ASSERT_EQ(buf2.length(), total_len);
+    butil::SingleIOBuf sbuf2;
+    sbuf2.swap(sbuf);
+    ASSERT_EQ(sbuf.get_length(), 0);
+    ASSERT_EQ(sbuf2.get_length(), total_len);
+    sbuf2.reset();
+    ASSERT_EQ(0, sbuf2.get_length());
+    
+    void* buf = sbuf.allocate(1024);
+    ASSERT_TRUE(nullptr != buf);
+    buf = sbuf.reallocate_downward(16384, 0, 0);
+    ASSERT_TRUE(nullptr != buf);
+    s_len = sbuf.get_length();
+    ASSERT_EQ(16384, s_len);
+
+    butil::IOBuf::BlockRef ref = sbuf.get_cur_ref();
+    butil::SingleIOBuf sbuf3(ref);
+    s_len = sbuf3.get_length();
+    ASSERT_EQ(16384, s_len);
+    sbuf.deallocate(buf);
+
+    errno = 0;
+    void *null_buf = sbuf3.reallocate_downward(s_len - 1, 0, 0);
+    ASSERT_EQ(null_buf, nullptr);
+
+    uint32_t old_size = sbuf3.get_length();
+    void *p = sbuf3.reallocate_downward(old_size + 16, 0, old_size);
+    ASSERT_TRUE(p != nullptr);
+    old_size = sbuf3.get_length();
+    p = sbuf3.reallocate_downward(old_size + 16, old_size, 0);
+    ASSERT_TRUE(p != nullptr);
+}
+
+TEST_F(IOBufTest, single_iobuf_assign_large_multi_block) {
+    // The message spans more than one BlockRef of the source IOBuf and does
+    // not fit in a default-sized block, so assign() has to concatenate it
+    // into a dedicated block.
+    const uint32_t n1 = 5000;
+    const uint32_t n2 = 6000;
+    char* d1 = (char*)malloc(n1);
+    memset(d1, 'a', n1);
+    char* d2 = (char*)malloc(n2);
+    memset(d2, 'b', n2);
+    butil::IOBuf buf;
+    buf.append_user_data(d1, n1, nullptr);
+    buf.append_user_data(d2, n2, nullptr);
+    ASSERT_EQ(2, buf.backing_block_num());
+
+    butil::SingleIOBuf sbuf;
+    ASSERT_TRUE(sbuf.assign(buf, n1 + n2));
+    ASSERT_EQ(n1 + n2, sbuf.get_length());
+    ASSERT_EQ(std::string(n1, 'a') + std::string(n2, 'b'),
+              std::string((const char*)sbuf.get_begin(), n1 + n2));
+
+    // Assigning again on top of an already assigned SingleIOBuf.
+    ASSERT_TRUE(sbuf.assign(buf, n1 + n2));
+    ASSERT_EQ(n1 + n2, sbuf.get_length());
+    ASSERT_EQ(std::string(n1, 'a') + std::string(n2, 'b'),
+              std::string((const char*)sbuf.get_begin(), n1 + n2));
+}
+
+TEST_F(IOBufTest, as_input_stream_basic) {
+    butil::IOBuf buf;
+    buf.append("hello world");
+
+    butil::IOBufInputStream stream(buf);
+    std::string s;
+    stream >> s;
+    ASSERT_EQ("hello", s);
+    stream >> s;
+    ASSERT_EQ("world", s);
+    ASSERT_EQ(EOF, stream.peek());
+
+    // Stream construction must not mutate the source IOBuf.
+    ASSERT_EQ("hello world", buf.to_string());
+}
+
+TEST_F(IOBufTest, as_input_stream_empty) {
+    butil::IOBuf buf;
+    butil::IOBufInputStream stream(buf);
+    ASSERT_EQ(EOF, stream.peek());
+    char c;
+    ASSERT_FALSE(stream.get(c));
+    ASSERT_TRUE(stream.eof());
+}
+
+TEST_F(IOBufTest, as_input_stream_accepts_const_iobuf) {
+    butil::IOBuf buf;
+    buf.append("abc");
+    const butil::IOBuf& cbuf = buf;
+    butil::IOBufInputStream stream(cbuf);
+    char c;
+    ASSERT_TRUE(stream.get(c)); ASSERT_EQ('a', c);
+    ASSERT_TRUE(stream.get(c)); ASSERT_EQ('b', c);
+    ASSERT_TRUE(stream.get(c)); ASSERT_EQ('c', c);
+    ASSERT_EQ(EOF, stream.peek());
+}
+
+// Each call to append_user_data adds a separate BlockRef, giving us a
+// multi-block IOBuf that exercises underflow() across block boundaries.
+static void append_as_separate_blocks(butil::IOBuf* buf,
+                                      const std::string& payload,
+                                      size_t chunk) {
+    for (size_t i = 0; i < payload.size(); i += chunk) {
+        const size_t n = std::min(chunk, payload.size() - i);
+        char* p = static_cast<char*>(malloc(n));
+        memcpy(p, payload.data() + i, n);
+        ASSERT_EQ(0, buf->append_user_data(p, n, free));
+    }
+}
+
+TEST_F(IOBufTest, as_input_stream_multi_block_read) {
+    butil::IOBuf buf;
+    const std::string payload = "the quick brown fox jumps over the lazy dog";
+    append_as_separate_blocks(&buf, payload, 7);
+    ASSERT_GT(buf.backing_block_num(), 1u);
+
+    butil::IOBufInputStream stream(buf);
+    std::string got(payload.size(), '\0');
+    stream.read(&got[0], got.size());
+    ASSERT_EQ(static_cast<std::streamsize>(payload.size()), stream.gcount());
+    ASSERT_EQ(payload, got);
+    ASSERT_EQ(EOF, stream.peek());
+}
+
+TEST_F(IOBufTest, as_input_stream_large_payload) {
+    // Payload >> DEFAULT_BLOCK_SIZE (8192) forces multiple blocks even with
+    // a single append call.
+    std::string payload;
+    payload.reserve(100 * 1024);
+    for (int i = 0; i < 100 * 1024; ++i) {
+        payload.push_back(static_cast<char>('a' + (i % 26)));
+    }
+    butil::IOBuf buf;
+    buf.append(payload);
+    ASSERT_GT(buf.backing_block_num(), 1u);
+
+    butil::IOBufInputStream stream(buf);
+    std::string got(payload.size(), '\0');
+    stream.read(&got[0], got.size());
+    ASSERT_EQ(static_cast<std::streamsize>(payload.size()), stream.gcount());
+    ASSERT_EQ(payload, got);
+}
+
+TEST_F(IOBufTest, as_input_stream_get_matches_read) {
+    butil::IOBuf buf;
+    const std::string payload = "the quick brown fox jumps over the lazy dog";
+    append_as_separate_blocks(&buf, payload, 7);
+
+    // Byte-by-byte path (sbumpc).
+    butil::IOBufInputStream s1(buf);
+    std::string got1;
+    char c;
+    while (s1.get(c)) {
+        got1.push_back(c);
+    }
+    ASSERT_EQ(payload, got1);
+
+    // Bulk path (xsgetn).
+    butil::IOBufInputStream s2(buf);
+    std::string got2(payload.size(), '\0');
+    s2.read(&got2[0], got2.size());
+    ASSERT_EQ(static_cast<std::streamsize>(payload.size()), s2.gcount());
+    ASSERT_EQ(payload, got2);
+}
+
+TEST_F(IOBufTest, as_input_stream_short_read_at_eof) {
+    butil::IOBuf buf;
+    buf.append("abcd");
+    butil::IOBufInputStream stream(buf);
+
+    char got[8] = {};
+    stream.read(got, sizeof(got));
+    // istream sets failbit on short read at EOF, but gcount() reflects the
+    // actual number of bytes transferred.
+    ASSERT_EQ(4, stream.gcount());
+    ASSERT_EQ(0, memcmp(got, "abcd", 4));
+    ASSERT_TRUE(stream.eof());
+}
+
+TEST_F(IOBufTest, as_input_stream_in_avail) {
+    butil::IOBuf buf;
+    const std::string parts[] = {"aaa", "bbbb", "ccccc"};
+    size_t total = 0;
+    for (size_t i = 0; i < arraysize(parts); ++i) {
+        char* p = static_cast<char*>(malloc(parts[i].size()));
+        memcpy(p, parts[i].data(), parts[i].size());
+        ASSERT_EQ(0, buf.append_user_data(p, parts[i].size(), free));
+        total += parts[i].size();
+    }
+
+    butil::IOBufInputStream stream(buf);
+    // get area is empty, so in_avail() defers to showmanyc() which must sum
+    // all remaining backing blocks.
+    ASSERT_EQ(static_cast<std::streamsize>(total), stream.rdbuf()->in_avail());
+}
+
+TEST_F(IOBufTest, as_output_stream_basic) {
+    butil::IOBuf buf;
+    {
+        butil::IOBufOutputStream stream(buf);
+        stream << "hello " << 42 << ' ' << 3.5;
+    } // dtor calls shrink()
+    ASSERT_EQ("hello 42 3.5", buf.to_string());
+}
+
+TEST_F(IOBufTest, as_output_stream_appends_not_overwrites) {
+    butil::IOBuf buf;
+    buf.append("prefix:");
+    {
+        butil::IOBufOutputStream stream(buf);
+        stream << "payload";
+    }
+    ASSERT_EQ("prefix:payload", buf.to_string());
+}
+
+TEST_F(IOBufTest, as_output_stream_large_payload) {
+    // Cross multiple blocks (DEFAULT_BLOCK_SIZE == 8192).
+    std::string payload;
+    payload.reserve(100 * 1024);
+    for (int i = 0; i < 100 * 1024; ++i) {
+        payload.push_back(static_cast<char>('a' + (i % 26)));
+    }
+    butil::IOBuf buf;
+    {
+        butil::IOBufOutputStream stream(buf);
+        stream.write(payload.data(), payload.size());
+        ASSERT_TRUE(stream.good());
+    }
+    ASSERT_GT(buf.backing_block_num(), 1u);
+    ASSERT_EQ(payload, buf.to_string());
+}
+
+TEST_F(IOBufTest, as_output_stream_xsputn_matches_overflow) {
+    // Same payload, two write paths: bulk write() vs per-byte put().
+    const std::string payload = "the quick brown fox jumps over the lazy dog "
+                                "0123456789 alpha beta gamma";
+    butil::IOBuf bulk_buf;
+    {
+        butil::IOBufOutputStream s(bulk_buf);
+        s.write(payload.data(), payload.size());
+    }
+    butil::IOBuf byte_buf;
+    {
+        butil::IOBufOutputStream s(byte_buf);
+        for (char c : payload) {
+            s.put(c);
+        }
+    }
+    ASSERT_EQ(payload, bulk_buf.to_string());
+    ASSERT_EQ(payload, byte_buf.to_string());
+}
+
+TEST_F(IOBufTest, as_output_stream_flush_shrinks_eagerly) {
+    // Without flush(), IOBuf::length() may exceed bytes-written because Next()
+    // over-claims the rest of the current block. flush() must reconcile it.
+    butil::IOBuf buf;
+    butil::IOBufOutputStream stream(buf);
+    stream << "abc";
+    stream.flush();
+    ASSERT_EQ(3u, buf.length());
+    ASSERT_EQ("abc", buf.to_string());
+
+    stream << "defg";
+    stream.flush();
+    ASSERT_EQ(7u, buf.length());
+    ASSERT_EQ("abcdefg", buf.to_string());
+}
+
+TEST_F(IOBufTest, as_output_stream_dedicated_block_size) {
+    // Passing block_size routes through create_block instead of TLS pool.
+    // Pick a small-but-valid block to force many allocations.
+    butil::IOBuf buf;
+    const std::string payload(4096, 'z');
+    {
+        butil::IOBufOutputStream stream(buf, /*block_size=*/256);
+        stream.write(payload.data(), payload.size());
+    }
+    ASSERT_EQ(payload, buf.to_string());
+    ASSERT_GT(buf.backing_block_num(), 1u);
+}
+
+TEST_F(IOBufTest, as_output_stream_round_trip_with_input_stream) {
+    // Write through OutputStream, read back through InputStream.
+    butil::IOBuf buf;
+    {
+        butil::IOBufOutputStream out(buf);
+        for (int i = 0; i < 1000; ++i) {
+            out << i << '\n';
+        }
+    }
+    butil::IOBufInputStream in(buf);
+    for (int i = 0; i < 1000; ++i) {
+        int v = -1;
+        in >> v;
+        ASSERT_EQ(i, v);
+    }
+}
+
+#if HAS_NLOHMANN_JSON
+// End-to-end test that the IOBuf <-> std::iostream adapters work with
+// nlohmann::json — the canonical "RPC handler reads JSON from an IOBuf body
+// and writes a JSON reply back to another IOBuf" flow.
+TEST_F(IOBufTest, as_stream_nlohmann_json_round_trip) {
+    // 1. Serialize a JSON object into an IOBuf via IOBufOutputStream.
+    nlohmann::json reply = {
+        {"status", "ok"},
+        {"code",   200},
+        {"items",  {1, 2, 3, 4, 5}},
+        {"nested", {{"a", "alpha"}, {"b", "beta"}}},
+    };
+    butil::IOBuf out;
+    {
+        butil::IOBufOutputStream os(out);
+        os << reply;
+    } // dtor runs shrink(); `out` now holds exactly the serialized bytes.
+
+    ASSERT_EQ(reply.dump(), out.to_string());
+
+    // 2. Parse the IOBuf back through IOBufInputStream and verify roundtrip.
+    butil::IOBufInputStream in(out);
+    nlohmann::json parsed = nlohmann::json::parse(in);
+    ASSERT_EQ(reply, parsed);
+    ASSERT_EQ("ok", parsed["status"]);
+    ASSERT_EQ(200, parsed["code"]);
+    ASSERT_EQ(5u, parsed["items"].size());
+    ASSERT_EQ("alpha", parsed["nested"]["a"]);
+
+    // 3. Pretty-print via std::setw, then re-parse — verifies formatting flags
+    // propagate through IOBufAsOutputStreamBuf correctly.
+    butil::IOBuf pretty;
+    {
+        butil::IOBufOutputStream os(pretty);
+        os << std::setw(2) << reply;
+    }
+    ASSERT_EQ(reply.dump(2), pretty.to_string());
+    butil::IOBufInputStream pretty_in(pretty);
+    ASSERT_EQ(reply, nlohmann::json::parse(pretty_in));
+}
+
+TEST_F(IOBufTest, as_stream_nlohmann_json_large_array) {
+    // Build a payload large enough to span multiple IOBuf blocks
+    // (DEFAULT_BLOCK_SIZE == 8192) and exercise xsputn/xsgetn across
+    // block boundaries.
+    nlohmann::json arr = nlohmann::json::array();
+    for (int i = 0; i < 5000; ++i) {
+        arr.push_back({{"i", i}, {"sq", i * i}});
+    }
+
+    butil::IOBuf buf;
+    {
+        butil::IOBufOutputStream os(buf);
+        os << arr;
+    }
+    ASSERT_GT(buf.backing_block_num(), 1u) << "payload should span >1 block";
+    ASSERT_EQ(arr.dump(), buf.to_string());
+
+    butil::IOBufInputStream in(buf);
+    nlohmann::json parsed = nlohmann::json::parse(in);
+    ASSERT_EQ(arr, parsed);
+    ASSERT_EQ(5000u, parsed.size());
+    ASSERT_EQ(4999, parsed[4999]["i"]);
+    ASSERT_EQ(4999 * 4999, parsed[4999]["sq"]);
+}
+#endif // HAS_NLOHMANN_JSON
 } // namespace

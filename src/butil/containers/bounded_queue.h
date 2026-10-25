@@ -1,18 +1,20 @@
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Sat Aug 18 12:42:16 CST 2012
 
 // A thread-unsafe bounded queue(ring buffer). It can push/pop from both
@@ -82,14 +84,14 @@ public:
         , _cap(0)
         , _start(0)
         , _ownership(NOT_OWN_STORAGE)
-        , _items(NULL) {
+        , _items(nullptr) {
     };
 
     ~BoundedQueue() {
         clear();
         if (_ownership == OWNS_STORAGE) {
             free(_items);
-            _items = NULL;
+            _items = nullptr;
         }
     }
 
@@ -122,7 +124,7 @@ public:
         if (_count < _cap) {
             return new ((T*)_items + _mod(_start + _count++, _cap)) T();
         }
-        return NULL;
+        return nullptr;
     }
 
     // Push |item| into top side of this queue
@@ -145,7 +147,7 @@ public:
             ++_count;
             return new ((T*)_items + _start) T();
         }
-        return NULL;
+        return nullptr;
     }
     
     // Pop top-most item from this queue
@@ -165,8 +167,9 @@ public:
     bool pop(T* item) {
         if (_count) {
             --_count;
-            *item = ((T*)_items)[_start];
-            ((T*)_items)[_start].~T();
+            T* const p = (T*)_items + _start;
+            *item = *p;
+            p->~T();
             _start = _mod(_start + 1, _cap);
             return true;
         }
@@ -178,7 +181,7 @@ public:
     bool pop_bottom() {
         if (_count) {
             --_count;
-            ((T*)_items + _start + _count)->~T();
+            ((T*)_items + _mod(_start + _count, _cap))->~T();
             return true;
         }
         return false;
@@ -189,8 +192,9 @@ public:
     bool pop_bottom(T* item) {
         if (_count) {
             --_count;
-            *item = ((T*)_items)[_start + _count];
-            ((T*)_items)[_start + _count].~T();
+            T* const p = (T*)_items + _mod(_start + _count, _cap);
+            *item = *p;
+            p->~T();
             return true;
         }
         return false;
@@ -205,52 +209,52 @@ public:
         _start = 0;
     }
 
-    // Get address of top-most item, NULL if queue is empty
-    T* top() { 
-        return _count ? ((T*)_items + _start) : NULL; 
+    // Get address of top-most item, nullptr if queue is empty
+    T* top() {
+        return _count ? ((T*)_items + _start) : nullptr;
     }
-    const T* top() const { 
-        return _count ? ((const T*)_items + _start) : NULL; 
+    const T* top() const {
+        return _count ? ((const T*)_items + _start) : nullptr;
     }
 
     // Randomly access item from top side.
     // top(0) == top(), top(size()-1) == bottom()
-    // Returns NULL if |index| is out of range.
+    // Returns nullptr if |index| is out of range.
     T* top(size_t index) {
         if (index < _count) {
             return (T*)_items + _mod(_start + index, _cap);
         }
-        return NULL;   // including _count == 0
+        return nullptr;   // including _count == 0
     }
     const T* top(size_t index) const {
         if (index < _count) {
             return (const T*)_items + _mod(_start + index, _cap);
         }
-        return NULL;   // including _count == 0
+        return nullptr;   // including _count == 0
     }
 
-    // Get address of bottom-most item, NULL if queue is empty
-    T* bottom() { 
-        return _count ? ((T*)_items + _mod(_start + _count - 1, _cap)) : NULL; 
+    // Get address of bottom-most item, nullptr if queue is empty
+    T* bottom() {
+        return _count ? ((T*)_items + _mod(_start + _count - 1, _cap)) : nullptr;
     }
     const T* bottom() const {
-        return _count ? ((const T*)_items + _mod(_start + _count - 1, _cap)) : NULL; 
+        return _count ? ((const T*)_items + _mod(_start + _count - 1, _cap)) : nullptr;
     }
     
     // Randomly access item from bottom side.
     // bottom(0) == bottom(), bottom(size()-1) == top()
-    // Returns NULL if |index| is out of range.
+    // Returns nullptr if |index| is out of range.
     T* bottom(size_t index) {
         if (index < _count) {
             return (T*)_items + _mod(_start + _count - index - 1, _cap);
         }
-        return NULL;  // including _count == 0
+        return nullptr;  // including _count == 0
     }
     const T* bottom(size_t index) const {
         if (index < _count) {
             return (const T*)_items + _mod(_start + _count - index - 1, _cap);
         }
-        return NULL;  // including _count == 0
+        return nullptr;  // including _count == 0
     }
 
     bool empty() const { return !_count; }
@@ -266,7 +270,7 @@ public:
     size_t max_capacity() const { return (1UL << (sizeof(_cap) * 8)) - 1; }
 
     // True if the queue was constructed successfully.
-    bool initialized() const { return _items != NULL; }
+    bool initialized() const { return _items != nullptr; }
 
     // Swap internal fields with another queue.
     void swap(BoundedQueue& rhs) {

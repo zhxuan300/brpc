@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <gflags/gflags.h>
 #include <stdio.h>                                      // getline
@@ -59,13 +61,18 @@ int RemoteFileNamingService::GetServers(const char *service_name_cstr,
                                       std::vector<ServerNode>* servers) {
     servers->clear();
 
-    if (_channel == NULL) {
+    if (_channel == nullptr) {
         butil::StringPiece tmpname(service_name_cstr);
         size_t pos = tmpname.find("://");
         butil::StringPiece proto;
         if (pos != butil::StringPiece::npos) {
             proto = tmpname.substr(0, pos);
-            for (pos += 3; tmpname[pos] == '/'; ++pos) {}
+            for (pos += 3; pos < tmpname.size() && tmpname[pos] == '/'; ++pos) {}
+            if (pos == tmpname.size()) {
+                LOG(ERROR) << "No server address in service_name="
+                           << service_name_cstr;
+                return -1;
+            }
             tmpname.remove_prefix(pos);
         } else {
             proto = "http";
@@ -103,7 +110,7 @@ int RemoteFileNamingService::GetServers(const char *service_name_cstr,
 
     Controller cntl;
     cntl.http_request().uri() = _path;
-    _channel->CallMethod(NULL, &cntl, NULL, NULL, NULL);
+    _channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
     if (cntl.Failed()) {
         LOG(WARNING) << "Fail to access " << _server_addr << _path << ": "
                      << cntl.ErrorText();

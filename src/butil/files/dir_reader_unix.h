@@ -1,18 +1,20 @@
-// Copyright (c) 2018 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: yinqiwen (yinqiwen@gmail.com)
 
 #ifndef BUTIL_FILES_DIR_READER_UNIX_H_
 #define BUTIL_FILES_DIR_READER_UNIX_H_
@@ -35,36 +37,36 @@ class DirReaderUnix {
  public:
   explicit DirReaderUnix(const char* directory_path)
       : fd_(open(directory_path, O_RDONLY | O_DIRECTORY)),
-        dir_(NULL),current_(NULL) {
+        dir_(nullptr),current_(nullptr) {
       dir_ = fdopendir(fd_);
   }
 
   ~DirReaderUnix() {
-    if (fd_ >= 0) {
-      if (IGNORE_EINTR(close(fd_)))
-        RAW_LOG(ERROR, "Failed to close directory handle");
-    }
-    if(NULL != dir_){
-        closedir(dir_);
+    if (nullptr != dir_) {
+      if (IGNORE_EINTR(closedir(dir_)) == 0) { // this implicitly closes fd_
+        dir_ = nullptr;
+      } else {
+        RAW_LOG(ERROR, "Failed to close directory.");
+      }
     }
   }
 
   bool IsValid() const {
-    return fd_ >= 0;
+    return dir_ != nullptr;
   }
 
   // Move to the next entry returning false if the iteration is complete.
   bool Next() {
     int err = readdir_r(dir_,&entry_, &current_);
-    if(0 != err || NULL == current_){
+    if(0 != err || nullptr == current_){
         return false;
     }
     return true;
   }
 
   const char* name() const {
-    if (NULL == current_)
-      return NULL;
+    if (nullptr == current_)
+      return nullptr;
     return current_->d_name;
   }
 

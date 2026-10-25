@@ -1,23 +1,26 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Mon Dec 14 19:12:30 CST 2015
 
 #include <map>
 #include <gflags/gflags.h>
 #include "butil/memory/singleton_on_pthread_once.h"
+#include "butil/threading/platform_thread.h"
 #include "bvar/bvar.h"
 #include "bvar/collector.h"
 
@@ -40,10 +43,10 @@ BAIDU_CASSERT(!(COLLECTOR_SAMPLING_BASE & (COLLECTOR_SAMPLING_BASE - 1)),
 // Combine two circular linked list into one.
 struct CombineCollected {
     void operator()(Collected* & s1, Collected* s2) const {
-        if (s2 == NULL) {
+        if (s2 == nullptr) {
             return;
         }
-        if (s1 == NULL) {
+        if (s1 == nullptr) {
             s1 = s2;
             return;
         }
@@ -74,13 +77,15 @@ private:
                             int64_t interval_us);
 
     static void* run_grab_thread(void* arg) {
+        butil::PlatformThread::SetNameSimple("bvar_collector_grabber");
         static_cast<Collector*>(arg)->grab_thread();
-        return NULL;
+        return nullptr;
     }
 
     static void* run_dump_thread(void* arg) {
+        butil::PlatformThread::SetNameSimple("bvar_collector_dumper");
         static_cast<Collector*>(arg)->dump_thread();
-        return NULL;
+        return nullptr;
     }
 
     static int64_t get_pending_count(void* arg) {
@@ -116,11 +121,11 @@ Collector::Collector()
     , _ngrab(0)
     , _ndrop(0)
     , _ndump(0) {
-    pthread_mutex_init(&_dump_thread_mutex, NULL);
-    pthread_cond_init(&_dump_thread_cond, NULL);
-    pthread_mutex_init(&_sleep_mutex, NULL);
-    pthread_cond_init(&_sleep_cond, NULL);
-    int rc = pthread_create(&_grab_thread, NULL, run_grab_thread, this);
+    pthread_mutex_init(&_dump_thread_mutex, nullptr);
+    pthread_cond_init(&_dump_thread_cond, nullptr);
+    pthread_mutex_init(&_sleep_mutex, nullptr);
+    pthread_cond_init(&_sleep_cond, nullptr);
+    int rc = pthread_create(&_grab_thread, nullptr, run_grab_thread, this);
     if (rc != 0) {
         LOG(ERROR) << "Fail to create Collector, " << berror(rc);
     } else {
@@ -131,7 +136,7 @@ Collector::Collector()
 Collector::~Collector() {
     if (_created) {
         _stop = true;
-        pthread_join(_grab_thread, NULL);
+        pthread_join(_grab_thread, nullptr);
         _created = false;
     }
     pthread_mutex_destroy(&_dump_thread_mutex);
@@ -145,7 +150,7 @@ static T deref_value(void* arg) {
     return *(T*)arg;
 }
 
-// for limiting samples returning NULL in speed_limit()
+// for limiting samples returning nullptr in speed_limit()
 static CollectorSpeedLimit g_null_speed_limit = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
 
 void Collector::grab_thread() {
@@ -156,7 +161,7 @@ void Collector::grab_thread() {
     // called inside the separate _dump_thread to prevent a slow callback
     // (caused by busy disk generally) from blocking collecting code too long
     // that pending requests may explode memory.
-    CHECK_EQ(0, pthread_create(&_dump_thread, NULL, run_dump_thread, this));
+    CHECK_EQ(0, pthread_create(&_dump_thread, nullptr, run_dump_thread, this));
 
     // vars
     bvar::PassiveStatus<int64_t> pending_sampled_data(
@@ -194,7 +199,7 @@ void Collector::grab_thread() {
         if (head) {
             butil::LinkNode<Collected> tmp_root;
             head->InsertBeforeAsList(&tmp_root);
-            head = NULL;
+            head = nullptr;
             
             // Group samples by preprocessors.
             for (butil::LinkNode<Collected>* p = tmp_root.next(); p != &tmp_root;) {
@@ -213,13 +218,13 @@ void Collector::grab_thread() {
                     // don't call preprocessor when there's no samples.
                     continue;
                 }
-                if (it->first != NULL) {
+                if (it->first != nullptr) {
                     it->first->process(list);
                 }
                 for (size_t i = 0; i < list.size(); ++i) {
                     Collected* p = list[i];
                     CollectorSpeedLimit* speed_limit = p->speed_limit();
-                    if (speed_limit == NULL) {
+                    if (speed_limit == nullptr) {
                         ++ngrab_map[&g_null_speed_limit];
                     } else {
                         // Add up the samples of certain type.
@@ -275,7 +280,7 @@ void Collector::grab_thread() {
         _stop = true; 
         pthread_cond_signal(&_dump_thread_cond);
     }
-    CHECK_EQ(0, pthread_join(_dump_thread, NULL));
+    CHECK_EQ(0, pthread_join(_dump_thread, nullptr));
 }
 
 void Collector::wakeup_grab_thread() {
@@ -300,8 +305,8 @@ void Collector::update_speed_limit(CollectorSpeedLimit* sl,
     size_t new_sampling_range = 0;
     const size_t old_sampling_range = sl->sampling_range;
     if (!sl->ever_grabbed) {
-        if (sl->first_sample_real_us) {
-            interval_us = butil::gettimeofday_us() - sl->first_sample_real_us;
+        if (sl->first_sample_us) {
+            interval_us = butil::cpuwide_time_us() - sl->first_sample_us;
             if (interval_us < 0) {
                 interval_us = 0;
             }
@@ -345,7 +350,7 @@ size_t is_collectable_before_first_time_grabbed(CollectorSpeedLimit* sl) {
         int before_add = sl->count_before_grabbed.fetch_add(
             1, butil::memory_order_relaxed);
         if (before_add == 0) {
-            sl->first_sample_real_us = butil::gettimeofday_us();
+            sl->first_sample_us = butil::cpuwide_time_us();
         } else if (before_add >= FLAGS_bvar_collector_expected_per_second) {
             butil::get_leaky_singleton<Collector>()->wakeup_grab_thread();
         }
@@ -374,7 +379,7 @@ void Collector::dump_thread() {
     while (!_stop) {
         ++round;
         // Get new samples set by grab_thread.
-        butil::LinkNode<Collected>* newhead = NULL;
+        butil::LinkNode<Collected>* newhead = nullptr;
         {
             BAIDU_SCOPED_LOCK(_dump_thread_mutex);
             while (!_stop && _dump_root.next() == &_dump_root) {
@@ -405,6 +410,11 @@ void Collector::dump_thread() {
     }
 }
 
+// Submit a sample for asynchronous dumping. The Collector holds only the Collected*
+// pointer (e.g., SpanContainer*). Regardless of which branch is taken below, the
+// sample will eventually be destroyed via either dump_and_destroy() or destroy(),
+// both of which call 'delete this' to release the container and decrement the
+// reference count of any managed resources (e.g., shared_ptr<Span>).
 void Collected::submit(int64_t cpuwide_us) {
     Collector* d = butil::get_leaky_singleton<Collector>();
     // Destroy the sample in-place if the grab_thread did not run for twice

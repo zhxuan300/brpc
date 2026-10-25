@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author Zhangyi Chen (chenzhangyi01@baidu.com)
-// Date 2014/10/16 17:55:39
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <limits>                           //std::numeric_limits
 
@@ -77,7 +90,7 @@ static long start_perf_test_with_atomic(size_t num_thread) {
     butil::atomic<uint64_t> counter(0);
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &add_atomic, (void *)&counter);
+        pthread_create(&threads[i], nullptr, &add_atomic, (void *)&counter);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
@@ -95,11 +108,11 @@ static long start_perf_test_with_adder(size_t num_thread) {
     EXPECT_TRUE(reducer.valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_counter, (void *)&reducer);
+        pthread_create(&threads[i], nullptr, &thread_counter, (void *)&reducer);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -169,6 +182,11 @@ TEST_F(ReducerTest, max) {
     ASSERT_EQ(30, reducer2.get_value());
     reducer2 << std::numeric_limits<int>::max();
     ASSERT_EQ(std::numeric_limits<int>::max(), reducer2.get_value());
+
+    bvar::Maxer<double> reducer3;
+    ASSERT_EQ(std::numeric_limits<double>::lowest(), reducer3.get_value());
+    reducer3 << -30.5 << -10.5 << -20.5;
+    ASSERT_EQ(-10.5, reducer3.get_value());
 }
 
 bvar::Adder<long> g_a;
@@ -205,14 +223,14 @@ void ReducerTest_window() {
     const int N = 6000;
     int count = 0;
     int total_count = 0;
-    int64_t last_time = butil::gettimeofday_us();
+    int64_t last_time = butil::cpuwide_time_us();
     for (int i = 1; i <= N; ++i) {
         c1 << 1;
         c2 << N - i;
         c3 << i;
         ++count;
         ++total_count;
-        int64_t now = butil::gettimeofday_us();
+        int64_t now = butil::cpuwide_time_us();
         if (now - last_time >= 1000000L) {
             last_time = now;
             ASSERT_EQ(total_count, c1.get_value());
@@ -235,8 +253,8 @@ void ReducerTest_window() {
 }
 
 TEST_F(ReducerTest, window) {
-#if !BRPC_WITH_GLOG
     ReducerTest_window();
+#if !BRPC_WITH_GLOG
     logging::StringSink log_str;
     logging::LogSink* old_sink = logging::SetLogSink(&log_str);
     sleep(1);
@@ -264,6 +282,74 @@ TEST_F(ReducerTest, non_primitive) {
     bvar::Adder<Foo> adder;
     adder << Foo(2) << Foo(3) << Foo(4);
     ASSERT_EQ(9, adder.get_value().x);
+}
+
+// The generic Adder/Maxer/Miner keep their data in a shared AgentCombiner and
+// hence expose share_combiner(), while the babylon-backed ones keep a value-type
+// counter and do not. This tells the two implementations apart.
+template <typename R>
+struct IsBabylonBacked
+    : std::integral_constant<bool, !bvar::detail::HasShareCombiner<R>::value> {};
+
+// Which implementation backs a given value type is decided by SFINAE at compile
+// time, so a malformed condition silently makes the babylon-backed partial
+// specializations unreachable without failing any runtime assertion. Assert the
+// selection statically.
+TEST_F(ReducerTest, babylon_counter_backend) {
+#if WITH_BABYLON_COUNTER
+    static_assert(IsBabylonBacked<bvar::Adder<int> >::value,
+                  "Adder<int> should be backed by a babylon counter");
+    static_assert(IsBabylonBacked<bvar::Adder<int64_t> >::value,
+                  "Adder<int64_t> should be backed by a babylon counter");
+    static_assert(IsBabylonBacked<bvar::Adder<double> >::value,
+                  "Adder<double> should be backed by a babylon counter");
+    static_assert(IsBabylonBacked<bvar::Maxer<int64_t> >::value,
+                  "Maxer<int64_t> should be backed by a babylon counter");
+    static_assert(!IsBabylonBacked<bvar::Maxer<double> >::value,
+                  "Maxer<double> should use the generic implementation");
+    static_assert(IsBabylonBacked<bvar::Miner<int64_t> >::value,
+                  "Miner<int64_t> should be backed by a babylon counter");
+    // babylon counters only support arithmetic types not larger than 8 bytes.
+    // The types they reject must fall back to the generic implementation rather
+    // than break the build.
+    static_assert(IsBabylonBacked<bvar::Adder<long double> >::value ==
+                  (sizeof(long double) <= 8),
+                  "Adder<long double> should follow the size constraint");
+    static_assert(!IsBabylonBacked<bvar::Adder<std::string> >::value,
+                  "Adder<std::string> should be backed by an AgentCombiner");
+    static_assert(!IsBabylonBacked<bvar::Adder<Foo> >::value,
+                  "Adder<Foo> should be backed by an AgentCombiner");
+#else
+    static_assert(!IsBabylonBacked<bvar::Adder<int64_t> >::value,
+                  "Adder<int64_t> should be backed by an AgentCombiner");
+    static_assert(!IsBabylonBacked<bvar::Maxer<int64_t> >::value,
+                  "Maxer<int64_t> should be backed by an AgentCombiner");
+    static_assert(!IsBabylonBacked<bvar::Miner<int64_t> >::value,
+                  "Miner<int64_t> should be backed by an AgentCombiner");
+#endif // WITH_BABYLON_COUNTER
+}
+
+// reset() must return the accumulated value and restore the identity of the
+// operator, which is how Window<> samples an operator without inverse. This runs
+// against whichever implementation backs the value type, hence it covers the
+// babylon counters as well when WITH_BABYLON_COUNTER is enabled.
+TEST_F(ReducerTest, reset) {
+    bvar::Adder<int> adder;
+    adder << 3 << 1;
+    ASSERT_EQ(4, adder.reset());
+    ASSERT_EQ(0, adder.get_value());
+    adder << 2;
+    ASSERT_EQ(2, adder.reset());
+
+    bvar::Maxer<int> maxer;
+    maxer << 3 << 1;
+    ASSERT_EQ(3, maxer.reset());
+    ASSERT_EQ(std::numeric_limits<int>::min(), maxer.get_value());
+
+    bvar::Miner<int> miner;
+    miner << 3 << 1;
+    ASSERT_EQ(1, miner.reset());
+    ASSERT_EQ(std::numeric_limits<int>::max(), miner.get_value());
 }
 
 bool g_stop = false;
@@ -295,13 +381,13 @@ TEST_F(ReducerTest, non_primitive_mt) {
     pthread_t th[8];
     g_stop = false;
     for (size_t i = 0; i < arraysize(th); ++i) {
-        pthread_create(&th[i], NULL, string_appender, &cater);
+        pthread_create(&th[i], nullptr, string_appender, &cater);
     }
     usleep(50000);
     g_stop = true;
     butil::hash_map<pthread_t, int> appended_count;
     for (size_t i = 0; i < arraysize(th); ++i) {
-        StringAppenderResult* res = NULL;
+        StringAppenderResult* res = nullptr;
         pthread_join(th[i], (void**)&res);
         appended_count[th[i]] = res->count;
         delete res;
@@ -309,7 +395,7 @@ TEST_F(ReducerTest, non_primitive_mt) {
     butil::hash_map<pthread_t, int> got_count;
     std::string res = cater.get_value();
     for (butil::StringSplitter sp(res.c_str(), '.'); sp; ++sp) {
-        char* endptr = NULL;
+        char* endptr = nullptr;
         ++got_count[(pthread_t)strtoll(sp.field(), &endptr, 10)];
         ASSERT_EQ(27LL, sp.field() + sp.length() - endptr)
             << butil::StringPiece(sp.field(), sp.length());

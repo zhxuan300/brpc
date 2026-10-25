@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A client sending requests to server asynchronously every 1 second.
 
@@ -116,13 +119,13 @@ struct TestCaseContext {
         , stage_index(0)
         , test_case(tc)
         , next_stage_sec(test_case.qps_stage_list(0).duration_sec() + 
-                         butil::gettimeofday_s()) {
+                         butil::cpuwide_time_s()) {
         DisplayStage(test_case.qps_stage_list(stage_index));
         Update();
     }
 
     bool Update() {
-        if (butil::gettimeofday_s() >= next_stage_sec) {
+        if (butil::cpuwide_time_s() >= next_stage_sec) {
             ++stage_index;
             if (stage_index < test_case.qps_stage_list_size()) {
                 next_stage_sec += test_case.qps_stage_list(stage_index).duration_sec(); 
@@ -141,7 +144,7 @@ struct TestCaseContext {
         } else if (qps_stage.type() == test::SMOOTH) {
             qps = lower_bound + (upper_bound - lower_bound) / 
                 double(qps_stage.duration_sec()) * (qps_stage.duration_sec() - next_stage_sec
-                + butil::gettimeofday_s());
+                + butil::cpuwide_time_s());
         }
         interval_us.store(1.0 / qps * 1000000, butil::memory_order_relaxed);
         return true;
@@ -183,7 +186,7 @@ void RunCase(test::ControlService_Stub &cntl_stub,
     test::NotifyResponse cntl_rsp;
     brpc::Controller cntl;
     cntl_req.set_message("StartCase");
-    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, NULL);
+    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, nullptr);
     CHECK(!cntl.Failed()) << "control failed";
 
     TestCaseContext context(test_case);
@@ -205,14 +208,14 @@ void RunCase(test::ControlService_Stub &cntl_stub,
     ::sleep(FLAGS_case_interval);
     cntl.Reset();
     cntl_req.set_message("StopCase");
-    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, NULL);
+    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, nullptr);
     CHECK(!cntl.Failed()) << "control failed";
     LOG(INFO) << "Case `" << test_case.case_name() << "' finshed:";
 }
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     Expose();
 
     brpc::Channel channel;
@@ -234,7 +237,7 @@ int main(int argc, char* argv[]) {
     test::NotifyRequest cntl_req;
     test::NotifyResponse cntl_rsp;
     cntl_req.set_message("ResetCaseSet");
-    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, NULL);
+    cntl_stub.Notify(&cntl, &cntl_req, &cntl_rsp, nullptr);
     CHECK(!cntl.Failed()) << "Cntl Failed";
     for (int i = 0; i < case_set.test_case_size(); ++i) {
         RunCase(cntl_stub, case_set.test_case(i));

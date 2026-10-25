@@ -1,18 +1,19 @@
-// Copyright (c) 2011 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// Lock a mutex, a spinlock, or mutex types in C++11 in a way that the lock
-// will be unlocked automatically when go out of declaring scope.
-// Example:
-//   pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-//   ...
-//   if (...) {
-//       BAIDU_SCOPED_LOCK(mutex);
-//       // got the lock.
-//   }
-//   // unlocked when out of declaring scope.
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// Author: Ge,Jun (gejun@baidu.com)
-// Date: Mon. Nov 7 14:47:36 CST 2011
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BUTIL_BAIDU_SCOPED_LOCK_H
 #define BUTIL_BAIDU_SCOPED_LOCK_H
@@ -76,7 +77,7 @@ template <typename Mutex> class unique_lock {
     DISALLOW_COPY_AND_ASSIGN(unique_lock);
 public:
     typedef Mutex mutex_type;
-    unique_lock() : _mutex(NULL), _owns_lock(false) {}
+    unique_lock() : _mutex(nullptr), _owns_lock(false) {}
     explicit unique_lock(mutex_type& mutex)
         : _mutex(&mutex), _owns_lock(true) {
         mutex.lock();
@@ -131,7 +132,7 @@ public:
 
     mutex_type* release() {
         mutex_type* saved_mutex = _mutex;
-        _mutex = NULL;
+        _mutex = nullptr;
         _owns_lock = false;
         return saved_mutex;
     }
@@ -156,7 +157,7 @@ public:
         const int rc = pthread_mutex_lock(_pmutex);
         if (rc) {
             LOG(FATAL) << "Fail to lock pthread_mutex_t=" << _pmutex << ", " << berror(rc);
-            _pmutex = NULL;
+            _pmutex = nullptr;
         }
 #else
         pthread_mutex_lock(_pmutex);
@@ -185,7 +186,7 @@ public:
         const int rc = pthread_spin_lock(_pspin);
         if (rc) {
             LOG(FATAL) << "Fail to lock pthread_spinlock_t=" << _pspin << ", " << berror(rc);
-            _pspin = NULL;
+            _pspin = nullptr;
         }
 #else
         pthread_spin_lock(_pspin);
@@ -211,7 +212,7 @@ template<> class unique_lock<pthread_mutex_t> {
     DISALLOW_COPY_AND_ASSIGN(unique_lock);
 public:
     typedef pthread_mutex_t         mutex_type;
-    unique_lock() : _mutex(NULL), _owns_lock(false) {}
+    unique_lock() : _mutex(nullptr), _owns_lock(false) {}
     explicit unique_lock(mutex_type& mutex)
         : _mutex(&mutex), _owns_lock(true) {
         pthread_mutex_lock(_mutex);
@@ -275,7 +276,7 @@ public:
 
     mutex_type* release() {
         mutex_type* saved_mutex = _mutex;
-        _mutex = NULL;
+        _mutex = nullptr;
         _owns_lock = false;
         return saved_mutex;
     }
@@ -293,7 +294,7 @@ template<> class unique_lock<pthread_spinlock_t> {
     DISALLOW_COPY_AND_ASSIGN(unique_lock);
 public:
     typedef pthread_spinlock_t  mutex_type;
-    unique_lock() : _mutex(NULL), _owns_lock(false) {}
+    unique_lock() : _mutex(nullptr), _owns_lock(false) {}
     explicit unique_lock(mutex_type& mutex)
         : _mutex(&mutex), _owns_lock(true) {
         pthread_spin_lock(_mutex);
@@ -357,7 +358,7 @@ public:
 
     mutex_type* release() {
         mutex_type* saved_mutex = _mutex;
-        _mutex = NULL;
+        _mutex = nullptr;
         _owns_lock = false;
         return saved_mutex;
     }
@@ -377,7 +378,7 @@ private:
 
 namespace butil {
 
-// Lock both lck1 and lck2 without the dead lock issue
+// Lock both lck1 and lck2 without the deadlock issue.
 template <typename Mutex1, typename Mutex2>
 void double_lock(std::unique_lock<Mutex1> &lck1, std::unique_lock<Mutex2> &lck2) {
     DCHECK(!lck1.owns_lock());

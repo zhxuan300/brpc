@@ -1,19 +1,20 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Jiashun Zhu (zhujiashun@baidu.com)
 
 #ifndef BRPC_POLICY_RTMP_PROTOCOL_H
 #define BRPC_POLICY_RTMP_PROTOCOL_H
@@ -168,12 +169,12 @@ public:
     // if this field is non-zero.
     uint32_t new_chunk_size;
     butil::IOBuf body;
-    // If next is not NULL, next->AppendAndDestroySelf() will be called
+    // If next is not nullptr, next->AppendAndDestroySelf() will be called
     // recursively. For implementing batched messages.
     SocketMessagePtr<RtmpUnsentMessage> next;
 public:
     RtmpUnsentMessage()
-        : chunk_stream_id(0) , new_chunk_size(0), next(NULL) {}
+        : chunk_stream_id(0) , new_chunk_size(0), next(nullptr) {}
     // @SocketMessage
     butil::Status AppendAndDestroySelf(butil::IOBuf* out, Socket*);
 };
@@ -254,7 +255,7 @@ public:
     // Get literal form of the state.
     static const char* state2str(State);
 
-    // One of copt/service must be NULL, indicating this context belongs
+    // One of copt/service must be nullptr, indicating this context belongs
     // to a server-side or client-side socket.
     RtmpContext(const RtmpClientOptions* copt, const Server* server);
     ~RtmpContext();
@@ -271,8 +272,8 @@ public:
     const Server* server() const { return _server; }
     RtmpService* service() const { return _service; }
 
-    bool is_server_side() const { return service() != NULL; }
-    bool is_client_side() const { return service() == NULL; }
+    bool is_server_side() const { return service() != nullptr; }
+    bool is_client_side() const { return service() == nullptr; }
 
     // XXXMessageStream may be called from multiple threads(currently not),
     // so they're protected by _stream_mutex
@@ -305,8 +306,8 @@ public:
 
     // Get the chunk stream by its id. The stream is created by need.
     RtmpChunkStream* GetChunkStream(uint32_t cs_id);
-    // Reset the chunk stream associated with the id.
-    void ClearChunkStream(uint32_t cs_id);
+    // Discard the incomplete message on the chunk stream, if it exists.
+    void AbortChunkStream(uint32_t cs_id);
 
     // Allocate/deallocate id for a chunk stream.
     void AllocateChunkStreamId(uint32_t* chunk_stream_id);
@@ -324,7 +325,7 @@ public:
     }
     // Called when the RTMP connection is established.
     void OnConnected(int error_code);
-    bool unconnected() const { return _on_connect != NULL; }
+    bool unconnected() const { return _on_connect != nullptr; }
 
     void only_check_simple_s0s1() { _only_check_simple_s0s1 = true; }
     bool can_stream_be_created_with_play_or_publish() const
@@ -423,6 +424,8 @@ public:
 
     int SerializeMessage(butil::IOBuf* buf, const RtmpMessageHeader& mh,
                          butil::IOBuf* body);
+
+    void OnAbort();
     
     bool OnMessage(
         const RtmpBasicHeader& bh, const RtmpMessageHeader& mh,

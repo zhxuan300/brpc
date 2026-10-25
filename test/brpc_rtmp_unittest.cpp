@@ -1,8 +1,25 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Fri May 20 15:52:22 CST 2016
 
+#include <limits>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -12,6 +29,8 @@
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include "butil/time.h"
 #include "butil/macros.h"
+#include "butil/fd_guard.h"
+#include "brpc/policy/rtmp_protocol.h"
 #include "brpc/socket.h"
 #include "brpc/acceptor.h"
 #include "brpc/server.h"
@@ -19,11 +38,109 @@
 #include "brpc/rtmp.h"
 #include "brpc/amf.h"
 
+namespace brpc {
+DECLARE_int32(amf_max_depth);
+DECLARE_int32(amf_max_string_size);
+DECLARE_int32(amf_max_array_size);
+}
+
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
+
+namespace {
+class ScopedAMFMaxDepth {
+public:
+    explicit ScopedAMFMaxDepth(int32_t depth) : _old_depth(brpc::FLAGS_amf_max_depth) {
+        brpc::FLAGS_amf_max_depth = depth;
+    }
+    ~ScopedAMFMaxDepth() {
+        brpc::FLAGS_amf_max_depth = _old_depth;
+    }
+
+private:
+    int32_t _old_depth;
+};
+
+class ScopedAMFLimit {
+public:
+    ScopedAMFLimit(int32_t* flag, int32_t value) : _flag(flag), _old_value(*flag) {
+        *_flag = value;
+    }
+    ~ScopedAMFLimit() {
+        *_flag = _old_value;
+    }
+
+private:
+    int32_t* _flag;
+    int32_t _old_value;
+};
+
+void AppendAMFStrictArrayHeader(std::string* out, uint32_t count) {
+    out->push_back((char)brpc::AMF_MARKER_STRICT_ARRAY);
+    out->push_back((char)((count >> 24) & 0xFF));
+    out->push_back((char)((count >> 16) & 0xFF));
+    out->push_back((char)((count >> 8) & 0xFF));
+    out->push_back((char)(count & 0xFF));
+}
+
+void AppendAMFObjectHeader(std::string* out) {
+    out->push_back((char)brpc::AMF_MARKER_OBJECT);
+}
+
+void AppendAMFEcmaArrayHeader(std::string* out, uint32_t count) {
+    out->push_back((char)brpc::AMF_MARKER_ECMA_ARRAY);
+    out->push_back((char)((count >> 24) & 0xFF));
+    out->push_back((char)((count >> 16) & 0xFF));
+    out->push_back((char)((count >> 8) & 0xFF));
+    out->push_back((char)(count & 0xFF));
+}
+
+void AppendAMFShortStringBody(std::string* out, const char* name) {
+    const uint16_t len = strlen(name);
+    out->push_back((char)((len >> 8) & 0xFF));
+    out->push_back((char)(len & 0xFF));
+    out->append(name, len);
+}
+
+void AppendAMFLongStringHeader(std::string* out, uint32_t len) {
+    out->push_back((char)brpc::AMF_MARKER_LONG_STRING);
+    out->push_back((char)((len >> 24) & 0xFF));
+    out->push_back((char)((len >> 16) & 0xFF));
+    out->push_back((char)((len >> 8) & 0xFF));
+    out->push_back((char)(len & 0xFF));
+}
+
+void AppendAMFObjectEnd(std::string* out) {
+    AppendAMFShortStringBody(out, "");
+    out->push_back((char)brpc::AMF_MARKER_OBJECT_END);
+}
+
+std::string MakeNestedAMFObject(int depth) {
+    std::string out;
+    AppendAMFObjectHeader(&out);
+    for (int i = 0; i < depth; ++i) {
+        AppendAMFShortStringBody(&out, "x");
+        AppendAMFObjectHeader(&out);
+    }
+    for (int i = 0; i <= depth; ++i) {
+        AppendAMFObjectEnd(&out);
+    }
+    return out;
+}
+
+std::string MakeNestedAMFEcmaArray(int depth) {
+    std::string out;
+    AppendAMFEcmaArrayHeader(&out, depth == 0 ? 0 : 1);
+    for (int i = 0; i < depth; ++i) {
+        AppendAMFShortStringBody(&out, "x");
+        AppendAMFEcmaArrayHeader(&out, i + 1 == depth ? 0 : 1);
+    }
+    return out;
+}
+}  // namespace
 
 class TestRtmpClientStream : public brpc::RtmpClientStream {
 public:
@@ -153,9 +270,16 @@ public:
                       << " ms before responding play request";
             bthread_usleep(_sleep_ms * 1000L);
         }
-        int rc = bthread_start_background(&_play_thread, NULL,
+        // Reserve a reference for the sender bthread, keeping the stream alive
+        // until SendData() returns, even if a failed send synchronously runs
+        // OnStop() and releases the framework's references. The reference
+        // belongs to the sender from the moment it is acquired, so only the
+        // failed creation path gives it back.
+        AddRefManually();
+        int rc = bthread_start_background(&_play_thread, nullptr,
                                           RunSendData, this);
         if (rc) {
+            RemoveRefManually();
             status->set_error(rc, "Fail to create thread");
             return;
         }
@@ -163,7 +287,7 @@ public:
         if (!_state.compare_exchange_strong(expected, STATE_PLAYING)) {
             if (expected == STATE_STOPPED) {
                 bthread_stop(_play_thread);
-                bthread_join(_play_thread, NULL);
+                bthread_join(_play_thread, nullptr);
             } else {
                 CHECK(false) << "Impossible";
             }
@@ -173,8 +297,17 @@ public:
     void OnStop() {
         LOG(INFO) << "OnStop of PlayingDummyStream=" << this;
         if (_state.exchange(STATE_STOPPED) == STATE_PLAYING) {
+            // A send failure can invoke this callback on the sender bthread
+            // itself. bthread_stop() only sets the stop flag that SendData's
+            // loop checks, so it must be called on the current bthread too,
+            // otherwise the sender loops and sleeps forever while holding its
+            // stream reference. Only joining the current bthread is unsafe, so
+            // skip just the join on the self-callback path; the sender's own
+            // reference keeps the stream alive until SendData returns.
             bthread_stop(_play_thread);
-            bthread_join(_play_thread, NULL);
+            if (_play_thread != bthread_self()) {
+                bthread_join(_play_thread, nullptr);
+            }
         }
     }
 
@@ -182,8 +315,11 @@ public:
     
 private:
     static void* RunSendData(void* arg) {
-        ((PlayingDummyStream*)arg)->SendData();
-        return NULL;
+        // Adopt the reference acquired before starting this bthread.
+        butil::intrusive_ptr<PlayingDummyStream> stream(
+            static_cast<PlayingDummyStream*>(arg), false);
+        stream->SendData();
+        return nullptr;
     }
 
     butil::atomic<State> _state;
@@ -226,6 +362,90 @@ void PlayingDummyStream::SendData() {
     LOG(INFO) << "Quit SendData of PlayingDummyStream=" << this;
 }
 
+// Regression test for a use-after-free where a send failure synchronously ran
+// OnStop() on the sender bthread and dropped the framework's reference while
+// SendData() was still using the stream. This reproduces the ordering
+// deterministically without a socket: the sender bthread runs OnStop() itself,
+// which releases the framework's reference, and then keeps touching the stream.
+class SelfStopStream : public brpc::RtmpServerStream {
+public:
+    SelfStopStream(butil::atomic<bool>* destroyed,
+                   butil::atomic<bool>* alive_after_stop,
+                   butil::atomic<bool>* stop_on_sender)
+        : _destroyed(destroyed)
+        , _alive_after_stop(alive_after_stop)
+        , _stop_on_sender(stop_on_sender)
+        , _sender_ready(false) {}
+    ~SelfStopStream() override {
+        _destroyed->store(true, butil::memory_order_relaxed);
+    }
+
+    void OnStop() override {
+        _stop_on_sender->store(_sender == bthread_self(),
+                               butil::memory_order_relaxed);
+        // Drop the framework's reference from within OnStop(), exactly like
+        // RtmpServerStream::RunOnFailed does on the sender bthread.
+        _framework_ref.reset();
+    }
+
+    // Starts the sender bthread and returns its id. The framework keeps one
+    // reference until OnStop() drops it; a second reference is reserved for
+    // the sender bthread, exactly like PlayingDummyStream::OnPlay does.
+    bthread_t Start() {
+        _framework_ref.reset(this);
+        AddRefManually();
+        CHECK_EQ(0, bthread_start_background(
+                        &_sender, nullptr, RunSender, this));
+        // Publish _sender before the sender bthread reads it in OnStop().
+        _sender_ready.store(true, butil::memory_order_release);
+        return _sender;
+    }
+
+private:
+    static void* RunSender(void* arg) {
+        butil::intrusive_ptr<SelfStopStream> self(
+            static_cast<SelfStopStream*>(arg), false);
+        while (!self->_sender_ready.load(butil::memory_order_acquire)) {
+            bthread_usleep(100);
+        }
+        // Run OnStop() on this very bthread, releasing the framework reference.
+        self->OnStop();
+        // The stream must still be alive here, kept by the sender's reference.
+        self->_alive_after_stop->store(
+            !self->_destroyed->load(butil::memory_order_relaxed) &&
+                self->ref_count() >= 1,
+            butil::memory_order_relaxed);
+        return nullptr;
+    }
+
+    butil::atomic<bool>* _destroyed;
+    butil::atomic<bool>* _alive_after_stop;
+    butil::atomic<bool>* _stop_on_sender;
+    butil::atomic<bool> _sender_ready;
+    bthread_t _sender;
+    butil::intrusive_ptr<SelfStopStream> _framework_ref;
+};
+
+TEST(RtmpTest, on_stop_on_sender_bthread_keeps_stream_alive) {
+    butil::atomic<bool> destroyed(false);
+    butil::atomic<bool> alive_after_stop(false);
+    butil::atomic<bool> stop_on_sender(false);
+    bthread_t sender;
+    {
+        butil::intrusive_ptr<SelfStopStream> stream(
+            new SelfStopStream(&destroyed, &alive_after_stop, &stop_on_sender));
+        sender = stream->Start();
+        ASSERT_EQ(0, bthread_join(sender, nullptr));
+        // OnStop ran on the sender bthread and the stream survived it.
+        ASSERT_TRUE(stop_on_sender.load(butil::memory_order_relaxed));
+        ASSERT_TRUE(alive_after_stop.load(butil::memory_order_relaxed));
+        // The sender's reference is gone but the test still holds one.
+        ASSERT_FALSE(destroyed.load(butil::memory_order_relaxed));
+    }
+    // The last reference is gone now, the stream must be destroyed.
+    ASSERT_TRUE(destroyed.load(butil::memory_order_relaxed));
+}
+
 class PlayingDummyService : public brpc::RtmpService {
 public:
     PlayingDummyService(int64_t sleep_ms = 0) : _sleep_ms(sleep_ms) {}
@@ -237,6 +457,14 @@ private:
         return new PlayingDummyStream(_sleep_ms);
     }
     int64_t _sleep_ms;
+};
+
+class RejectingRtmpService : public brpc::RtmpService {
+private:
+    brpc::RtmpServerStream* NewStream(
+        const brpc::RtmpConnectRequest&) override {
+        return nullptr;
+    }
 };
 
 class PublishStream : public brpc::RtmpServerStream {
@@ -305,7 +533,7 @@ private:
 class PublishService : public brpc::RtmpService {
 public:
     PublishService(int64_t sleep_ms = 0) : _sleep_ms(sleep_ms) {
-        pthread_mutex_init(&_mutex, NULL);
+        pthread_mutex_init(&_mutex, nullptr);
     }
     ~PublishService() {
         pthread_mutex_destroy(&_mutex);
@@ -507,19 +735,570 @@ TEST(RtmpTest, amf) {
     ASSERT_EQ("heheda", info3.description());
 }
 
+TEST(RtmpTest, amf_rejects_out_of_range_uint32) {
+    // Each value below encodes legally in an AMF0 number but has no uint32
+    // representation; the cast in ReadAMFUint32 was undefined for them.
+    const double bad_values[] = { -1.0, 4294967296.0, 1e30, -1e30,
+                                  std::numeric_limits<double>::infinity(),
+                                  std::numeric_limits<double>::quiet_NaN() };
+    for (size_t i = 0; i < arraysize(bad_values); ++i) {
+        std::string buf;
+        {
+            google::protobuf::io::StringOutputStream zc_stream(&buf);
+            brpc::AMFOutputStream ostream(&zc_stream);
+            brpc::WriteAMFNumber(bad_values[i], &ostream);
+            ASSERT_TRUE(ostream.good());
+        }
+        google::protobuf::io::ArrayInputStream zc_stream(buf.data(), buf.size());
+        brpc::AMFInputStream istream(&zc_stream);
+        uint32_t val = 0;
+        EXPECT_FALSE(brpc::ReadAMFUint32(&val, &istream)) << "i=" << i;
+    }
+
+    const double good_values[] = { 0.0, 42.5, 4294967295.0 };
+    const uint32_t expected_values[] = { 0, 42, 4294967295u };
+    for (size_t i = 0; i < arraysize(good_values); ++i) {
+        std::string buf;
+        {
+            google::protobuf::io::StringOutputStream zc_stream(&buf);
+            brpc::AMFOutputStream ostream(&zc_stream);
+            brpc::WriteAMFNumber(good_values[i], &ostream);
+            ASSERT_TRUE(ostream.good());
+        }
+        google::protobuf::io::ArrayInputStream zc_stream(buf.data(), buf.size());
+        brpc::AMFInputStream istream(&zc_stream);
+        uint32_t val = 0;
+        ASSERT_TRUE(brpc::ReadAMFUint32(&val, &istream)) << "i=" << i;
+        ASSERT_EQ(expected_values[i], val);
+    }
+}
+
+TEST(RtmpTest, amf_rejects_oversized_string_before_growing_output) {
+    std::string req_buf;
+    AppendAMFLongStringHeader(&req_buf, 16);
+    req_buf.append("short", 5);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    std::string result = "unchanged";
+    EXPECT_FALSE(brpc::ReadAMFString(&result, &istream));
+    EXPECT_TRUE(result.empty());
+
+    ScopedAMFLimit scoped_limit(&brpc::FLAGS_amf_max_string_size, 4);
+    std::string capped_buf;
+    AppendAMFLongStringHeader(&capped_buf, 5);
+    capped_buf.append("hello", 5);
+
+    google::protobuf::io::ArrayInputStream zc_stream2(capped_buf.data(),
+                                                     capped_buf.size());
+    brpc::AMFInputStream istream2(&zc_stream2);
+    EXPECT_FALSE(brpc::ReadAMFString(&result, &istream2));
+}
+
+TEST(RtmpTest, amf_rejects_oversized_ecma_array_count) {
+    ScopedAMFLimit scoped_limit(&brpc::FLAGS_amf_max_array_size, 1);
+
+    std::string req_buf;
+    AppendAMFEcmaArrayHeader(&req_buf, 2);
+    AppendAMFShortStringBody(&req_buf, "x");
+    req_buf.push_back((char)brpc::AMF_MARKER_NULL);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    brpc::AMFObject obj;
+    EXPECT_FALSE(brpc::ReadAMFObject(&obj, &istream));
+}
+
+TEST(RtmpTest, amf_truncated_long_string_does_not_allocate_declared_size) {
+    // Regression: a tiny message declaring a huge (but under-the-cap)
+    // string length must not cause the declared size to be allocated
+    // before the bytes are actually available in the stream.
+    const uint32_t declared_len = 8 * 1024 * 1024;
+    std::string req_buf;
+    AppendAMFLongStringHeader(&req_buf, declared_len);
+    req_buf.append("only-a-few-bytes", 16);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    std::string result;
+    EXPECT_FALSE(brpc::ReadAMFString(&result, &istream));
+    EXPECT_TRUE(result.empty());
+    // Reading is chunked, so a truncated stream leaves at most one chunk
+    // of capacity behind instead of the full declared length.
+    EXPECT_LT(result.capacity(), (size_t)declared_len);
+}
+
+TEST(RtmpTest, amf_reads_long_string_larger_than_one_chunk) {
+    const std::string big(200 * 1024, 'x');
+    std::string req_buf;
+    {
+        google::protobuf::io::StringOutputStream zc_stream(&req_buf);
+        brpc::AMFOutputStream ostream(&zc_stream);
+        brpc::WriteAMFString(big, &ostream);
+        ASSERT_TRUE(ostream.good());
+    }
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    std::string result;
+    ASSERT_TRUE(brpc::ReadAMFString(&result, &istream));
+    ASSERT_EQ(big, result);
+}
+
+TEST(RtmpTest, chunk_stream_rejects_message_length_over_max_body_size) {
+    int pipe_fds[2];
+    ASSERT_EQ(0, pipe(pipe_fds));
+    butil::fd_guard guard0(pipe_fds[0]);   // read end, closed by this guard
+    butil::fd_guard guard1(pipe_fds[1]);   // write end, handed over to Socket
+
+    brpc::SocketId id;
+    brpc::SocketOptions options;
+    options.fd = guard1.release();         // Socket takes ownership of the fd
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr sock;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &sock));
+
+    brpc::policy::RtmpContext ctx(nullptr, nullptr);
+    ctx.SetState(sock->remote_side(),
+                 brpc::policy::RtmpContext::STATE_RECEIVED_C2);
+
+    // The message length declared by a chunk header is remote-controlled and
+    // was never bounded: with repeated mid-message headers a connection's
+    // reassembly buffer could grow without limit. A type-0 header declaring
+    // a length above -max_body_size must be rejected up front.
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 1024;
+
+    std::string chunk;
+    chunk.push_back((char)0x02);   // basic header: fmt=0, cs_id=2
+    chunk.append(3, '\0');         // timestamp = 0
+    chunk.push_back('\0');         // message_length (3 bytes) = 4096
+    chunk.push_back((char)0x10);
+    chunk.push_back('\0');
+    chunk.push_back((char)0x02);   // message_type = Abort
+    chunk.append(4, '\0');         // stream_id = 0 (little endian)
+    chunk.append(128, '\0');       // one full chunk of payload
+
+    butil::IOBuf buf;
+    buf.append(chunk);
+    ASSERT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA,
+              ctx.Feed(&buf, sock.get()).error());
+}
+
+
+TEST(RtmpTest, amf_rejects_oversized_strict_array_count) {
+    ScopedAMFLimit scoped_limit(&brpc::FLAGS_amf_max_array_size, 1);
+
+    std::string req_buf;
+    AppendAMFStrictArrayHeader(&req_buf, 2);
+    req_buf.push_back((char)brpc::AMF_MARKER_NULL);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    brpc::AMFArray arr;
+    EXPECT_FALSE(brpc::ReadAMFArray(&arr, &istream));
+    EXPECT_EQ(0u, arr.size());
+}
+
+TEST(RtmpTest, amf_rejects_stray_object_end_marker) {
+    // A stray object-end marker (0x09) in a value position used to hit
+    // CHECK(false): the process aborted with -crash_on_fatal_log, and the
+    // object/array readers then continued as if the input were valid.
+    {
+        // As the value of a field in a generic object.
+        std::string req_buf;
+        AppendAMFObjectHeader(&req_buf);
+        AppendAMFShortStringBody(&req_buf, "a");
+        req_buf.push_back((char)brpc::AMF_MARKER_OBJECT_END);
+        AppendAMFObjectEnd(&req_buf);
+
+        google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+        brpc::AMFInputStream istream(&zc_stream);
+        brpc::AMFObject obj;
+        EXPECT_FALSE(brpc::ReadAMFObject(&obj, &istream));
+    }
+    {
+        // As an item of a strict array.
+        std::string req_buf;
+        AppendAMFStrictArrayHeader(&req_buf, 1);
+        req_buf.push_back((char)brpc::AMF_MARKER_OBJECT_END);
+
+        google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+        brpc::AMFInputStream istream(&zc_stream);
+        brpc::AMFArray arr;
+        EXPECT_FALSE(brpc::ReadAMFArray(&arr, &istream));
+    }
+    {
+        // As the value of a field mapped to a protobuf message.
+        std::string req_buf;
+        AppendAMFObjectHeader(&req_buf);
+        AppendAMFShortStringBody(&req_buf, "code");
+        req_buf.push_back((char)brpc::AMF_MARKER_OBJECT_END);
+        AppendAMFObjectEnd(&req_buf);
+
+        google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+        brpc::AMFInputStream istream(&zc_stream);
+        brpc::RtmpInfo info;
+        EXPECT_FALSE(brpc::ReadAMFObject(&info, &istream));
+    }
+}
+
+TEST(RtmpTest, amf_rejects_deep_nested_arrays) {
+    ScopedAMFMaxDepth scoped_depth(4);
+
+    std::string req_buf;
+    for (int i = 0; i <= brpc::FLAGS_amf_max_depth + 1; ++i) {
+        AppendAMFStrictArrayHeader(&req_buf, 1);
+    }
+    req_buf.push_back((char)brpc::AMF_MARKER_NULL);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    brpc::AMFArray arr;
+    EXPECT_FALSE(brpc::ReadAMFArray(&arr, &istream));
+
+    req_buf.clear();
+    for (int i = 0; i < brpc::FLAGS_amf_max_depth; ++i) {
+        AppendAMFStrictArrayHeader(&req_buf, 1);
+    }
+    req_buf.push_back((char)brpc::AMF_MARKER_NULL);
+
+    google::protobuf::io::ArrayInputStream zc_stream2(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream2(&zc_stream2);
+    brpc::AMFArray valid_arr;
+    EXPECT_TRUE(brpc::ReadAMFArray(&valid_arr, &istream2));
+}
+
+TEST(RtmpTest, amf_rejects_deep_nested_objects) {
+    ScopedAMFMaxDepth scoped_depth(4);
+
+    std::string req_buf = MakeNestedAMFObject(brpc::FLAGS_amf_max_depth + 1);
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    brpc::AMFObject obj;
+    EXPECT_FALSE(brpc::ReadAMFObject(&obj, &istream));
+
+    req_buf = MakeNestedAMFObject(brpc::FLAGS_amf_max_depth);
+    google::protobuf::io::ArrayInputStream zc_stream2(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream2(&zc_stream2);
+    brpc::AMFObject valid_obj;
+    EXPECT_TRUE(brpc::ReadAMFObject(&valid_obj, &istream2));
+}
+
+TEST(RtmpTest, amf_rejects_deep_nested_ecma_arrays) {
+    ScopedAMFMaxDepth scoped_depth(4);
+
+    std::string req_buf = MakeNestedAMFEcmaArray(brpc::FLAGS_amf_max_depth + 1);
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    brpc::AMFObject obj;
+    EXPECT_FALSE(brpc::ReadAMFObject(&obj, &istream));
+
+    req_buf = MakeNestedAMFEcmaArray(brpc::FLAGS_amf_max_depth);
+    google::protobuf::io::ArrayInputStream zc_stream2(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream2(&zc_stream2);
+    brpc::AMFObject valid_obj;
+    EXPECT_TRUE(brpc::ReadAMFObject(&valid_obj, &istream2));
+}
+
+// Create() copies the record into a non-NUL-terminated buffer, so the SPS must
+// be parsed with an explicitly-sized view. A crafted sequence header whose SPS
+// body has no zero byte used to make ParseSPS run strlen off the end of that
+// buffer (an out-of-bounds read, caught here under ASan).
+TEST(RtmpTest, avc_seq_header_sps_without_zero_byte) {
+    const uint16_t sps_length = 70; // keep the record above the small-array cap
+    butil::IOBuf buf;
+    const char head[6] = { 0x01, 0x64, 0x00, 0x28, (char)0xff, (char)0xe1 };
+    buf.append(head, sizeof(head)); // version/profile/level, lengthSizeMinus1=3, numSPS=1
+    const char len_be[2] = { (char)(sps_length >> 8), (char)(sps_length & 0xff) };
+    buf.append(len_be, sizeof(len_be));
+    std::string sps(sps_length, (char)0x67); // NAL header 0x67 then non-zero filler
+    buf.append(sps);
+
+    brpc::AVCDecoderConfigurationRecord avc;
+    // Only requirement: the call must not read past the copied record.
+    avc.Create(buf);
+}
+
+// The Exp-Golomb decoder used by ParseSPS placed every value bit at the same
+// shift (leadingZeroBits-1) instead of the descending (leadingZeroBits-1-i)
+// position, so any ue(v) code with leadingZeroBits>=2 decoded to the wrong
+// number (and a crafted code could overflow the int32 accumulator). Here the
+// SPS encodes pic_width/pic_height as ue(4); the old code decoded 5 (width 96),
+// the correct value is 4 (width 80).
+TEST(RtmpTest, avc_seq_header_sps_exp_golomb) {
+    butil::IOBuf buf;
+    // configurationVersion, profile, compat, level, lengthSizeMinusOne=3, numSPS=1
+    const char head[6] = { 0x01, 0x42, 0x00, 0x1E, (char)0xff, (char)0xe1 };
+    buf.append(head, sizeof(head));
+    // Baseline SPS (profile_idc=66 skips the chroma block). The bitstream after
+    // profile/flags/level encodes: seq_parameter_set_id=0, log2_max_frame_num=0,
+    // pic_order_cnt_type=2, max_num_ref_frames=0, gaps_flag=0, then
+    // pic_width_in_mbs_minus1=ue(4) and pic_height_in_map_units_minus1=ue(4).
+    const char sps[7] = { 0x67, 0x42, 0x00, 0x1E, (char)0xdc, 0x52, (char)0xc0 };
+    const char len_be[2] = { 0x00, (char)sizeof(sps) };
+    buf.append(len_be, sizeof(len_be));
+    buf.append(sps, sizeof(sps));
+    buf.push_back('\0'); // numPPS=0
+
+    brpc::AVCDecoderConfigurationRecord avc;
+    ASSERT_TRUE(avc.Create(buf).ok());
+    ASSERT_EQ(80, avc.width);
+    ASSERT_EQ(80, avc.height);
+}
+
+static void AppendBigEndian3Bytes(std::string* s, uint32_t v) {
+    s->push_back((char)((v >> 16) & 0xFF));
+    s->push_back((char)((v >> 8) & 0xFF));
+    s->push_back((char)(v & 0xFF));
+}
+
+// Build an FLV stream header followed by a single tag of `tag_type' whose
+// DataSize field is set to `data_size'. No tag body is appended, so a valid
+// tag needs data_size==0 to be rejected before any body is consumed.
+static std::string MakeFlvTagWithDataSize(char tag_type, uint32_t data_size) {
+    std::string s;
+    const char header[] = { 'F', 'L', 'V', 0x01, 0x05, 0, 0, 0, 0x09 };
+    s.append(header, sizeof(header));
+    s.append(4, '\0');  // PreviousTagSize0
+    s.push_back(tag_type);
+    AppendBigEndian3Bytes(&s, data_size);  // DataSize
+    s.append(3, '\0');  // Timestamp
+    s.push_back('\0');  // TimestampExtended
+    s.append(3, '\0');  // StreamID
+    s.append(4, '\0');  // PreviousTagSize
+    return s;
+}
+
+TEST(RtmpTest, flv_reader_rejects_zero_datasize_video_tag) {
+    std::string flv = MakeFlvTagWithDataSize((char)brpc::FLV_TAG_VIDEO, 0);
+    butil::IOBuf buf;
+    buf.append(flv);
+
+    brpc::FlvReader reader(&buf);
+    brpc::FlvTagType type;
+    ASSERT_TRUE(reader.PeekMessageType(&type).ok());
+    ASSERT_EQ(brpc::FLV_TAG_VIDEO, type);
+    const size_t before = buf.size();
+
+    brpc::RtmpVideoMessage vmsg;
+    // A DataSize of 0 used to underflow `msg_size - 1' and drain the whole
+    // buffer; it must now be rejected without consuming the tag.
+    ASSERT_FALSE(reader.Read(&vmsg).ok());
+    ASSERT_EQ(before, buf.size());
+}
+
+TEST(RtmpTest, flv_reader_rejects_zero_datasize_audio_tag) {
+    std::string flv = MakeFlvTagWithDataSize((char)brpc::FLV_TAG_AUDIO, 0);
+    butil::IOBuf buf;
+    buf.append(flv);
+
+    brpc::FlvReader reader(&buf);
+    brpc::FlvTagType type;
+    ASSERT_TRUE(reader.PeekMessageType(&type).ok());
+    ASSERT_EQ(brpc::FLV_TAG_AUDIO, type);
+    const size_t before = buf.size();
+
+    brpc::RtmpAudioMessage amsg;
+    ASSERT_FALSE(reader.Read(&amsg).ok());
+    ASSERT_EQ(before, buf.size());
+}
+
+// Abort discards an incomplete message without deleting the chunk stream,
+// whether it names the stream carrying the Abort or a different stream.
+TEST(RtmpTest, abort_message_preserves_chunk_stream_state) {
+    int pipe_fds[2];
+    ASSERT_EQ(0, pipe(pipe_fds));
+    butil::fd_guard guard0(pipe_fds[0]);   // read end, closed by this guard
+    butil::fd_guard guard1(pipe_fds[1]);   // write end, handed over to Socket
+
+    brpc::SocketId id;
+    brpc::SocketOptions options;
+    options.fd = guard1.release();         // Socket takes ownership of the fd
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr sock;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &sock));
+
+    brpc::policy::RtmpContext ctx(nullptr, nullptr);
+    ctx.SetState(sock->remote_side(),
+                 brpc::policy::RtmpContext::STATE_RECEIVED_C2);
+
+    // fmt0 chunk on chunk stream 2 carrying an Abort message (type 2) whose
+    // payload is the same chunk stream id (2).
+    std::string chunk;
+    chunk.push_back((char)0x02);   // basic header: fmt=0, cs_id=2
+    chunk.append(3, '\0');         // timestamp = 0
+    chunk.push_back('\0');         // message_length (3 bytes) = 4
+    chunk.push_back('\0');
+    chunk.push_back((char)0x04);
+    chunk.push_back((char)0x02);   // message_type = Abort
+    chunk.append(4, '\0');         // stream_id = 0 (little endian)
+    chunk.push_back('\0');         // payload: cs_id = 2 (big endian)
+    chunk.push_back('\0');
+    chunk.push_back('\0');
+    chunk.push_back((char)0x02);
+
+    butil::IOBuf buf;
+    buf.append(chunk);
+    ASSERT_EQ(brpc::PARSE_OK, ctx.Feed(&buf, sock.get()).error());
+
+    // A following type-1 chunk inherits the message header from the previous
+    // message on the same stream. If the abort had wrongly deleted the chunk
+    // stream, the freshly recreated stream would have no last header and this
+    // chunk would be rejected; instead it must be parsed successfully.
+    std::string cont;
+    cont.push_back((char)0x42);   // basic header: fmt=1, cs_id=2
+    cont.append(3, '\0');         // timestamp delta = 0
+    cont.push_back('\0');         // message_length (3 bytes) = 4
+    cont.push_back('\0');
+    cont.push_back((char)0x04);
+    cont.push_back((char)0x03);   // message_type = Ack
+    cont.append(4, '\0');         // payload: bytes_received = 0
+    butil::IOBuf buf2;
+    buf2.append(cont);
+    ASSERT_EQ(brpc::PARSE_OK, ctx.Feed(&buf2, sock.get()).error());
+
+    // Reduce the inbound chunk size to split four-byte control messages.
+    std::string set_chunk_size;
+    set_chunk_size.push_back((char)0x02);  // fmt=0, cs_id=2
+    set_chunk_size.append(3, '\0');        // timestamp = 0
+    AppendBigEndian3Bytes(&set_chunk_size, 4);
+    set_chunk_size.push_back((char)0x01);  // message_type = SetChunkSize
+    set_chunk_size.append(4, '\0');        // stream_id = 0
+    set_chunk_size.append(3, '\0');
+    set_chunk_size.push_back((char)0x02);  // new chunk size = 2
+    butil::IOBuf set_chunk_size_buf;
+    set_chunk_size_buf.append(set_chunk_size);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&set_chunk_size_buf, sock.get()).error());
+
+    // Start an Ack on chunk stream 3, leaving half of its body incomplete.
+    std::string partial_ack;
+    partial_ack.push_back((char)0x03);     // fmt=0, cs_id=3
+    partial_ack.append(3, '\0');           // timestamp = 0
+    AppendBigEndian3Bytes(&partial_ack, 4);
+    partial_ack.push_back((char)0x03);     // message_type = Ack
+    partial_ack.append(4, '\0');           // stream_id = 0
+    partial_ack.append(2, '\0');           // first two body bytes
+    butil::IOBuf partial_ack_buf;
+    partial_ack_buf.append(partial_ack);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&partial_ack_buf, sock.get()).error());
+
+    // Abort chunk stream 3. The Abort itself is split over two chunks because
+    // the inbound chunk size is now two bytes.
+    std::string abort_first;
+    abort_first.push_back((char)0x02);     // fmt=0, cs_id=2
+    abort_first.append(3, '\0');           // timestamp = 0
+    AppendBigEndian3Bytes(&abort_first, 4);
+    abort_first.push_back((char)0x02);     // message_type = Abort
+    abort_first.append(4, '\0');           // stream_id = 0
+    abort_first.append(2, '\0');           // first two bytes of cs_id
+    butil::IOBuf abort_first_buf;
+    abort_first_buf.append(abort_first);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&abort_first_buf, sock.get()).error());
+
+    const char abort_last[] = { (char)0xC2, 0, 3 };  // fmt=3, cs_id=2
+    butil::IOBuf abort_last_buf;
+    abort_last_buf.append(abort_last, sizeof(abort_last));
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&abort_last_buf, sock.get()).error());
+
+    // A type-3 chunk starts a new message using stream 3's previous header.
+    // Deleting the stream on Abort would lose that header and reject this.
+    const char ack_part[] = { (char)0xC3, 0, 0 };  // fmt=3, cs_id=3
+    butil::IOBuf ack_part1_buf;
+    ack_part1_buf.append(ack_part, sizeof(ack_part));
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&ack_part1_buf, sock.get()).error());
+}
+
+TEST(RtmpTest, rejected_create_stream_with_response_write_failure) {
+    RejectingRtmpService rtmp_service;
+    brpc::Server server;
+    brpc::ServerOptions server_options;
+    server_options.rtmp_service = &rtmp_service;
+    ASSERT_EQ(0, server.Start(0, &server_options));
+
+    brpc::SocketId socket_id;
+    brpc::SocketOptions socket_options;
+    ASSERT_EQ(0, brpc::Socket::Create(socket_options, &socket_id));
+    brpc::SocketUniquePtr socket;
+    ASSERT_EQ(0, brpc::Socket::Address(socket_id, &socket));
+    ASSERT_EQ(0, socket->SetFailed());
+
+    brpc::policy::RtmpContext ctx(nullptr, &server);
+    brpc::policy::RtmpChunkStream chunk_stream(
+        &ctx, brpc::policy::RTMP_CONTROL_CHUNK_STREAM_ID);
+
+    std::string request;
+    google::protobuf::io::StringOutputStream zc_stream(&request);
+    brpc::AMFOutputStream ostream(&zc_stream);
+    brpc::WriteAMFNumber(1, &ostream);
+    brpc::AMFObject command;
+    brpc::WriteAMFObject(command, &ostream);
+    ASSERT_TRUE(ostream.good());
+
+    google::protobuf::io::ArrayInputStream input(
+        request.data(), request.size());
+    brpc::AMFInputStream istream(&input);
+    brpc::policy::RtmpMessageHeader message_header;
+    ASSERT_FALSE(chunk_stream.OnCreateStream(
+        message_header, &istream, socket.get()));
+
+    server.Stop(0);
+    server.Join();
+}
+
+class MyServerAuthenticator : public brpc::Authenticator {
+public:
+    int GenerateCredential(std::string*) const override { return 0; }
+    int VerifyCredential(const std::string&, const butil::EndPoint&,
+                         brpc::AuthContext*) const override { return 0; }
+};
+
+TEST(RtmpTest, reject_unauthenticated_connection) {
+    PlayingDummyService rtmp_service;
+    MyServerAuthenticator auth;
+    brpc::Server server;
+    brpc::ServerOptions server_opt;
+    server_opt.rtmp_service = &rtmp_service;
+    server_opt.auth = &auth;
+    ASSERT_EQ(0, server.Start(0, &server_opt));
+
+    brpc::SocketId socket_id;
+    brpc::SocketOptions socket_options;
+    ASSERT_EQ(0, brpc::Socket::Create(socket_options, &socket_id));
+    brpc::SocketUniquePtr socket;
+    ASSERT_EQ(0, brpc::Socket::Address(socket_id, &socket));
+
+    // RTMP messages are handled inside the parser and never reach
+    // InputMessenger's authentication hook. With ServerOptions.auth set the
+    // connection must be rejected before any handshaking happens.
+    butil::IOBuf buf;
+    buf.append("\x03", 1);  // C0 (version)
+    brpc::ParseResult pr = brpc::policy::ParseRtmpMessage(
+        &buf, socket.get(), false, &server);
+    ASSERT_EQ(brpc::PARSE_ERROR_ABSOLUTELY_WRONG, pr.error());
+    ASSERT_EQ(nullptr, socket->parsing_context());
+
+    server.Stop(0);
+    server.Join();
+}
+
 TEST(RtmpTest, successfully_play_streams) {
     PlayingDummyService rtmp_service;
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8571, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8571", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -544,14 +1323,14 @@ TEST(RtmpTest, fail_to_play_streams) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8571, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8571", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -575,14 +1354,14 @@ TEST(RtmpTest, successfully_publish_streams) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8571, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8571", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -638,14 +1417,14 @@ TEST(RtmpTest, failed_to_publish_streams) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8575, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8575", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -748,14 +1527,14 @@ TEST(RtmpTest, destroy_client_streams_during_creation) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8574, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8574", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -780,14 +1559,14 @@ TEST(RtmpTest, destroy_retrying_client_streams_during_creation) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8574, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8574", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server.listen_address(), rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -813,14 +1592,15 @@ TEST(RtmpTest, retrying_stream) {
     brpc::Server server;
     brpc::ServerOptions server_opt;
     server_opt.rtmp_service = &rtmp_service;
-    ASSERT_EQ(0, server.Start(8576, &server_opt));
+    ASSERT_EQ(0, server.Start(0, &server_opt));
+    const butil::EndPoint server_address = server.listen_address();
 
     brpc::RtmpClientOptions rtmp_opt;
     rtmp_opt.app = "hello";
     rtmp_opt.swfUrl = "anything";
     rtmp_opt.tcUrl = "rtmp://heheda";
     brpc::RtmpClient rtmp_client;
-    ASSERT_EQ(0, rtmp_client.Init("localhost:8576", rtmp_opt));
+    ASSERT_EQ(0, rtmp_client.Init(server_address, rtmp_opt));
 
     // Create multiple streams.
     const int NSTREAM = 2;
@@ -839,7 +1619,7 @@ TEST(RtmpTest, retrying_stream) {
     server.Join();
     LOG(INFO) << "Stopped server and sleep for a while";
     sleep(3);
-    ASSERT_EQ(0, server.Start(8576, &server_opt));
+    ASSERT_EQ(0, server.Start(server_address, &server_opt));
     sleep(3);
     for (int i = 0; i < NSTREAM; ++i) {
         ASSERT_EQ(1, cstreams[i]->_called_on_first_message);

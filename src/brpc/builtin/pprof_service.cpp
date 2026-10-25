@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <time.h>                           // strftime
 #include <pthread.h>
@@ -31,6 +34,7 @@
 #include "brpc/builtin/pprof_service.h"
 #include "brpc/builtin/common.h"
 #include "brpc/details/tcmalloc_extension.h"
+#include "brpc/details/jemalloc_profiler.h"
 #include "bthread/bthread.h"                // bthread_usleep
 #include "butil/fd_guard.h"
 
@@ -38,8 +42,8 @@ extern "C" {
 #if defined(OS_LINUX)
 extern char *program_invocation_name;
 #endif
-int __attribute__((weak)) ProfilerStart(const char* fname);
-void __attribute__((weak)) ProfilerStop();
+int BAIDU_WEAK ProfilerStart(const char* fname);
+void BAIDU_WEAK ProfilerStop();
 }
 
 namespace bthread {
@@ -54,8 +58,8 @@ static int ReadSeconds(Controller* cntl) {
     int seconds = 0;
     const std::string* param =
         cntl->http_request().uri().GetQuery("seconds");
-    if (param != NULL) {
-        char* endptr = NULL;
+    if (param != nullptr) {
+        char* endptr = nullptr;
         const long sec = strtol(param->c_str(), &endptr, 10);
         if (endptr == param->c_str() + param->length()) {
             seconds = sec;
@@ -64,7 +68,7 @@ static int ReadSeconds(Controller* cntl) {
         }
     }
 
-    return seconds;
+    return std::min(seconds, FLAGS_max_profiling_seconds);
 }
 
 int MakeProfName(ProfilingType type, char* buf, size_t buf_len) {
@@ -97,7 +101,7 @@ void PProfService::profile(
     ClosureGuard done_guard(done);
     Controller* cntl = static_cast<Controller*>(controller_base);
     cntl->http_response().set_content_type("text/plain");
-    if ((void*)ProfilerStart == NULL || (void*)ProfilerStop == NULL) {
+    if ((void*)ProfilerStart == nullptr || (void*)ProfilerStop == nullptr) {
         cntl->SetFailed(ENOMETHOD, "%s, to enable cpu profiler, check out "
                         "docs/cn/cpu_profiler.md",
                         berror(ENOMETHOD));
@@ -210,14 +214,20 @@ void PProfService::heap(
     ::google::protobuf::Closure* done) {
     ClosureGuard done_guard(done);
     Controller* cntl = static_cast<Controller*>(controller_base);
+
+    if (HasJemalloc()) {
+        JeControlProfile(cntl);
+        return;
+    }
+
     MallocExtension* malloc_ext = MallocExtension::instance();
-    if (malloc_ext == NULL || !has_TCMALLOC_SAMPLE_PARAMETER()) {
+    if (malloc_ext == nullptr || !has_TCMALLOC_SAMPLE_PARAMETER()) {
         const char* extra_desc = "";
-        if (malloc_ext != NULL) {
+        if (malloc_ext != nullptr) {
             extra_desc = " (no TCMALLOC_SAMPLE_PARAMETER in env)";
         }
         cntl->SetFailed(ENOMETHOD, "Heap profiler is not enabled%s,"
-                        "check out http://wiki.baidu.com/display/RPC",
+                        "check out https://github.com/apache/brpc/blob/master/docs/cn/heap_profiler.md",
                         extra_desc);
         return;
     }
@@ -245,7 +255,7 @@ void PProfService::growth(
     ClosureGuard done_guard(done);
     Controller* cntl = static_cast<Controller*>(controller_base);
     MallocExtension* malloc_ext = MallocExtension::instance();
-    if (malloc_ext == NULL) {
+    if (malloc_ext == nullptr) {
         cntl->SetFailed(ENOMETHOD, "%s, to enable growth profiler, check out "
                         "docs/cn/heap_profiler.md",
                         berror(ENOMETHOD));
@@ -302,10 +312,10 @@ static int ExtractSymbolsFromBinary(
     std::string line;
     while (std::getline(ss, line)) {
         butil::StringSplitter sp(line.c_str(), ' ');
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
-        char* endptr = NULL;
+        char* endptr = nullptr;
         uintptr_t addr = strtoull(sp.field(), &endptr, 16);
         if (*endptr != ' ') {
             continue;
@@ -317,7 +327,7 @@ static int ExtractSymbolsFromBinary(
             continue;
         }
         ++sp;
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
         if (sp.length() != 1UL) {
@@ -326,7 +336,7 @@ static int ExtractSymbolsFromBinary(
         //const char c = *sp.field();
         
         ++sp;
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
         const char* name_begin = sp.field();
@@ -393,15 +403,15 @@ static void LoadSymbols() {
     butil::Timer tm;
     tm.start();
     butil::ScopedFILE fp(fopen("/proc/self/maps", "r"));
-    if (fp == NULL) {
+    if (fp == nullptr) {
         return;
     }
-    char* line = NULL;
+    char* line = nullptr;
     size_t line_len = 0;
     ssize_t nr = 0;
     while ((nr = getline(&line, &line_len, fp.get())) != -1) {
         butil::StringSplitter sp(line, line + nr, ' ');
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
         char* endptr;
@@ -416,11 +426,11 @@ static void LoadSymbols() {
         }
         ++sp;
         // ..x. must be executable
-        if (sp == NULL || sp.length() != 4 || sp.field()[2] != 'x') {
+        if (sp == nullptr || sp.length() != 4 || sp.field()[2] != 'x') {
             continue;
         }
         ++sp;
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
         size_t offset = strtoull(sp.field(), &endptr, 16);
@@ -431,7 +441,7 @@ static void LoadSymbols() {
         for (int i = 0; i < 3; ++i) {
             ++sp;
         }
-        if (sp == NULL) {
+        if (sp == nullptr) {
             continue;
         }
         size_t n = sp.length();
@@ -541,7 +551,7 @@ void PProfService::symbol(
         std::vector<uintptr_t> addr_list;
         addr_list.reserve(32);
         butil::StringSplitter sp(addr_cstr, '+');
-        for ( ; sp != NULL; ++sp) {
+        for ( ; sp != nullptr; ++sp) {
             char* endptr;
             uintptr_t addr = strtoull(sp.field(), &endptr, 16);
             addr_list.push_back(addr);

@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2015/09/15 10:44:17
 
 #ifndef  BVAR_DETAIL_PERCENTILE_H
@@ -30,6 +32,9 @@
 #include "bvar/detail/combiner.h"       // AgentCombiner
 #include "bvar/detail/sampler.h"        // ReducerSampler
 #include "butil/fast_rand.h"
+#if WITH_BABYLON_COUNTER
+#include "babylon/concurrent/counter.h"
+#endif // WITH_BABYLON_COUNTER
 
 namespace bvar {
 namespace detail {
@@ -97,7 +102,7 @@ public:
             // No sample should be dropped
             CHECK_EQ(_num_samples, _num_added)
                 << "_num_added=" << _num_added
-                << " rhs._num_added" << rhs._num_added
+                << " rhs._num_added=" << rhs._num_added
                 << " _num_samples=" << _num_samples
                 << " rhs._num_samples=" << rhs._num_samples
                 << " SAMPLE_SIZE=" << SAMPLE_SIZE
@@ -136,6 +141,43 @@ public:
         }
         _num_added += rhs._num_added;
     }
+
+#if WITH_BABYLON_COUNTER
+    size_t merge(const babylon::ConcurrentSampler::SampleBucket& bucket) {
+        auto num_added = bucket.record_num.load(std::memory_order_acquire);
+        if (num_added == 0) {
+            return 0;
+        }
+        auto num_samples = std::min(num_added, static_cast<uint32_t>(bucket.capacity));
+        // If there is space, deposit directly.
+        if (_num_samples + num_samples <= SAMPLE_SIZE) {
+            __builtin_memcpy(_samples + _num_samples, bucket.data,
+                             sizeof(uint32_t) * num_samples);
+            _num_samples += num_samples;
+        } else {
+            // Sample probability weighting.
+            float ratio = static_cast<float>(num_samples) / num_added;
+            // Try to deposit directly first.
+            if (_num_samples < SAMPLE_SIZE) {
+                auto copy_size = SAMPLE_SIZE - _num_samples;
+                num_samples -= copy_size;
+                __builtin_memcpy(_samples + _num_samples,
+                                 bucket.data + num_samples, sizeof(uint32_t) * copy_size);
+            }
+            // The remaining samples are stored according to probability.
+            for (size_t i = 0; i < num_samples; ++i) {
+                auto index = butil::fast_rand() %
+                    static_cast<uint64_t>((_num_added + i) * ratio + 1);
+                if (index < SAMPLE_SIZE) {
+                    _samples[index] = bucket.data[i];
+                }
+            }
+            _num_samples = SAMPLE_SIZE;
+        }
+        _num_added += num_added;
+        return num_added;
+    }
+#endif // WITH_BABYLON_COUNTER
 
     // Randomly pick n samples from mutable_rhs to |this|
     template <size_t size2>
@@ -237,12 +279,15 @@ class AddLatency;
 template <size_t SAMPLE_SIZE_IN>
 class PercentileSamples {
 public:
+#if !WITH_BABYLON_COUNTER
 friend class AddLatency;
+#endif // WITH_BABYLON_COUNTER
 
     static const size_t SAMPLE_SIZE = SAMPLE_SIZE_IN;
     
-    PercentileSamples() {
-        memset(this, 0, sizeof(*this));
+    PercentileSamples()
+        : _num_added(0)
+        , _intervals() {
     }
 
     ~PercentileSamples() {
@@ -261,7 +306,7 @@ friend class AddLatency;
             if (rhs._intervals[i] && !rhs._intervals[i]->empty()) {
                 _intervals[i] = new PercentileInterval<SAMPLE_SIZE>(*rhs._intervals[i]);
             } else {
-                _intervals[i] = NULL;
+                _intervals[i] = nullptr;
             }
         }
     }
@@ -296,7 +341,7 @@ friend class AddLatency;
             return 0;
         }
         for (size_t i = 0; i < NUM_INTERVALS; ++i) {
-            if (_intervals[i] == NULL) {
+            if (_intervals[i] == nullptr) {
                 continue;
             }
             PercentileInterval<SAMPLE_SIZE>& invl = *_intervals[i];
@@ -321,6 +366,12 @@ friend class AddLatency;
             }
         }
     }
+
+#if WITH_BABYLON_COUNTER
+    void merge(const babylon::ConcurrentSampler::SampleBucket& bucket, size_t index) {
+        _num_added += get_interval_at(index).merge(bucket);
+    }
+#endif // WITH_BABYLON_COUNTER
 
     // Combine multiple into a single PercentileSamples
     template <typename Iterator>
@@ -411,7 +462,7 @@ template <size_t size1> friend class PercentileSamples;
 
     // Get/create interval on-demand.
     PercentileInterval<SAMPLE_SIZE>& get_interval_at(size_t index) {
-        if (_intervals[index] == NULL) {
+        if (_intervals[index] == nullptr) {
             _intervals[index] = new PercentileInterval<SAMPLE_SIZE>;
         }
         return *_intervals[index];
@@ -441,36 +492,48 @@ std::ostream &operator<<(std::ostream &os, const PercentileSamples<size> &p) {
 typedef PercentileSamples<254> GlobalPercentileSamples;
 typedef PercentileSamples<30> ThreadLocalPercentileSamples;
 
+namespace detail {
+struct AddPercentileSamples {
+    template <size_t size1, size_t size2>
+    void operator()(PercentileSamples<size1> &b1,
+                    const PercentileSamples<size2> &b2) const {
+        b1.merge(b2);
+    }
+};
+} // namespace detail
+
 // A specialized reducer for finding the percentile of latencies.
 // NOTE: DON'T use it directly, use LatencyRecorder instead.
+#if !WITH_BABYLON_COUNTER
 class Percentile {
 public:
-    struct AddPercentileSamples {
-        template <size_t size1, size_t size2>
-        void operator()(PercentileSamples<size1> &b1, 
-                        const PercentileSamples<size2> &b2) const {
-            b1.merge(b2);
-        }
-    };
-
-    typedef GlobalPercentileSamples                         value_type;
-    typedef ReducerSampler<Percentile, 
-                           GlobalPercentileSamples,
-                           AddPercentileSamples, VoidOp>    sampler_type;
+    typedef GlobalPercentileSamples value_type;
+    typedef ReducerSampler<Percentile, GlobalPercentileSamples,
+                           detail::AddPercentileSamples, VoidOp>sampler_type;
     typedef AgentCombiner <GlobalPercentileSamples,
                            ThreadLocalPercentileSamples,
-                           AddPercentileSamples>            combiner_type;
-    typedef combiner_type::Agent                            agent_type;
+                           detail::AddPercentileSamples> combiner_type;
+    typedef combiner_type::self_shared_type shared_combiner_type;
+    typedef combiner_type::Agent agent_type;
+
     Percentile();
     ~Percentile();
 
-    AddPercentileSamples op() const { return AddPercentileSamples(); }
+    detail::AddPercentileSamples op() const {
+        return detail::AddPercentileSamples();
+    }
     VoidOp inv_op() const { return VoidOp(); }
+
+    // Expose the shared data carrier, so that ReducerSampler holds it instead
+    // of `this`. Sampling then keeps reading valid memory even if this
+    // Percentile is destructed before the sampler is recycled.
+    shared_combiner_type share_combiner() const { return _combiner; }
 
     // The sampler for windows over percentile.
     sampler_type* get_sampler() {
-        if (NULL == _sampler) {
+        if (nullptr == _sampler) {
             _sampler = new sampler_type(this);
+            _sampler->set_debug_name(_debug_name);
             _sampler->schedule();
         }
         return _sampler;
@@ -482,20 +545,93 @@ public:
     
     Percentile& operator<<(int64_t latency);
 
-    bool valid() const { return _combiner != NULL && _combiner->valid(); }
+    bool valid() const { return _combiner != nullptr && _combiner->valid(); }
     
     // This name is useful for warning negative latencies in operator<<
     void set_debug_name(const butil::StringPiece& name) {
         _debug_name.assign(name.data(), name.size());
+        if (nullptr != _sampler) {
+            _sampler->set_debug_name(_debug_name);
+        }
     }
 
 private:
     DISALLOW_COPY_AND_ASSIGN(Percentile);
 
-    combiner_type*          _combiner;
-    sampler_type*           _sampler;
+    shared_combiner_type _combiner;
+    sampler_type* _sampler;
     std::string _debug_name;
 };
+#else
+class Percentile {
+public:
+    typedef GlobalPercentileSamples value_type;
+    typedef detail::AddPercentileSamples AddPercentileSamples;
+    typedef AddPercentileSamples Op;
+    typedef VoidOp InvOp;
+    typedef ReducerSampler<Percentile, value_type, Op, InvOp> sampler_type;
+
+    Percentile() {
+        // babylon::ConcurrentSampler defaults every per-value-range
+        // bucket to capacity 30 (see _bucket_capacity[32] in
+        // babylon/concurrent/counter.h) and only grows it inside
+        // Percentile::reset() after observing how many samples
+        // arrived. That means the *first* collection round always
+        // observes badly under-sampled buckets, which destabilises
+        // mid-quantile estimates (e.g. p60/p70 on a uniform 1..10000
+        // stream can land at ~5482/~6284 instead of ~6000/~7000 and
+        // make PercentileTest.add fail). Pre-size every bucket to the
+        // full SAMPLE_SIZE on construction so the very first reset()
+        // already sees representative samples.
+        for (size_t i = 0; i < NUM_INTERVALS; ++i) {
+            _concurrent_sampler.set_bucket_capacity(i, value_type::SAMPLE_SIZE);
+        }
+    }
+
+    DISALLOW_COPY_AND_MOVE(Percentile);
+    ~Percentile() noexcept {
+        if (nullptr != _sampler) {
+            _sampler->destroy();
+        }
+    }
+
+    Op op() const { return Op(); }
+    InvOp inv_op() const { return InvOp(); }
+
+    sampler_type* get_sampler() {
+        if (nullptr == _sampler) {
+            _sampler = new sampler_type(this);
+            _sampler->set_debug_name(_debug_name);
+            _sampler->schedule();
+        }
+        return _sampler;
+    }
+
+    value_type reset();
+
+    value_type get_value() const {
+        LOG_EVERY_SECOND(ERROR) << "Percentile should never call this get_value()";
+        return value_type();
+    }
+
+    Percentile& operator<<(int64_t value);
+
+    bool valid() const { return true; }
+
+    // This name is useful for warning negative latencies in operator<<
+    void set_debug_name(const butil::StringPiece& name) {
+        _debug_name.assign(name.data(), name.size());
+        if (nullptr != _sampler) {
+            _sampler->set_debug_name(_debug_name);
+        }
+    }
+
+private:
+    babylon::ConcurrentSampler _concurrent_sampler;
+    sampler_type* _sampler{nullptr};
+    std::string _debug_name;
+};
+#endif // WITH_BABYLON_COUNTER
 
 }  // namespace detail
 }  // namespace bvar

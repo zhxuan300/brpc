@@ -1,5 +1,51 @@
-# Quick introduction
+- [bvar Introduction](#bvar-introduction)
+- [bvar::Variable](#bvarvariable)
+- [Export all variables](#export-all-variables)
+- [bvar::Reducer](#bvarreducer)
+    - [bvar::Adder](#bvaradder)
+    - [bvar::Maxer](#bvarmaxer)
+    - [bvar::Miner](#bvarminer)
+- [bvar::IntRecorder](#bvarintrecorder)
+- [bvar::LatencyRecorder](#bvarlatencyrecorder)
+- [bvar::Histogram](#bvarhistogram)
+- [bvar::Window](#bvarwindow)
+    - [How to use bvar::Window](#how-to-use-bvarwindow)
+- [bvar::PerSecond](#bvarpersecond)
+    - [Difference with Window](#difference-with-window)
+- [bvar::WindowEx](#bvarwindowex)
+    - [How to use bvar::WindowEx](#how-to-use-bvarwindowex)
+    - [Difference between bvar::WindowEx and bvar::Window](#difference-between-bvarwindowex-and-bvarwindow)
+- [bvar::PerSecondEx](#bvarpersecondex)
+    - [How to use bvar::PerSecondEx](#how-to-use-bvarpersecondex)
+    - [Difference between bvar::PerSecondEx and bvar::WindowEx](#difference-between-bvarpersecondex-and-bvarwindowex)
+    - [Difference between bvar::PerSecondEx and bvar::PerSecond](#difference-between-bvarpersecondex-and-bvarpersecond)
+- [bvar::Status](#bvarstatus)
+- [bvar::PassiveStatus](#bvarpassivestatus)
+- [bvar::GFlag](#bvargflag)
 
+# bvar Introduction
+
+单维度bvar使用文档，多维度mbvar请[移步](mbvar_c++.md)。
+
+bvar分为多个具体的类，常用的有：
+
+| 类型 | 说明 |
+|-----------------|-----------------------------------------------------------------------------------------|
+| bvar::Adder\<T\>| 计数器，默认0，varname << N相当于varname += N |
+| bvar::Maxer\<T\> | 求最大值，默认std::numeric_limits<T>::min()，varname << N相当于varname = max(varname, N) |
+| bvar::Miner\<T\>| 求最小值，默认std::numeric_limits<T>::max()，varname << N相当于varname = min(varname, N) |
+| bvar::IntRecorder| 求自使用以来的平均值。注意这里的定语不是“一段时间内”。一般要通过Window衍生出时间窗口内的平均值      |
+| bvar::Window\<VAR\>| 获得某个bvar在一段时间内的累加值。Window衍生于已存在的bvar，会自动更新 |
+| bvar::PerSecond\<VAR\>| 获得某个bvar在一段时间内平均每秒的累加值。PerSecond也是会自动更新的衍生变量 |
+| bvar::WindowEx\<T\> | 获得某个bvar在一段时间内的累加值。不依赖其他的bvar，需要给它发送数据 |
+| bvar::PerSecondEx\<T\>|  获得某个bvar在一段时间内平均每秒的累加值。不依赖其他的bvar，需要给它发送数据 |
+| bvar::LatencyRecorder| 专用于记录延时和qps的变量。输入延时，平均延时/最大延时/qps/总次数 都有了 |
+| bvar::Histogram | 把观测值落到一组固定的桶里，只导出各个桶的计数，分位值由监控系统算。创建时必须显式给出桶的上界 |
+| bvar::Status\<T\> | 记录和显示一个值，拥有额外的set_value函数 |
+| bvar::PassiveStatus | 按需显示值。在一些场合中，我们无法set_value或不知道以何种频率set_value，更适合的方式也许是当需要显示时才打印。用户传入打印回调函数实现这个目的 |
+| bvar::GFlag | 将重要的gflags公开为bvar，以便监控它们 |
+
+例子：
 ```c++
 #include <bvar/bvar.h>
 
@@ -14,7 +60,7 @@ bvar::Window<bvar::Adder<int> > g_read_error_minute("foo_bar", "read_error", &g_
 //                                                    前缀       监控项名称                  60秒,忽略则为10秒
 
 // bvar::LatencyRecorder是一个复合变量，可以统计：总量、qps、平均延时，延时分位值，最大延时。
-bvar::LatencyRecorder g_write_latency(“foo_bar", "write”);
+bvar::LatencyRecorder g_write_latency("foo_bar", "write");
 //                                      ^          ^
 //                                     前缀       监控项，别加latency！LatencyRecorder包含多个bvar，它们会加上各自的后缀，比如write_qps, write_latency等等。
 
@@ -44,17 +90,7 @@ foo::bar::g_task_pushed << 1;
 
 注意Window<>和PerSecond<>都是衍生变量，会自动更新，你不用给它们推值。你当然也可以把bvar作为成员变量或局部变量。
 
-常用的bvar有：
-
-- `bvar::Adder<T>` : 计数器，默认0，varname << N相当于varname += N。
-- `bvar::Maxer<T>` : 求最大值，默认std::numeric_limits<T>::min()，varname << N相当于varname = max(varname, N)。
-- `bvar::Miner<T>` : 求最小值，默认std::numeric_limits<T>::max()，varname << N相当于varname = min(varname, N)。
-- `bvar::IntRecorder` : 求自使用以来的平均值。注意这里的定语不是“一段时间内”。一般要通过Window衍生出时间窗口内的平均值。
-- `bvar::Window<VAR>` : 获得某个bvar在一段时间内的累加值。Window衍生于已存在的bvar，会自动更新。
-- `bvar::PerSecond<VAR>` : 获得某个bvar在一段时间内平均每秒的累加值。PerSecond也是会自动更新的衍生变量。
-- `bvar::LatencyRecorder` : 专用于记录延时和qps的变量。输入延时，平均延时/最大延时/qps/总次数 都有了。
-
-**确认变量名是全局唯一的！**否则会曝光失败，如果-bvar_abort_on_same_name为true，程序会直接abort。
+**确认变量名是全局唯一的！** 否则会曝光失败，如果-bvar_abort_on_same_name为true，程序会直接abort。
 
 程序中有来自各种模块不同的bvar，为避免重名，建议如此命名：**模块_类名_指标**
 
@@ -87,7 +123,7 @@ rpc_socket_count : 6                            # 模块=rpc     类名=socket  
 ```c++
 namespace foo {
 namespace bar {
-// 注意g_read_error_minute和g_task_pushed_per_second都是衍生的bvar，会自动更新，不要声明。
+// 注意g_read_error_minute和g_task_pushed_second都是衍生的bvar，会自动更新，不要声明。
 extern bvar::Adder<int> g_read_error;
 extern bvar::LatencyRecorder g_write_latency;
 extern bvar::Adder<int> g_task_pushed;
@@ -135,7 +171,7 @@ public:
 
 Variable是所有bvar的基类，主要提供全局注册，列举，查询等功能。
 
-用户以默认参数建立一个bvar时，这个bvar并未注册到任何全局结构中，在这种情况下，bvar纯粹是一个更快的计数器。我们称把一个bvar注册到全局表中的行为为”曝光“，可通过**expose**函数曝光：
+用户以默认参数建立一个bvar时，这个bvar并未注册到任何全局结构中，在这种情况下，bvar纯粹是一个更快的计数器。我们称把一个bvar注册到全局表中的行为为“曝光”，可通过`expose`函数曝光：
 ```c++
 // Expose this variable globally so that it's counted in following functions:
 //   list_exposed
@@ -144,11 +180,11 @@ Variable是所有bvar的基类，主要提供全局注册，列举，查询等�
 //   find_exposed
 // Return 0 on success, -1 otherwise.
 int expose(const butil::StringPiece& name);
-int expose(const butil::StringPiece& prefix, const butil::StringPiece& name);
+int expose_as(const butil::StringPiece& prefix, const butil::StringPiece& name);
 ```
 全局曝光后的bvar名字便为name或prefix + name，可通过以_exposed为后缀的static函数查询。比如Variable::describe_exposed(name)会返回名为name的bvar的描述。
 
-当相同名字的bvar已存在时，expose会打印FATAL日志并返回-1。如果选项**--bvar_abort_on_same_name**设为true (默认是false)，程序会直接abort。
+当相同名字的bvar已存在时，expose会打印FATAL日志并返回-1。如果选项 **-bvar_abort_on_same_name**设为true (默认是false)，程序会直接abort。
 
 下面是一些曝光bvar的例子：
 ```c++
@@ -168,7 +204,7 @@ bvar::Status<std::string> status1("count2", "hello");  // the name conflicts. if
                                                        // program aborts, otherwise a fatal log is printed.
 ```
 
-为避免重名，bvar的名字应加上前缀，建议为<namespace>_<module>_<name>。为了方便使用，我们提供了**expose_as**函数，接收一个前缀。
+为避免重名，bvar的名字应加上前缀，建议为`<namespace>_<module>_<name>`。为了方便使用，我们提供了**expose_as**函数，接收一个前缀。
 ```c++
 // Expose this variable with a prefix.
 // Example:
@@ -221,11 +257,11 @@ dump功能由如下gflags控制：
 | ------------------ | ----------------------- | ---------------------------------------- |
 | bvar_dump          | false                   | Create a background thread dumping all bvar periodically, all bvar_dump_* flags are not effective when this flag is off |
 | bvar_dump_exclude  | ""                      | Dump bvar excluded from these wildcards(separated by comma), empty means no exclusion |
-| bvar_dump_file     | monitor/bvar.<app>.data | Dump bvar into this file                 |
+| bvar_dump_file     | monitor/bvar.\<app\>.data | Dump bvar into this file                 |
 | bvar_dump_include  | ""                      | Dump bvar matching these wildcards(separated by comma), empty means including all |
 | bvar_dump_interval | 10                      | Seconds between consecutive dump         |
 | bvar_dump_prefix   | \<app\>                 | Every dumped name starts with this prefix |
-| bvar_dump_tabs     | \<check the code\>      | Dump bvar into different tabs according to the filters (seperated by semicolon), format: *(tab_name=wildcards) |
+| bvar_dump_tabs     | \<check the code\>      | Dump bvar into different tabs according to the filters (separated by semicolon), format: *(tab_name=wildcards) |
 
 当bvar_dump_file不为空时，程序会启动一个后台导出线程以bvar_dump_interval指定的间隔更新bvar_dump_file，其中包含了被bvar_dump_include匹配且不被bvar_dump_exclude匹配的所有bvar。
 
@@ -257,6 +293,7 @@ if (google::SetCommandLineOption("bvar_dump_include", "*service*").empty()) {
 }
 LOG(INFO) << "Successfully set bvar_dump_include to *service*";
 ```
+
 请勿直接设置FLAGS_bvar_dump_file / FLAGS_bvar_dump_include / FLAGS_bvar_dump_exclude。
 一方面这些gflag类型都是std::string，直接覆盖是线程不安全的；另一方面不会触发validator（检查正确性的回调），所以也不会启动后台导出线程。
 
@@ -291,7 +328,7 @@ class Variable {
     ...
     // Find all exposed variables matching `white_wildcards' but
     // `black_wildcards' and send them to `dumper'.
-    // Use default options when `options' is NULL.
+    // Use default options when `options' is nullptr.
     // Return number of dumped variables, -1 on error.
     static int dump_exposed(Dumper* dumper, const DumpOptions* options);
 };
@@ -319,7 +356,7 @@ reducer << e1 << e2 << e3的作用等价于reducer = e1 op e2 op e3。
 顾名思义，用于累加，Op为+。
 ```c++
 bvar::Adder<int> value;
-value<< 1 << 2 << 3 << -4;
+value << 1 << 2 << 3 << -4;
 CHECK_EQ(2, value.get_value());
 
 bvar::Adder<double> fp_value;  // 可能有warning
@@ -340,7 +377,7 @@ CHECK_EQ("hello world", concater.get_value());
 用于取最大值，运算符为std::max。
 ```c++
 bvar::Maxer<int> value;
-value<< 1 << 2 << 3 << -4;
+value << 1 << 2 << 3 << -4;
 CHECK_EQ(3, value.get_value());
 ```
 Since Maxer<> use std::numeric_limits<T>::min() as the identity, it cannot be applied to generic types unless you specialized std::numeric_limits<> (and overloaded operator<, yes, not operator>).
@@ -350,7 +387,7 @@ Since Maxer<> use std::numeric_limits<T>::min() as the identity, it cannot be ap
 用于取最小值，运算符为std::min。
 ```c++
 bvar::Maxer<int> value;
-value<< 1 << 2 << 3 << -4;
+value << 1 << 2 << 3 << -4;
 CHECK_EQ(-4, value.get_value());
 ```
 Since Miner<> use std::numeric_limits<T>::max() as the identity, it cannot be applied to generic types unless you specialized std::numeric_limits<> (and overloaded operator<).
@@ -382,6 +419,56 @@ LatencyRecorder write_latency("table2_my_table_write");  // produces 4 variables
 write_latency << the_latency_of_write;
 ```
 
+# bvar::Histogram
+
+把数据落到一组固定的桶里，统计每个桶的数量，也就是prometheus的histogram。
+
+```c++
+// 显式选择桶的上界，另有一个+Inf桶
+bvar::Histogram g_write_latency("table2_my_table_write_latency",
+                                {10, 20, 50, 100, 500, 1000, 5000});
+// In your write function
+g_write_latency << the_latency_of_write;
+```
+
+Histogram也没有默认构造函数，桶的上界必须在创建时给出（initializer_list / vector)：
+
+```c++
+bvar::Histogram g_size("foo_size", {128, 1024, 8192, 65536});
+
+std::vector<double> bounds = LoadBoundsFromConfig();
+bvar::Histogram g_size2("foo_size2", bvar::Histogram::BucketSchema(bounds));
+```
+
+桶的上界由Histogram::BucketSchema描述，语义与prometheus的`le`一致：下标i的桶统计满足`bound_at(i-1) < v <= bound_at(i)`的v，最后额外有一个`+Inf`桶。
+
+桶数上限是`MAX_HISTOGRAM_BUCKETS`（32，含`+Inf`）。边界和观测值均使用double，上界必须有限、严格递增且非空；不满足时Histogram::BucketSchema会打error日志并丢掉有问题的上界（全空则退化为`{1}`），非有限的观测值会被忽略。
+
+一个Histogram导出为一族prometheus指标，而不是一个值：
+```
+# HELP table2_my_table_write_latency
+# TYPE table2_my_table_write_latency histogram
+table2_my_table_write_latency_bucket{le="10"} 3
+table2_my_table_write_latency_bucket{le="20"} 17
+...
+table2_my_table_write_latency_bucket{le="+Inf"} 4021
+table2_my_table_write_latency_sum 1234567
+table2_my_table_write_latency_count 4021
+```
+
+桶计数从构造起一直累加、不会减少，导出时转换为prometheus期望的按`le`累计的计数。分位值由prometheus监控系统计算：`histogram_quantile(0.99, sum by (le)(rate(table2_my_table_write_latency_bucket[1m])))`。
+
+想在进程内看最近一段时间的分布，套一个Window，读它的桶计数：
+```c++
+bvar::Window<bvar::Histogram> g_write_latency_1m(&g_write_latency, 60);
+// 最近60秒的分布：counts[i]是落在对应桶区间内的个数，
+// 不是prometheus导出格式中跨桶累计的计数
+bvar::Histogram::Value v = g_write_latency_1m.get_value();
+```
+注意：Window<Histogram>::describe()只能输出json，所以prometheus抓取不到Window<Histogram>。
+
+Histogram也可以放进MultiDimension，用法见[mbvar文档](mbvar_c++.md#bvarhistogram)。
+
 # bvar::Window
 
 获得之前一段时间内的统计值。Window不能独立存在，必须依赖于一个已有的计数器。Window会自动更新，不用给它发送数据。出于性能考虑，Window的数据来自于每秒一次对原计数器的采样，在最差情况下，Window的返回值有1秒的延时。
@@ -394,6 +481,22 @@ write_latency << the_latency_of_write;
 // - defined value_type and sampler_type
 template <typename R>
 class Window : public Variable;
+```
+
+## How to use bvar::Window
+```c++
+bvar::Adder<int> sum;
+bvar::Maxer<int> max_value;
+bvar::IntRecorder avg_value;
+  
+// sum_minute.get_value()是sum在之前60秒内的累加值。
+bvar::Window<bvar::Adder<int> > sum_minute(&sum, 60);
+  
+// max_value_minute.get_value()是max_value在之前60秒内的最大值。
+bvar::Window<bvar::Maxer<int> > max_value_minute(&max_value, 60);
+ 
+// avg_value_minute.get_value()是avg_value在之前60秒内的平均值。
+bvar::Window<IntRecorder> avg_value_minute(&avg_value, 60);
 ```
 
 # bvar::PerSecond
@@ -418,17 +521,125 @@ bvar::PerSecond<bvar::Maxer<int> > max_value_per_second_wrong(&max_value);
 bvar::Window<bvar::Maxer<int> > max_value_per_second(&max_value, 1);
 ```
 
-## 和Window的差别
+## Difference with Window
 
 比如要统计内存在上一分钟内的变化，用Window<>的话，返回值的含义是”上一分钟内存增加了18M”，用PerSecond<>的话，返回值的含义是“上一分钟平均每秒增加了0.3M”。
 
 Window的优点是精确值，适合一些比较小的量，比如“上一分钟的错误数“，如果这用PerSecond的话，得到可能是”上一分钟平均每秒产生了0.0167个错误"，这相比于”上一分钟有1个错误“显然不够清晰。另外一些和时间无关的量也要用Window，比如统计上一分钟cpu占用率的方法是用一个Adder同时累加cpu时间和真实时间，然后用Window获得上一分钟的cpu时间和真实时间，两者相除就得到了上一分钟的cpu占用率，这和时间无关，用PerSecond会产生错误的结果。
 
+# bvar::WindowEx
+
+获得之前一段时间内的统计值。WindowEx是独立存在的，不依赖其他的计数器，需要给它发送数据。出于性能考虑，WindowEx每秒对数据做一次统计，在最差情况下，WindowEx的返回值有1秒的延时。
+```c++
+// Get data within a time window.
+// The time unit is 1 second fixed.
+// Window not relies on other bvar.
+ 
+// R must:
+// - window_size must be a constant
+template <typename R, time_t window_size = 0>
+class WindowEx : public adapter::WindowExAdapter<R, adapter::WindowExType<R> > {
+public:
+    typedef adapter::WindowExAdapter<R, adapter::WindowExType<R> > Base;
+ 
+    WindowEx() : Base(window_size) {}
+ 
+    WindowEx(const base::StringPiece& name) : Base(window_size) {
+        this->expose(name);
+    }
+ 
+    WindowEx(const base::StringPiece& prefix,
+             const base::StringPiece& name)
+        : Base(window_size) {
+        this->expose_as(prefix, name);
+    }
+};
+```
+
+## How to use bvar::WindowEx
+```c++
+const int window_size = 60;
+ 
+// sum_minute.get_value()是60秒内的累加值，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+bvar::WindowEx<bvar::Adder<int>, window_size> sum_minute("sum_minute");
+sum_minute << 1 << 2 << 3;
+ 
+// max_minute.get_value()是60秒内的最大值，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+bvar::WindowEx<bvar::Maxer<int>, window_size> max_minute("max_minute");
+max_minute << 1 << 2 << 3;
+ 
+// min_minute.get_value()是60秒内的最小值，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+bvar::WindowEx<bvar::Miner<int>, window_size> min_minute("min_minute");
+min_minute << 1 << 2 << 3;
+ 
+// avg_minute.get_value是60秒内的平均值(返回值是bvar::Stat)，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+bvar::WindowEx<bvar::IntRecorder, window_size> avg_minute("avg_minute");
+avg_minute << 1 << 2 << 3;
+// 获得avg_minuter 60秒内的平均值stat
+bvar::Stat avg_stat = avg_minute.get_value();
+// 获得整型平均值
+int64_t avg_int = avg_stat.get_average_int();
+// 获得double类型平均值
+double avg_double = avg_stat.get_average_double();
+```
+
+## Difference between bvar::WindowEx and bvar::Window
+
+- bvar::Window 不能独立存在，必须依赖于一个已有的计数器。Window会自动更新，不用给它发送数据；window_size是通过构造函数参数传递的。
+
+- bvar::WindowEx 是独立存在的，不依赖其他的计数器，需要给它发送数据。使用起来比较方便；window_size是通过模板参数传递的，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+
+# bvar::PerSecondEx
+获得之前一段时间内平均每秒的统计值。它和WindowEx基本相同，除了返回值会除以时间窗口之外。
+```c++
+// Get data per second within a time window.
+// The only difference between PerSecondEx and WindowEx is that PerSecondEx divides
+// the data by time duration.
+ 
+// R must:
+// - window_size must be a constant
+template <typename R, time_t window_size = 0>
+class PerSecondEx : public adapter::WindowExAdapter<R, adapter::PerSecondExType<R> > {
+public:
+    typedef adapter::WindowExAdapter<R, adapter::PerSecondExType<R> > Base;
+ 
+    PerSecondEx() : Base(window_size) {}
+ 
+    PerSecondEx(const base::StringPiece& name) : Base(window_size) {
+        this->expose(name);
+    }
+ 
+    PerSecondEx(const base::StringPiece& prefix,
+                const base::StringPiece& name)
+        : Base(window_size) {
+        this->expose_as(prefix, name);
+    }
+};
+```
+
+## How to use bvar::PerSecondEx
+
+```c++
+const int window_size = 60;
+ 
+// sum_per_second.get_value()是60秒内*平均每秒*的累加值，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+bvar::PerSecondEx<bvar::Adder<int>, window_size> sum_per_second("sum_per_second");
+sum_per_second << 1 << 2 << 3;
+```
+
+## Difference between bvar::PerSecondEx and bvar::WindowEx
+
+- bvar::PerSecondEx 获得之前一段时间内平均每秒的统计值。它和WindowEx基本相同，除了返回值会除以时间窗口之外。
+
+## Difference between bvar::PerSecondEx and bvar::PerSecond
+- bvar::PerSecond 不能独立存在，必须依赖于一个已有的计数器。PerSecond会自动更新，不用给它发送数据；window_size是通过构造函数参数传递的。
+- bvar::PerSecondEx 是独立存在的，不依赖其他的计数器，需要给它发送数据。使用起来比较方便；window_size是通过模板参数传递的，省略最后一个window_size(时间窗口)的话默认为bvar_dump_interval。
+
 # bvar::Status
 
 记录和显示一个值，拥有额外的set_value函数。
-```c++
 
+```c++
 // Display a rarely or periodically updated value.
 // Usage:
 //   bvar::Status<int> foo_count1(17);
@@ -466,7 +677,6 @@ class PassiveStatus : public Variable;
 ```
 虽然很简单，但PassiveStatus是最有用的bvar之一，因为很多统计量已经存在，我们不需要再次存储它们，而只要按需获取。比如下面的代码声明了一个在linux下显示进程用户名的bvar：
 ```c++
-
 static void get_username(std::ostream& os, void*) {
     char buf[32];
     if (getlogin_r(buf, sizeof(buf)) == 0) {
@@ -476,16 +686,15 @@ static void get_username(std::ostream& os, void*) {
         os << "unknown";
     }
 }
-PassiveStatus<std::string> g_username("process_username", get_username, NULL);
+PassiveStatus<std::string> g_username("process_username", get_username, nullptr);
 ```
 
 # bvar::GFlag
-
-Expose important gflags as bvar so that they're monitored (in noah).
+Expose important gflags as bvar so that they're monitored.
 ```c++
 DEFINE_int32(my_flag_that_matters, 8, "...");
 
-// Expose the gflag as *same-named* bvar so that it's monitored (in noah).
+// Expose the gflag as *same-named* bvar so that it's monitored.
 static bvar::GFlag s_gflag_my_flag_that_matters("my_flag_that_matters");
 //                                                ^
 //                                            the gflag name
@@ -493,3 +702,8 @@ static bvar::GFlag s_gflag_my_flag_that_matters("my_flag_that_matters");
 // Expose the gflag as a bvar named "foo_bar_my_flag_that_matters".
 static bvar::GFlag s_gflag_my_flag_that_matters_with_prefix("foo_bar", "my_flag_that_matters");
 ```
+# babylon counter bvar
+
+原理和性能见[babylon介绍](https://github.com/baidu/babylon/tree/main/example/use-counter-with-bvar)。
+
+目前只支持bazel编译方式：`--define with_babylon_counter=true`，babylon版本要求：>= 1.4.4。打开开关后，即可使用基于babylon counter实现的更高性能的bvar，无需修改代码。

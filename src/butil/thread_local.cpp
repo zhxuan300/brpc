@@ -1,18 +1,20 @@
-// Copyright (c) 2011 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
  
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Mon. Nov 7 14:47:36 CST 2011
 
 #include <errno.h>                       // errno
@@ -45,7 +47,7 @@ public:
             if (_fns.capacity() < 16) {
                 _fns.reserve(16);
             }
-            _fns.push_back(std::make_pair(fn, arg));
+            _fns.emplace_back(fn, arg);
         } catch (...) {
             errno = ENOMEM;
             return -1;
@@ -79,7 +81,7 @@ static void helper_exit_global() {
     detail::ThreadExitHelper* h = 
         (detail::ThreadExitHelper*)pthread_getspecific(detail::thread_atexit_key);
     if (h) {
-        pthread_setspecific(detail::thread_atexit_key, NULL);
+        pthread_setspecific(detail::thread_atexit_key, nullptr);
         delete h;
     }
 }
@@ -99,9 +101,9 @@ detail::ThreadExitHelper* get_or_new_thread_exit_helper() {
 
     detail::ThreadExitHelper* h =
         (detail::ThreadExitHelper*)pthread_getspecific(detail::thread_atexit_key);
-    if (NULL == h) {
+    if (nullptr == h) {
         h = new (std::nothrow) detail::ThreadExitHelper;
-        if (NULL != h) {
+        if (nullptr != h) {
             pthread_setspecific(detail::thread_atexit_key, h);
         }
     }
@@ -120,7 +122,7 @@ static void call_single_arg_fn(void* fn) {
 }  // namespace detail
 
 int thread_atexit(void (*fn)(void*), void* arg) {
-    if (NULL == fn) {
+    if (nullptr == fn) {
         errno = EINVAL;
         return -1;
     }
@@ -133,7 +135,7 @@ int thread_atexit(void (*fn)(void*), void* arg) {
 }
 
 int thread_atexit(void (*fn)()) {
-    if (NULL == fn) {
+    if (nullptr == fn) {
         errno = EINVAL;
         return -1;
     }
@@ -141,7 +143,7 @@ int thread_atexit(void (*fn)()) {
 }
 
 void thread_atexit_cancel(void (*fn)(void*), void* arg) {
-    if (fn != NULL) {
+    if (fn != nullptr) {
         detail::ThreadExitHelper* h = detail::get_thread_exit_helper();
         if (h) {
             h->remove(fn, arg);
@@ -150,7 +152,7 @@ void thread_atexit_cancel(void (*fn)(void*), void* arg) {
 }
 
 void thread_atexit_cancel(void (*fn)()) {
-    if (NULL != fn) {
+    if (nullptr != fn) {
         thread_atexit_cancel(detail::call_single_arg_fn, (void*)fn);
     }
 }

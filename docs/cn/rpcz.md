@@ -13,6 +13,7 @@
 | rpcz_database_dir          | ./rpc_data/rpcz      | For storing requests/contexts collected by rpcz. | src/baidu/rpc/span.cpp                 |
 | rpcz_keep_span_db          | false                | Don't remove DB of rpcz at program's exit | src/baidu/rpc/span.cpp                 |
 | rpcz_keep_span_seconds (R) | 3600                 | Keep spans for at most so many seconds   | src/baidu/rpc/span.cpp                 |
+| rpcz_save_span_min_latency_us (R) | 0 (default:0) | The minimum latency microseconds of span saved | src/baidu/rpc/span.cpp |
 
 若启动时未加-enable_rpcz，则可在启动后访问SERVER_URL/rpcz/enable动态开启rpcz，访问SERVER_URL/rpcz/disable则关闭，这两个链接等价于访问SERVER_URL/flags/enable_rpcz?setvalue=true和SERVER_URL/flags/enable_rpcz?setvalue=false。在r31010之后，rpc在html版本中增加了一个按钮可视化地开启和关闭。
 
@@ -48,10 +49,31 @@
 
 ## Annotation
 
-只要你使用了brpc，就可以使用[TRACEPRINTF](https://github.com/brpc/brpc/blob/master/src/brpc/traceprintf.h)打印内容到事件流中，比如：
+只要你使用了brpc，就可以使用[TRACEPRINTF](https://github.com/apache/brpc/blob/master/src/brpc/traceprintf.h)打印内容到事件流中，比如：
 
 ```c++
 TRACEPRINTF("Hello rpcz %d", 123);
 ```
 
 这条annotation会按其发生时间插入到对应请求的rpcz中。从这个角度看，rpcz是请求级的日志。如果你用TRACEPRINTF打印了沿路的上下文，便可看到请求在每个阶段停留的时间，牵涉到的数据集和参数。这是个很有用的功能。
+
+## 跨bthread传递trace上下文
+
+有的业务在处理server请求的时候，会创建子bthread，在子bthread中发起rpc调用。默认情况下，子bthread中的rpc调用跟原来的请求无法建立关联，trace就会断掉。这种情况下，可以在创建子bthread时，指定BTHREAD_INHERIT_SPAN标志，来显式地建立trace上文关联，如：
+
+```c++
+bthread_attr_t attr = { BTHREAD_STACKTYPE_NORMAL, BTHREAD_INHERIT_SPAN, nullptr };
+bthread_start_urgent(&tid, &attr, thread_proc, arg);
+```
+
+### Span生命周期管理
+
+brpc使用智能指针（`std::shared_ptr`/`std::weak_ptr`）管理Span对象的生命周期，并通过自旋锁保护并发访问，解决了以下问题：
+
+1. **Use-after-free防护**：父Span通过`shared_ptr`持有子Span的强引用，TLS中使用`weak_ptr`存储，确保Span对象在被访问时仍然有效。即使server在子bthread完成前返回response，也不会导致访问已释放的Span对象。
+
+2. **线程安全**：使用自旋锁保护`_client_list`和`_info`的并发修改，支持多个bthread同时创建子span或添加annotation。
+
+3. **自动生命周期管理**：当父Span销毁时，会自动清理所有子Span（通过`_client_list.clear()`），无需手动管理。
+
+使用`BTHREAD_INHERIT_SPAN`创建子bthread时，不再需要担心Span对象的生命周期问题，可以安全地在异步场景中使用。

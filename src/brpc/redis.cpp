@@ -1,136 +1,41 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-
-#define INTERNAL_SUPPRESS_PROTOBUF_FIELD_DEPRECATION
-#include <algorithm>
-#include <gflags/gflags.h>
-#include <google/protobuf/stubs/once.h>
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/wire_format_lite_inl.h>
-#include <google/protobuf/descriptor.h>
-#include <google/protobuf/reflection_ops.h>
-#include <google/protobuf/wire_format.h>
-#include "butil/string_printf.h"
-#include "butil/macros.h"
-#include "brpc/controller.h"
 #include "brpc/redis.h"
-#include "brpc/redis_command.h"
 
+#include <gflags/gflags.h>
+#include <google/protobuf/reflection_ops.h> // ReflectionOps::Merge
+
+#include "brpc/redis_command.h"
+#include "brpc/proto_base.pb.h"
+#include "butil/status.h"
+#include "butil/strings/string_util.h" // StringToLowerASCII
 
 namespace brpc {
 
 DEFINE_bool(redis_verbose_crlf2space, false, "[DEBUG] Show \\r\\n as a space");
 
-// Internal implementation detail -- do not call these.
-void protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto_impl();
-void protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-void protobuf_AssignDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-void protobuf_ShutdownFile_baidu_2frpc_2fredis_5fbase_2eproto();
-
-namespace {
-
-const ::google::protobuf::Descriptor* RedisRequest_descriptor_ = NULL;
-const ::google::protobuf::Descriptor* RedisResponse_descriptor_ = NULL;
-
-}  // namespace
-
-void protobuf_AssignDesc_baidu_2frpc_2fredis_5fbase_2eproto() {
-    protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-    const ::google::protobuf::FileDescriptor* file =
-        ::google::protobuf::DescriptorPool::generated_pool()->FindFileByName(
-            "baidu/rpc/redis_base.proto");
-    GOOGLE_CHECK(file != NULL);
-    RedisRequest_descriptor_ = file->message_type(0);
-    RedisResponse_descriptor_ = file->message_type(1);
-}
-
-namespace {
-
-GOOGLE_PROTOBUF_DECLARE_ONCE(protobuf_AssignDescriptors_once_);
-inline void protobuf_AssignDescriptorsOnce() {
-    ::google::protobuf::GoogleOnceInit(&protobuf_AssignDescriptors_once_,
-                                       &protobuf_AssignDesc_baidu_2frpc_2fredis_5fbase_2eproto);
-}
-
-void protobuf_RegisterTypes(const ::std::string&) {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::MessageFactory::InternalRegisterGeneratedMessage(
-        RedisRequest_descriptor_, &RedisRequest::default_instance());
-    ::google::protobuf::MessageFactory::InternalRegisterGeneratedMessage(
-        RedisResponse_descriptor_, &RedisResponse::default_instance());
-}
-
-}  // namespace
-
-void protobuf_ShutdownFile_baidu_2frpc_2fredis_5fbase_2eproto() {
-    delete RedisRequest::default_instance_;
-    delete RedisResponse::default_instance_;
-}
-
-void protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto_impl() {
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-
-#if GOOGLE_PROTOBUF_VERSION >= 3002000
-    ::google::protobuf::internal::InitProtobufDefaults();
-#else
-    ::google::protobuf::protobuf_AddDesc_google_2fprotobuf_2fdescriptor_2eproto();
-#endif
-  ::google::protobuf::DescriptorPool::InternalAddGeneratedFile(
-    "\n\032baidu/rpc/redis_base.proto\022\tbaidu.rpc\032"
-    " google/protobuf/descriptor.proto\"\016\n\014Red"
-    "isRequest\"\017\n\rRedisResponseB\003\200\001\001", 111);
-  ::google::protobuf::MessageFactory::InternalRegisterGeneratedFile(
-    "baidu/rpc/redis_base.proto", &protobuf_RegisterTypes);
-  RedisRequest::default_instance_ = new RedisRequest();
-  RedisResponse::default_instance_ = new RedisResponse();
-  RedisRequest::default_instance_->InitAsDefaultInstance();
-  RedisResponse::default_instance_->InitAsDefaultInstance();
-  ::google::protobuf::internal::OnShutdown(&protobuf_ShutdownFile_baidu_2frpc_2fredis_5fbase_2eproto);
-}
-
-GOOGLE_PROTOBUF_DECLARE_ONCE(protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto_once);
-void protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto() {
-    ::google::protobuf::GoogleOnceInit(
-        &protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto_once,
-        &protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto_impl);
-}
-
-// Force AddDescriptors() to be called at static initialization time.
-struct StaticDescriptorInitializer_baidu_2frpc_2fredis_5fbase_2eproto {
-    StaticDescriptorInitializer_baidu_2frpc_2fredis_5fbase_2eproto() {
-        protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-    }
-} static_descriptor_initializer_baidu_2frpc_2fredis_5fbase_2eproto_;
-
-
-// ===================================================================
-
-#ifndef _MSC_VER
-#endif  // !_MSC_VER
-
 RedisRequest::RedisRequest()
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<RedisRequest>() {
     SharedCtor();
 }
 
-void RedisRequest::InitAsDefaultInstance() {
-}
-
 RedisRequest::RedisRequest(const RedisRequest& from)
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<RedisRequest>(from) {
     SharedCtor();
     MergeFrom(from);
 }
@@ -146,31 +51,10 @@ RedisRequest::~RedisRequest() {
 }
 
 void RedisRequest::SharedDtor() {
-    if (this != default_instance_) {
-    }
 }
 
 void RedisRequest::SetCachedSize(int size) const {
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
     _cached_size_ = size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
-}
-const ::google::protobuf::Descriptor* RedisRequest::descriptor() {
-    protobuf_AssignDescriptorsOnce();
-    return RedisRequest_descriptor_;
-}
-
-const RedisRequest& RedisRequest::default_instance() {
-    if (default_instance_ == NULL) {
-        protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-    }
-    return *default_instance_;
-}
-
-RedisRequest* RedisRequest::default_instance_ = NULL;
-
-RedisRequest* RedisRequest::New() const {
-    return new RedisRequest;
 }
 
 void RedisRequest::Clear() {
@@ -179,58 +63,17 @@ void RedisRequest::Clear() {
     _buf.clear();
 }
 
-bool RedisRequest::MergePartialFromCodedStream(
-    ::google::protobuf::io::CodedInputStream*) {
-    LOG(WARNING) << "You're not supposed to parse a RedisRequest";
-    return true;
-}
-
-void RedisRequest::SerializeWithCachedSizes(
-    ::google::protobuf::io::CodedOutputStream*) const {
-    LOG(WARNING) << "You're not supposed to serialize a RedisRequest";
-}
-
-::google::protobuf::uint8* RedisRequest::SerializeWithCachedSizesToArray(
-    ::google::protobuf::uint8* target) const {
-    return target;
-}
-
-int RedisRequest::ByteSize() const {
-    int total_size =  _buf.size();
-    GOOGLE_SAFE_CONCURRENT_WRITES_BEGIN();
+size_t RedisRequest::ByteSizeLong() const {
+    int total_size =  static_cast<int>(_buf.size());
     _cached_size_ = total_size;
-    GOOGLE_SAFE_CONCURRENT_WRITES_END();
     return total_size;
 }
 
-void RedisRequest::MergeFrom(const ::google::protobuf::Message& from) {
-    GOOGLE_CHECK_NE(&from, this);
-    const RedisRequest* source =
-        ::google::protobuf::internal::dynamic_cast_if_available<const RedisRequest*>(&from);
-    if (source == NULL) {
-        ::google::protobuf::internal::ReflectionOps::Merge(from, this);
-    } else {
-        MergeFrom(*source);
-    }
-}
-
 void RedisRequest::MergeFrom(const RedisRequest& from) {
-    GOOGLE_CHECK_NE(&from, this);
+    CHECK_NE(&from, this);
     _has_error = _has_error || from._has_error;
     _buf.append(from._buf);
     _ncommand += from._ncommand;
-}
-
-void RedisRequest::CopyFrom(const ::google::protobuf::Message& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
-}
-
-void RedisRequest::CopyFrom(const RedisRequest& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
 }
 
 bool RedisRequest::IsInitialized() const {
@@ -246,14 +89,6 @@ void RedisRequest::Swap(RedisRequest* other) {
     }
 }
 
-::google::protobuf::Metadata RedisRequest::GetMetadata() const {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::Metadata metadata;
-    metadata.descriptor = RedisRequest_descriptor_;
-    metadata.reflection = NULL;
-    return metadata;
-}
-
 bool RedisRequest::AddCommand(const butil::StringPiece& command) {
     if (_has_error) {
         return false;
@@ -263,13 +98,13 @@ bool RedisRequest::AddCommand(const butil::StringPiece& command) {
         ++_ncommand;
         return true;
     } else {
-        CHECK(st.ok()) << st;
+        LOG(ERROR) << "RedisRequest::AddCommand failed: " << st;
         _has_error = true;
         return false;
-    }    
+    }
 }
 
-bool RedisRequest::AddCommandByComponents(const butil::StringPiece* components, 
+bool RedisRequest::AddCommandByComponents(const butil::StringPiece* components,
                                          size_t n) {
     if (_has_error) {
         return false;
@@ -279,10 +114,15 @@ bool RedisRequest::AddCommandByComponents(const butil::StringPiece* components,
         ++_ncommand;
         return true;
     } else {
-        CHECK(st.ok()) << st;
+        LOG(ERROR) << "RedisRequest::AddCommand failed: " << st;
         _has_error = true;
         return false;
-    }        
+    }
+}
+
+bool RedisRequest::AddCommandByComponents(
+        const std::vector<butil::StringPiece>& components) {
+    return AddCommandByComponents(components.data(), components.size());
 }
 
 bool RedisRequest::AddCommandWithArgs(const char* fmt, ...) {
@@ -297,7 +137,7 @@ bool RedisRequest::AddCommandWithArgs(const char* fmt, ...) {
         ++_ncommand;
         return true;
     } else {
-        CHECK(st.ok()) << st;
+        LOG(ERROR) << "RedisRequest::AddCommand failed: " << st;
         _has_error = true;
         return false;
     }
@@ -312,7 +152,7 @@ bool RedisRequest::AddCommandV(const char* fmt, va_list ap) {
         ++_ncommand;
         return true;
     } else {
-        CHECK(st.ok()) << st;
+        LOG(ERROR) << "RedisRequest::AddCommand failed: " << st;
         _has_error = true;
         return false;
     }
@@ -325,6 +165,13 @@ bool RedisRequest::SerializeTo(butil::IOBuf* buf) const {
     }
     *buf = _buf;
     return true;
+}
+
+::google::protobuf::Metadata RedisRequest::GetMetadata() const {
+    ::google::protobuf::Metadata metadata{};
+    metadata.descriptor = RedisRequestBase::descriptor();
+    metadata.reflection = nullptr;
+    return metadata;
 }
 
 void RedisRequest::Print(std::ostream& os) const {
@@ -352,27 +199,20 @@ std::ostream& operator<<(std::ostream& os, const RedisRequest& r) {
     return os;
 }
 
-// ===================================================================
-
-#ifndef _MSC_VER
-#endif  // !_MSC_VER
-
 RedisResponse::RedisResponse()
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<RedisResponse>()
+    , _first_reply(&_arena) {
     SharedCtor();
 }
-
-void RedisResponse::InitAsDefaultInstance() {
-}
-
 RedisResponse::RedisResponse(const RedisResponse& from)
-    : ::google::protobuf::Message() {
+    : NonreflectableMessage<RedisResponse>(from)
+    , _first_reply(&_arena) {
     SharedCtor();
     MergeFrom(from);
 }
 
 void RedisResponse::SharedCtor() {
-    _other_replies = NULL;
+    _other_replies = nullptr;
     _cached_size_ = 0;
     _nreply = 0;
 }
@@ -382,78 +222,32 @@ RedisResponse::~RedisResponse() {
 }
 
 void RedisResponse::SharedDtor() {
-    if (this != default_instance_) {
-    }
 }
 
 void RedisResponse::SetCachedSize(int size) const {
     _cached_size_ = size;
 }
-const ::google::protobuf::Descriptor* RedisResponse::descriptor() {
-    protobuf_AssignDescriptorsOnce();
-    return RedisResponse_descriptor_;
-}
-
-const RedisResponse& RedisResponse::default_instance() {
-    if (default_instance_ == NULL) {
-        protobuf_AddDesc_baidu_2frpc_2fredis_5fbase_2eproto();
-    }
-    return *default_instance_;
-}
-
-RedisResponse* RedisResponse::default_instance_ = NULL;
-
-RedisResponse* RedisResponse::New() const {
-    return new RedisResponse;
-}
 
 void RedisResponse::Clear() {
-    _first_reply.Clear();
-    _other_replies = NULL;
+    _first_reply.Reset();
+    _other_replies = nullptr;
     _arena.clear();
     _nreply = 0;
     _cached_size_ = 0;
 }
 
-bool RedisResponse::MergePartialFromCodedStream(
-    ::google::protobuf::io::CodedInputStream*) {
-    LOG(WARNING) << "You're not supposed to parse a RedisResponse";
-    return true;
-}
-
-void RedisResponse::SerializeWithCachedSizes(
-    ::google::protobuf::io::CodedOutputStream*) const {
-    LOG(WARNING) << "You're not supposed to serialize a RedisResponse";
-}
-
-::google::protobuf::uint8* RedisResponse::SerializeWithCachedSizesToArray(
-    ::google::protobuf::uint8* target) const {
-    return target;
-}
-
-int RedisResponse::ByteSize() const {
+size_t RedisResponse::ByteSizeLong() const {
     return _cached_size_;
 }
 
-void RedisResponse::MergeFrom(const ::google::protobuf::Message& from) {
-    GOOGLE_CHECK_NE(&from, this);
-    const RedisResponse* source =
-        ::google::protobuf::internal::dynamic_cast_if_available<const RedisResponse*>(&from);
-    if (source == NULL) {
-        ::google::protobuf::internal::ReflectionOps::Merge(from, this);
-    } else {
-        MergeFrom(*source);
-    }
-}
-
 void RedisResponse::MergeFrom(const RedisResponse& from) {
-    GOOGLE_CHECK_NE(&from, this);
+    CHECK_NE(&from, this);
     if (from._nreply == 0) {
         return;
     }
     _cached_size_ += from._cached_size_;
     if (_nreply == 0) {
-        _first_reply.CopyFromDifferentArena(from._first_reply, &_arena);
+        _first_reply.CopyFromDifferentArena(from._first_reply);
     }
     const int new_nreply = _nreply + from._nreply;
     if (new_nreply == 1) {
@@ -463,7 +257,7 @@ void RedisResponse::MergeFrom(const RedisResponse& from) {
     RedisReply* new_others =
         (RedisReply*)_arena.allocate(sizeof(RedisReply) * (new_nreply - 1));
     for (int i = 0; i < new_nreply - 1; ++i) {
-        new (new_others + i) RedisReply;
+        new (new_others + i) RedisReply(&_arena);
     }
     int new_other_index = 0;
     for (int i = 1; i < _nreply; ++i) {
@@ -471,24 +265,11 @@ void RedisResponse::MergeFrom(const RedisResponse& from) {
             _other_replies[i - 1]);
     }
     for (int i = !_nreply; i < from._nreply; ++i) {
-        new_others[new_other_index++].CopyFromDifferentArena(
-            from.reply(i), &_arena);
+        new_others[new_other_index++].CopyFromDifferentArena(from.reply(i));
     }
     DCHECK_EQ(new_nreply - 1, new_other_index);
     _other_replies = new_others;
     _nreply = new_nreply;
-}
-
-void RedisResponse::CopyFrom(const ::google::protobuf::Message& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
-}
-
-void RedisResponse::CopyFrom(const RedisResponse& from) {
-    if (&from == this) return;
-    Clear();
-    MergeFrom(from);
 }
 
 bool RedisResponse::IsInitialized() const {
@@ -506,20 +287,20 @@ void RedisResponse::Swap(RedisResponse* other) {
 }
 
 ::google::protobuf::Metadata RedisResponse::GetMetadata() const {
-    protobuf_AssignDescriptorsOnce();
-    ::google::protobuf::Metadata metadata;
-    metadata.descriptor = RedisResponse_descriptor_;
-    metadata.reflection = NULL;
+    ::google::protobuf::Metadata metadata{};
+    metadata.descriptor = RedisResponseBase::descriptor();
+    metadata.reflection = nullptr;
     return metadata;
 }
 
 // ===================================================================
 
-bool RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count) {
+ParseError RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count) {
     size_t oldsize = buf.size();
     if (reply_size() == 0) {
-        if (!_first_reply.ConsumePartialIOBuf(buf, &_arena)) {
-            return false;
+        ParseError err = _first_reply.ConsumePartialIOBuf(buf);
+        if (err != PARSE_OK) {
+            return err;
         }
         const size_t newsize = buf.size();
         _cached_size_ += oldsize - newsize;
@@ -527,20 +308,21 @@ bool RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count) {
         ++_nreply;
     }
     if (reply_count > 1) {
-        if (_other_replies == NULL) {
+        if (_other_replies == nullptr) {
             _other_replies = (RedisReply*)_arena.allocate(
                 sizeof(RedisReply) * (reply_count - 1));
-            if (_other_replies == NULL) {
+            if (_other_replies == nullptr) {
                 LOG(ERROR) << "Fail to allocate RedisReply[" << reply_count -1 << "]";
-                return false;
+                return PARSE_ERROR_ABSOLUTELY_WRONG;
             }
             for (int i = 0; i < reply_count - 1; ++i) {
-                new (&_other_replies[i]) RedisReply;
+                new (&_other_replies[i]) RedisReply(&_arena);
             }
         }
         for (int i = reply_size(); i < reply_count; ++i) {
-            if (!_other_replies[i - 1].ConsumePartialIOBuf(buf, &_arena)) {
-                return false;
+            ParseError err = _other_replies[i - 1].ConsumePartialIOBuf(buf);
+            if (err != PARSE_OK) {
+                return err;
             }
             const size_t newsize = buf.size();
             _cached_size_ += oldsize - newsize;
@@ -548,7 +330,7 @@ bool RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count) {
             ++_nreply;
         }
     }
-    return true;
+    return PARSE_OK;
 }
 
 std::ostream& operator<<(std::ostream& os, const RedisResponse& response) {
@@ -568,5 +350,51 @@ std::ostream& operator<<(std::ostream& os, const RedisResponse& response) {
     }
     return os;
 }
- 
+
+bool RedisService::AddCommandHandler(const std::string& name, RedisCommandHandler* handler) {
+    std::string lcname = StringToLowerASCII(name);
+    auto it = _command_map.find(lcname);
+    if (it != _command_map.end()) {
+        LOG(ERROR) << "redis command name=" << name << " exist";
+        return false;
+    }
+    _command_map[lcname] = handler;
+    return true;
+}
+
+RedisCommandHandler* RedisService::FindCommandHandler(const butil::StringPiece& name) const {
+    auto it = _command_map.find(name.as_string());
+    if (it != _command_map.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+RedisCommandHandler* RedisCommandHandler::NewTransactionHandler() {
+    LOG(ERROR) << "NewTransactionHandler is not implemented";
+    return nullptr;
+}
+
+// ========== impl of RedisConnContext ==========
+RedisConnContext::RedisConnContext(const RedisService* rs)
+        : redis_service(rs)
+        , batched_size(0)
+        , session(nullptr) {}
+
+RedisConnContext::~RedisConnContext() { }
+
+void RedisConnContext::Destroy() {
+    if (session) {
+        session->Destroy();
+    }
+    delete this;
+}
+
+void RedisConnContext::reset_session(Destroyable* s){
+    if (session) {
+        session->Destroy();
+    }
+    session = s;
+}
+
 } // namespace brpc

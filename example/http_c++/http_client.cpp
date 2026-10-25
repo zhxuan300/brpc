@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // - Access pb services via HTTP
 //   ./http_client http://www.foo.com:8765/EchoService/Echo -d '{"message":"hello"}'
@@ -19,13 +22,19 @@
 // - Access www.foo.com
 //   ./http_client www.foo.com
 
+#include <string>
 #include <gflags/gflags.h>
 #include <butil/logging.h>
 #include <brpc/channel.h>
+#include "bthread/countdown_event.h"
 
 DEFINE_string(d, "", "POST this data to the http server");
+DEFINE_bool(progressive, false,
+            "whether or not progressive read data from server");
+DEFINE_int32(progressive_read_timeout_ms, 5000,
+             "progressive read data idle timeout in milliseconds");
 DEFINE_string(load_balancer, "", "The algorithm for load balancing");
-DEFINE_int32(timeout_ms, 1000, "RPC timeout in milliseconds");
+DEFINE_int32(timeout_ms, 2000, "RPC timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)"); 
 DEFINE_string(protocol, "http", "Client-side protocol");
 
@@ -33,9 +42,28 @@ namespace brpc {
 DECLARE_bool(http_verbose);
 }
 
+class PartDataReader : public brpc::ProgressiveReader {
+public:
+    explicit PartDataReader(bthread::CountdownEvent* done) : _done(done) {}
+
+    butil::Status OnReadOnePart(const void* data, size_t length) override {
+        const std::string part(static_cast<const char*>(data), length);
+        LOG(INFO) << "data: " << part << " size: " << length;
+        return butil::Status::OK();
+    }
+
+    void OnEndOfMessage(const butil::Status& status) override {
+        LOG(INFO) << "progressive read data final status : " << status;
+        _done->signal();
+        delete this;
+    }
+private:
+    bthread::CountdownEvent* _done;
+};
+
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     if (argc != 2) {
         LOG(ERROR) << "Usage: ./http_client \"http(s)://www.foo.com\"";
@@ -51,7 +79,7 @@ int main(int argc, char* argv[]) {
     options.timeout_ms = FLAGS_timeout_ms/*milliseconds*/;
     options.max_retry = FLAGS_max_retry;
 
-    // Initialize the channel, NULL means using default options. 
+    // Initialize the channel, nullptr means using default options. 
     // options, see `brpc/channel.h'.
     if (channel.Init(url, FLAGS_load_balancer.c_str(), &options) != 0) {
         LOG(ERROR) << "Fail to initialize channel";
@@ -68,12 +96,24 @@ int main(int argc, char* argv[]) {
         cntl.request_attachment().append(FLAGS_d);
     }
 
-    // Because `done'(last parameter) is NULL, this function waits until
+    if (FLAGS_progressive) {
+        cntl.set_progressive_read_timeout_ms(FLAGS_progressive_read_timeout_ms);
+        cntl.response_will_be_read_progressively();
+    }
+
+    // Because `done'(last parameter) is nullptr, this function waits until
     // the response comes back or error occurs(including timedout).
-    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
     if (cntl.Failed()) {
         std::cerr << cntl.ErrorText() << std::endl;
         return -1;
+    }
+
+    if (FLAGS_progressive) {
+        bthread::CountdownEvent done(1);
+        cntl.ReadProgressiveAttachmentBy(new PartDataReader(&done));
+        done.wait();
+        LOG(INFO) << "wait client progressive read done safely";
     }
     // If -http_verbose is on, brpc already prints the response to stderr.
     if (!brpc::FLAGS_http_verbose) {

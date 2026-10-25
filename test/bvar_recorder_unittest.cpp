@@ -1,6 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date 2014/10/13 19:47:59
 
 #include <pthread.h>                                // pthread_*
@@ -15,6 +29,7 @@
 #include <gtest/gtest.h>
 
 namespace {
+#if !WITH_BABYLON_COUNTER
 TEST(RecorderTest, test_complement) {
     LOG(INFO) << "sizeof(LatencyRecorder)=" << sizeof(bvar::LatencyRecorder)
               << " " << sizeof(bvar::detail::Percentile)
@@ -47,6 +62,7 @@ TEST(RecorderTest, test_compress_negtive_number) {
         ASSERT_EQ(a, bvar::IntRecorder::_extend_sign_bit(bvar::IntRecorder::_get_sum(compressed)));
     }
 }
+#endif // !WITH_BABYLON_COUNTER
 
 TEST(RecorderTest, sanity) {
     {
@@ -56,13 +72,18 @@ TEST(RecorderTest, sanity) {
         for (size_t i = 0; i < 100; ++i) {
             recorder << 2;
         }
-        ASSERT_EQ(2l, (int64_t)recorder.average());
+        ASSERT_EQ(2l, recorder.average());
         ASSERT_EQ("2", bvar::Variable::describe_exposed("var1"));
         std::vector<std::string> vars;
         bvar::Variable::list_exposed(&vars);
         ASSERT_EQ(1UL, vars.size());
         ASSERT_EQ("var1", vars[0]);
         ASSERT_EQ(1UL, bvar::Variable::count_exposed());
+    }
+    {
+        bvar::IntRecorder recorder("var2");
+        recorder << 2;
+        ASSERT_EQ(2l, recorder.average());
     }
     ASSERT_EQ(0UL, bvar::Variable::count_exposed());
 }
@@ -75,10 +96,10 @@ TEST(RecorderTest, window) {
     bvar::Window<bvar::IntRecorder> w3(&c1, 3);
 
     const int N = 10000;
-    int64_t last_time = butil::gettimeofday_us();
+    int64_t last_time = butil::cpuwide_time_us();
     for (int i = 1; i <= N; ++i) {
         c1 << i;
-        int64_t now = butil::gettimeofday_us();
+        int64_t now = butil::cpuwide_time_us();
         if (now - last_time >= 1000000L) {
             last_time = now;
             LOG(INFO) << "c1=" << c1 << " w1=" << w1 << " w2=" << w2 << " w3=" << w3;
@@ -179,7 +200,7 @@ TEST(RecorderTest, perf) {
     ASSERT_TRUE(recorder.valid());
     pthread_t threads[8];
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_create(&threads[i], NULL, &thread_counter, (void *)&recorder);
+        pthread_create(&threads[i], nullptr, &thread_counter, (void *)&recorder);
     }
     long totol_time = 0;
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
@@ -192,4 +213,107 @@ TEST(RecorderTest, perf) {
               << "ns per sample with " << ARRAY_SIZE(threads) 
               << " threads";
 }
+
+class LatencyRecorderWithWindowSample : public bvar::LatencyRecorder {
+public:
+    explicit LatencyRecorderWithWindowSample(time_t window_size)
+        : bvar::LatencyRecorder(window_size) {}
+
+    bool get_latency_sample(bvar::detail::Sample<bvar::Stat>* sample) const {
+        return _latency_window.get_span(sample);
+    }
+};
+
+TEST(RecorderTest, latency_recorder_window_statistics) {
+    // Keep both batches across sampler ticks. A ten-second window is longer
+    // than the five-second wait budget, which allows for busy CI runners.
+    const time_t window_size = 10;
+    LatencyRecorderWithWindowSample recorder(window_size);
+    const int64_t sampling_timeout_us = 5 * 1000000L;
+    const int64_t deadline =
+        butil::monotonic_time_us() + sampling_timeout_us;
+    bvar::detail::Sample<bvar::Stat> sample;
+
+    // Deliberately sample a partial batch before recording the remaining
+    // values, rather than assuming all writes fall between sampler ticks.
+    recorder << 1 << 2 << 3;
+    while (butil::monotonic_time_us() < deadline) {
+        if (recorder.get_latency_sample(&sample) && sample.data.num >= 3) {
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT_EQ(3, sample.data.num) << "First batch was not sampled";
+    EXPECT_EQ(6, sample.data.sum);
+
+    recorder << 4 << 5 << 6 << 7;
+    EXPECT_EQ(7, recorder.count());
+    bool complete_sample = false;
+    int64_t max_latency = 0;
+    while (butil::monotonic_time_us() < deadline) {
+        if (!complete_sample && recorder.get_latency_sample(&sample) &&
+            sample.data.num >= 7) {
+            complete_sample = true;
+        }
+        if (max_latency < 7) {
+            max_latency = recorder.max_latency();
+        }
+        if (complete_sample && max_latency >= 7) {
+            break;
+        }
+        usleep(10000);
+    }
+
+    // Validate completeness before checking sum / count from the same saved
+    // snapshot. Rereading latency() could observe a different sampling span.
+    ASSERT_TRUE(complete_sample) << "Full batch was not sampled; count="
+                                 << sample.data.num;
+    ASSERT_EQ(7, sample.data.num);
+    EXPECT_EQ(28, sample.data.sum);
+    EXPECT_EQ(4, sample.data.get_average_int());
+    // The maximum has an independent sampler and is saved separately.
+    EXPECT_EQ(7, max_latency);
+}
+
+TEST(RecorderTest, latency_recorder_qps_accuracy) {
+    bvar::LatencyRecorder lr1(2); // set windows size to 2s
+    bvar::LatencyRecorder lr2(2);
+    bvar::LatencyRecorder lr3(2);
+    bvar::LatencyRecorder lr4(2);
+    usleep(3000000); // wait sampler to sample 3 times
+
+    auto write = [](bvar::LatencyRecorder& lr, int times) {   
+        for (int i = 0; i < times; ++i) {
+            lr << 1;
+        }
+    };
+    write(lr1, 10);
+    write(lr2, 11);
+    write(lr3, 3);
+    write(lr4, 1);
+    usleep(1000000); // wait sampler to sample 1 time
+
+    auto read = [](bvar::LatencyRecorder& lr, double exp_qps, int window_size = 0) {
+        int64_t qps_sum = 0;
+        int64_t exp_qps_int = (int64_t)exp_qps;
+        for (int i = 0; i < 1000; ++i) {
+            int64_t qps = window_size ? lr.qps(window_size): lr.qps();
+            EXPECT_GE(qps, exp_qps_int - 1);
+            EXPECT_LE(qps, exp_qps_int + 1);
+            qps_sum += qps;
+        }
+        double err = fabs(qps_sum / 1000.0 - exp_qps);
+        return err;
+    };
+    ASSERT_GT(0.1, read(lr1, 10/2.0));
+    ASSERT_GT(0.1, read(lr2, 11/2.0));
+    ASSERT_GT(0.1, read(lr3, 3/2.0));
+    ASSERT_GT(0.1, read(lr4, 1/2.0));
+
+    ASSERT_GT(0.1, read(lr1, 10/3.0, 3));
+    ASSERT_GT(0.1, read(lr2, 11/3.0, 3));
+    ASSERT_GT(0.1, read(lr3, 3/3.0, 3));
+    ASSERT_GT(0.1, read(lr4, 1/3.0, 3));
+}
+
 } // namespace

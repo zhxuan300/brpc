@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A client sending requests to server in batch every 1 second.
 
@@ -28,19 +31,19 @@ DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // A Channel represents a communication line to a Server. Notice that 
     // Channel is thread-safe and can be shared by all threads in your program.
     brpc::Channel channel;
         
-    // Initialize the channel, NULL means using default options. 
+    // Initialize the channel, nullptr means using default options. 
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_BAIDU_STD;
     options.connection_type = FLAGS_connection_type;
     options.timeout_ms = FLAGS_timeout_ms/*milliseconds*/;
     options.max_retry = FLAGS_max_retry;
-    if (channel.Init(FLAGS_server.c_str(), NULL) != 0) {
+    if (channel.Init(FLAGS_server.c_str(), nullptr) != 0) {
         LOG(ERROR) << "Fail to initialize channel";
         return -1;
     }
@@ -50,7 +53,7 @@ int main(int argc, char* argv[]) {
     example::EchoService_Stub stub(&channel);
     brpc::Controller cntl;
     brpc::StreamId stream;
-    if (brpc::StreamCreate(&stream, cntl, NULL) != 0) {
+    if (brpc::StreamCreate(&stream, cntl, nullptr) != 0) {
         LOG(ERROR) << "Fail to create stream";
         return -1;
     }
@@ -58,7 +61,7 @@ int main(int argc, char* argv[]) {
     example::EchoRequest request;
     example::EchoResponse response;
     request.set_message("I'm a RPC to connect stream");
-    stub.Echo(&cntl, &request, &response, NULL);
+    stub.Echo(&cntl, &request, &response, nullptr);
     if (cntl.Failed()) {
         LOG(ERROR) << "Fail to connect stream, " << cntl.ErrorText();
         return -1;

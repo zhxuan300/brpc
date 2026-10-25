@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_NSHEAD_PB_SERVICE_ADAPTOR_H
 #define BRPC_NSHEAD_PB_SERVICE_ADAPTOR_H
@@ -71,7 +73,7 @@ public:
     //   meta: was set by ParseNsheadMeta()
     //   controller: If something goes wrong, call controller->SetFailed()
     //   pb_res: the pb response that returned by pb method. [NOTE] `pb_res'
-    //           can be NULL or uninitialized when RPC failed (indicated by
+    //           can be nullptr or uninitialized when RPC failed (indicated by
     //           Controller::Failed()), in which case you may put error
     //           information into `nshead_res'.
     //   nshead_res: the nshead response that will be sent back to client.

@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: chenzhangyi01@baidu.com gejun@baidu.com
 // Date 2014/09/25 17:50:21
 
 #ifndef  BVAR_RECORDER_H
@@ -25,11 +27,14 @@
 #include "bvar/variable.h"
 #include "bvar/window.h"
 #include "bvar/detail/sampler.h"
+#if WITH_BABYLON_COUNTER
+#include "babylon/concurrent/counter.h"
+#endif // WITH_BABYLON_COUNTER
 
 namespace bvar {
 
 struct Stat {
-    Stat() : sum(0), num(0) {};
+    Stat() : sum(0), num(0) {}
     Stat(int64_t sum2, int64_t num2) : sum(sum2), num(num2) {}
     int64_t sum;
     int64_t num;
@@ -74,11 +79,22 @@ inline std::ostream& operator<<(std::ostream& os, const Stat& s) {
     }
 }
 
+namespace detail {
+struct AddStat {
+    void operator()(Stat& s1, const Stat& s2) const { s1 += s2; }
+};
+
+struct MinusStat {
+    void operator()(Stat& s1, const Stat& s2) const { s1 -= s2; }
+};
+} // namespace detail
+
 // For calculating average of numbers.
 // Example:
 //   IntRecorder latency;
 //   latency << 1 << 3 << 5;
 //   CHECK_EQ(3, latency.average());
+#if !WITH_BABYLON_COUNTER
 class IntRecorder : public Variable {
 public:
     // Compressing format:
@@ -90,16 +106,10 @@ public:
     BAIDU_CASSERT(SUM_BIT_WIDTH > 32 && SUM_BIT_WIDTH < 64, 
                   SUM_BIT_WIDTH_must_be_between_33_and_63);
 
-    struct AddStat {
-        void operator()(Stat& s1, const Stat& s2) const { s1 += s2; }
-    };
-    struct MinusStat {
-        void operator()(Stat& s1, const Stat& s2) const { s1 -= s2; }
-    };    
-
     typedef Stat value_type;
     typedef detail::ReducerSampler<IntRecorder, Stat,
-                                   AddStat, MinusStat> sampler_type;
+                                   detail::AddStat,
+                                   detail::MinusStat> sampler_type;
 
     typedef Stat SampleSet;
     
@@ -111,24 +121,25 @@ public:
     };
     
     typedef detail::AgentCombiner<Stat, uint64_t, AddToStat> combiner_type;
+    typedef typename combiner_type::self_shared_type shared_combiner_type;
     typedef combiner_type::Agent agent_type;
 
-    IntRecorder() : _sampler(NULL) {}
+    IntRecorder() : _combiner(std::make_shared<combiner_type>()), _sampler(nullptr) {}
 
-    explicit IntRecorder(const butil::StringPiece& name) : _sampler(NULL) {
+    IntRecorder(const butil::StringPiece& name) : IntRecorder() {
         expose(name);
     }
 
     IntRecorder(const butil::StringPiece& prefix, const butil::StringPiece& name)
-        : _sampler(NULL) {
+        : IntRecorder() {
         expose_as(prefix, name);
     }
 
-    ~IntRecorder() {
+    ~IntRecorder() override {
         hide();
         if (_sampler) {
             _sampler->destroy();
-            _sampler = NULL;
+            _sampler = nullptr;
         }
     }
 
@@ -136,33 +147,39 @@ public:
     IntRecorder& operator<<(int64_t/*note*/ sample);
 
     int64_t average() const {
-        return _combiner.combine_agents().get_average_int();
+        return _combiner->combine_agents().get_average_int();
     }
 
     double average(double) const {
-        return _combiner.combine_agents().get_average_double();
+        return _combiner->combine_agents().get_average_double();
     }
 
     Stat get_value() const {
-        return _combiner.combine_agents();
+        return _combiner->combine_agents();
     }
     
     Stat reset() {
-        return _combiner.reset_all_agents();
+        return _combiner->reset_all_agents();
     }
 
-    AddStat op() const { return AddStat(); }
-    MinusStat inv_op() const { return MinusStat(); }
+    detail::AddStat op() const { return detail::AddStat(); }
+    detail::MinusStat inv_op() const { return detail::MinusStat(); }
+
+    // Expose the shared data carrier, so that ReducerSampler holds it instead
+    // of `this'. Sampling then keeps reading valid memory even if this
+    // IntRecorder is destructed before the sampler is recycled.
+    shared_combiner_type share_combiner() const { return _combiner; }
     
-    void describe(std::ostream& os, bool /*quote_string*/) const {
+    void describe(std::ostream& os, bool /*quote_string*/) const override {
         os << get_value();
     }
 
-    bool valid() const { return _combiner.valid(); }
+    bool valid() const { return _combiner->valid(); }
     
     sampler_type* get_sampler() {
-        if (NULL == _sampler) {
+        if (_sampler == nullptr) {
             _sampler = new sampler_type(this);
+            _sampler->set_debug_name(diagnostic_name());
             _sampler->schedule();
         }
         return _sampler;
@@ -172,9 +189,27 @@ public:
     // IntRecorder is often used as the source of data and not exposed.
     void set_debug_name(const butil::StringPiece& name) {
         _debug_name.assign(name.data(), name.size());
+        if (_sampler != nullptr) {
+            _sampler->set_debug_name(diagnostic_name());
+        }
     }
-    
+
+protected:
+    int expose_impl(const butil::StringPiece& prefix,
+                    const butil::StringPiece& name,
+                    DisplayFilter display_filter) override {
+        const int rc = Variable::expose_impl(prefix, name, display_filter);
+        if (rc == 0 && _sampler != nullptr) {
+            _sampler->set_debug_name(diagnostic_name());
+        }
+        return rc;
+    }
+
 private:
+    const std::string& diagnostic_name() const {
+        return name().empty() ? _debug_name : name();
+    }
+
     // TODO: The following numeric functions should be independent utils
     static uint64_t _get_sum(const uint64_t n) {
         return (n & MAX_SUM_PER_THREAD);
@@ -228,14 +263,14 @@ private:
     }
 
 private:
-    combiner_type           _combiner;
-    sampler_type*           _sampler;
-    std::string             _debug_name;
+    shared_combiner_type    _combiner;
+    sampler_type* _sampler;
+    std::string _debug_name;
 };
 
 inline IntRecorder& IntRecorder::operator<<(int64_t sample) {
     if (BAIDU_UNLIKELY((int64_t)(int)sample != sample)) {
-        const char* reason = NULL;
+        const char* reason = nullptr;
         if (sample > std::numeric_limits<int>::max()) {
             reason = "overflows";
             sample = std::numeric_limits<int>::max();
@@ -256,7 +291,7 @@ inline IntRecorder& IntRecorder::operator<<(int64_t sample) {
                        << (void*)this << ") " << reason;
         }
     }
-    agent_type* agent = _combiner.get_or_create_tls_agent();
+    agent_type* agent = _combiner->get_or_create_tls_agent();
     if (BAIDU_UNLIKELY(!agent)) {
         LOG(FATAL) << "Fail to create agent";
         return *this;
@@ -274,7 +309,7 @@ inline IntRecorder& IntRecorder::operator<<(int64_t sample) {
             // Although agent->element might have been cleared at this 
             // point, it is just OK because the very value is 0 in
             // this case
-            agent->combiner->commit_and_clear(agent);
+            _combiner->commit_and_clear(agent);
             sum = 0;
             num = 0;
             n = 0;
@@ -283,6 +318,121 @@ inline IntRecorder& IntRecorder::operator<<(int64_t sample) {
                  n, _compress(num + 1, sum + complement)));
     return *this;
 }
+#else // WITH_BABYLON_COUNTER
+class IntRecorder : public Variable {
+public:
+    typedef Stat value_type;
+    typedef detail::AddStat Op;
+    typedef detail::MinusStat InvOp;
+    typedef detail::ReducerSampler<IntRecorder, value_type, Op, InvOp> sampler_type;
+
+    COMMON_VARIABLE_CONSTRUCTOR(IntRecorder);
+
+    DISALLOW_COPY_AND_MOVE(IntRecorder);
+
+    ~IntRecorder() override {
+        hide();
+        if (nullptr != _sampler) {
+            _sampler->destroy();
+        }
+    }
+
+    // Note: The input type is acutally int. Use int64_t to check overflow.
+    IntRecorder& operator<<(int64_t value) {
+        if (BAIDU_UNLIKELY((int64_t)(int)value != value)) {
+            const char* reason = nullptr;
+            if (value > std::numeric_limits<int>::max()) {
+                reason = "overflows";
+                value = std::numeric_limits<int>::max();
+            } else {
+                reason = "underflows";
+                value = std::numeric_limits<int>::min();
+            }
+            // Truncate to be max or min of int. We're using 44 bits to store the
+            // sum thus following aggregations are not likely to be over/underflow.
+            if (!name().empty()) {
+                LOG(WARNING) << "Input=" << value << " to `" << name()
+                           << "\' " << reason;
+            } else if (!_debug_name.empty()) {
+                LOG(WARNING) << "Input=" << value << " to `" << _debug_name
+                           << "\' " << reason;
+            } else {
+                LOG(WARNING) << "Input=" << value << " to IntRecorder("
+                           << (void*)this << ") " << reason;
+            }
+        }
+
+        _summer << value;
+        return *this;
+    }
+
+    int64_t average() const {
+        return get_value().get_average_int();
+    }
+
+    double average(double) const {
+        return get_value().get_average_double();
+    }
+
+    value_type get_value() const {
+        auto summary = _summer.value();
+        return value_type{summary.sum, static_cast<ssize_t>(summary.num)};
+    }
+
+    value_type reset() {
+        LOG_EVERY_SECOND(ERROR) << "IntRecorder with babylon counter should never call reset()";
+        return get_value();
+    }
+
+    Op op() const { return Op(); }
+    InvOp inv_op() const { return InvOp(); }
+
+    void describe(::std::ostream& os, bool) const override {
+        os << get_value();
+    }
+
+    bool valid() const { return true; }
+
+    sampler_type* get_sampler() {
+        if (nullptr == _sampler) {
+            _sampler = new sampler_type(this);
+            _sampler->set_debug_name(diagnostic_name());
+            _sampler->schedule();
+        }
+        return _sampler;
+    }
+
+    // This name is useful for printing overflow log in operator<< since
+    // IntRecorder is often used as the source of data and not exposed.
+    void set_debug_name(const butil::StringPiece& name) {
+        _debug_name.assign(name.data(), name.size());
+        if (nullptr != _sampler) {
+            _sampler->set_debug_name(diagnostic_name());
+        }
+    }
+
+protected:
+    int expose_impl(const butil::StringPiece& prefix,
+                    const butil::StringPiece& name,
+                    DisplayFilter display_filter) override {
+        const int rc = Variable::expose_impl(prefix, name, display_filter);
+        if (rc == 0 && nullptr != _sampler) {
+            _sampler->set_debug_name(diagnostic_name());
+        }
+        return rc;
+    }
+
+private:
+    // See the non-babylon IntRecorder for details.
+    const std::string& diagnostic_name() const {
+        return name().empty() ? _debug_name : name();
+    }
+
+    babylon::ConcurrentSummer _summer;
+    sampler_type* _sampler{nullptr};
+    std::string _debug_name;
+};
+#endif // WITH_BABYLON_COUNTER
 
 }  // namespace bvar
 

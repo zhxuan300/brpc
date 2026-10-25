@@ -12,14 +12,19 @@
 
 #include <stddef.h>  // For size_t.
 #include <string.h>  // For memcpy.
+#include <stdlib.h>
 
 #include "butil/compiler_specific.h"  // For ALLOW_UNUSED.
+#include "butil/string_printf.h"      // For butil::string_printf().
 
 // There must be many copy-paste versions of these macros which are same
 // things, undefine them to avoid conflict.
 #undef DISALLOW_COPY
+#undef DISALLOW_MOVE
 #undef DISALLOW_ASSIGN
+#undef DISALLOW_MOVE_ASSIGN
 #undef DISALLOW_COPY_AND_ASSIGN
+#undef DISALLOW_COPY_AND_MOVE
 #undef DISALLOW_EVIL_CONSTRUCTORS
 #undef DISALLOW_IMPLICIT_CONSTRUCTORS
 
@@ -29,19 +34,37 @@
 #define BUTIL_DELETE_FUNCTION(decl) decl = delete
 #endif
 
-// Put this in the private: declarations for a class to be uncopyable.
+// Declarations for a class to be uncopyable.
 #define DISALLOW_COPY(TypeName)                         \
     BUTIL_DELETE_FUNCTION(TypeName(const TypeName&))
 
-// Put this in the private: declarations for a class to be unassignable.
-#define DISALLOW_ASSIGN(TypeName)                               \
-    BUTIL_DELETE_FUNCTION(void operator=(const TypeName&))
+// Declarations for a class to be unmovable.
+#define DISALLOW_MOVE(TypeName)                         \
+    BUTIL_DELETE_FUNCTION(TypeName(TypeName&&))
 
-// A macro to disallow the copy constructor and operator= functions
-// This should be used in the private: declarations for a class
-#define DISALLOW_COPY_AND_ASSIGN(TypeName)                      \
-    BUTIL_DELETE_FUNCTION(TypeName(const TypeName&));            \
-    BUTIL_DELETE_FUNCTION(void operator=(const TypeName&))
+// Declarations for a class to be unassignable.
+#define DISALLOW_ASSIGN(TypeName)                        \
+    BUTIL_DELETE_FUNCTION(TypeName& operator=(const TypeName&))
+
+// Declarations for a class to be move-unassignable.
+#define DISALLOW_MOVE_ASSIGN(TypeName)                   \
+    BUTIL_DELETE_FUNCTION(TypeName& operator=(TypeName&&))
+
+// A macro to disallow the copy constructor and operator= functions.
+#define DISALLOW_COPY_AND_ASSIGN(TypeName)               \
+    DISALLOW_COPY(TypeName);                             \
+    DISALLOW_ASSIGN(TypeName)
+
+// A macro to disallow the move constructor and operator= functions.
+#define DISALLOW_MOVE_AND_ASSIGN(TypeName)               \
+    DISALLOW_MOVE(TypeName);                             \
+    DISALLOW_MOVE_ASSIGN(TypeName)
+
+// A macro to disallow the copy constructor,
+// the move constructor and operator= functions.
+#define DISALLOW_COPY_AND_MOVE(TypeName)                 \
+    DISALLOW_COPY_AND_ASSIGN(TypeName);                  \
+    DISALLOW_MOVE(TypeName)
 
 // An older, deprecated, politically incorrect name for the above.
 // NOTE: The usage of this macro was banned from our code base, but some
@@ -441,5 +464,33 @@ namespace {  /*anonymous namespace */                           \
     BAIDU_CONCAT(baidu_global_init_, __LINE__)
 
 #endif  // __cplusplus
+
+#define ASSERT_LOG(fmt, ...)                                            \
+    do {                                                                \
+        std::string log = butil::string_printf(fmt, ## __VA_ARGS__);    \
+        LOG(FATAL) << log;                                              \
+    } while (false)
+
+// Assert macro that can crash the process to generate a dump.
+#define RELEASE_ASSERT(condition)   \
+    do {                            \
+        if (!(condition)) {         \
+            ::abort();              \
+        }                           \
+    } while (false)
+
+// Assert macro that can crash the process to generate a dump and
+// supply a verbose explanation of what went wrong.
+// For example:
+//  std::vector<int> v;
+//  ...
+//  RELEASE_ASSERT_VERBOSE(v.empty(), "v should be empty, but with size=%zu", v.size());
+#define RELEASE_ASSERT_VERBOSE(condition, fmt, ...)                                 \
+    do {                                                                            \
+        if (!(condition)) {                                                         \
+            ASSERT_LOG("Assert failure: " #condition ". " #fmt, ## __VA_ARGS__);    \
+            ::abort();                                                              \
+        }                                                                           \
+    } while (false)
 
 #endif  // BUTIL_MACROS_H_

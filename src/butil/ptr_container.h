@@ -1,18 +1,20 @@
-// Copyright (c) 2018 brpc authors.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (jge666@gmail.com)
 // Date: Fri Sep  7 12:15:23 CST 2018
 
 #ifndef BUTIL_PTR_CONTAINER_H
@@ -26,7 +28,7 @@ namespace butil {
 template <typename T>
 class PtrContainer {
 public:
-    PtrContainer() : _ptr(NULL) {}
+    PtrContainer() : _ptr(nullptr) {}
 
     explicit PtrContainer(T* obj) : _ptr(obj) {}
 
@@ -35,9 +37,13 @@ public:
     }
 
     PtrContainer(const PtrContainer& rhs)
-        : _ptr(rhs._ptr ? new T(*rhs._ptr) : NULL) {}
+        : _ptr(rhs._ptr ? new T(*rhs._ptr) : nullptr) {}
     
     void operator=(const PtrContainer& rhs) {
+        if (this == &rhs) {
+            return;
+        }
+
         if (rhs._ptr) {
             if (_ptr) {
                 *_ptr = *rhs._ptr;
@@ -46,7 +52,7 @@ public:
             }
         } else {
             delete _ptr;
-            _ptr = NULL;
+            _ptr = nullptr;
         }
     }
 
@@ -58,7 +64,13 @@ public:
     }
 
     operator void*() const { return _ptr; }
-    
+
+    explicit operator bool() const { return get() != nullptr; }
+
+    T& operator*() const { return *get(); }
+
+    T* operator->() const { return get(); }
+
 private:
     T* _ptr;
 };

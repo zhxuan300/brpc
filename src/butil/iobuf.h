@@ -1,26 +1,32 @@
-// iobuf - A non-continuous zero-copied buffer
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// iobuf - A non-continuous zero-copied buffer
+
 // Date: Thu Nov 22 13:57:56 CST 2012
 
 #ifndef BUTIL_IOBUF_H
 #define BUTIL_IOBUF_H
 
 #include <sys/uio.h>                             // iovec
-#include <stdint.h>                              // uint32_t
+#include <stdint.h>                              // uint32_t, int64_t
+#include <functional>
+#include <istream>                               // std::istream
+#include <streambuf>                             // std::streambuf
 #include <string>                                // std::string
 #include <ostream>                               // std::ostream
 #include <google/protobuf/io/zero_copy_stream.h> // ZeroCopyInputStream
@@ -39,10 +45,18 @@ struct const_iovec {
     const void* iov_base;
     size_t iov_len;
 };
+#ifndef USE_MESALINK
 struct ssl_st;
+#else
+#define ssl_st MESALINK_SSL
+#endif
 }
 
 namespace butil {
+
+size_t GetDefaultBlockSize();
+
+void SetDefaultBlockSize(size_t block_size);
 
 // IOBuf is a non-continuous buffer that can be cut and combined w/o copying
 // payload. It can be read from or flushed into file descriptors as well.
@@ -55,8 +69,10 @@ class IOBuf {
 friend class IOBufAsZeroCopyInputStream;
 friend class IOBufAsZeroCopyOutputStream;
 friend class IOBufBytesIterator;
+friend class IOBufCutter;
+friend class SingleIOBuf;
+
 public:
-    static const size_t DEFAULT_BLOCK_SIZE = 8192;
     static const size_t INITIAL_CAP = 32; // must be power of 2
 
     struct Block;
@@ -124,7 +140,7 @@ public:
     // Returns bytes popped.
     size_t pop_back(size_t n);
 
-    // Cut off `n' bytes from front side and APPEND to `out'
+    // Cut off n bytes from front side and APPEND to `out'
     // If n == 0, nothing cut; if n >= length(), all bytes are cut
     // Returns bytes cut.
     size_t cutn(IOBuf* out, size_t n);
@@ -132,7 +148,7 @@ public:
     size_t cutn(std::string* out, size_t n);
     // Cut off 1 byte from the front side and set to *c
     // Return true on cut, false otherwise.
-    bool cut1(char* c);
+    bool cut1(void* c);
 
     // Cut from front side until the characters matches `delim', append
     // data before the matched characters to `out'.
@@ -238,7 +254,16 @@ public:
     // Append the user-data to back side WITHOUT copying.
     // The user-data can be split and shared by smaller IOBufs and will be
     // deleted using the deleter func when no IOBuf references it anymore.
-    int append_user_data(void* data, size_t size, void (*deleter)(void*));
+    int append_user_data(void* data, size_t size, std::function<void(void*)> deleter);
+
+    // Append the user-data to back side WITHOUT copying.
+    // The meta is associated with this piece of user-data.
+    int append_user_data_with_meta(void* data, size_t size, std::function<void(void*)> deleter, uint64_t meta);
+
+    // Get the data meta of the first byte in this IOBuf.
+    // The meta is specified with append_user_data_with_meta before.
+    // 0 means the meta is invalid.
+    uint64_t get_first_data_meta();
 
     // Resizes the buf to a length of n characters.
     // If n is smaller than the current length, all bytes after n will be
@@ -288,9 +313,9 @@ public:
     // Returns bytes copied.
     size_t copy_to(void* buf, size_t n = (size_t)-1L, size_t pos = 0) const;
 
-    // NOTE: first parameter is not std::string& because user may passes
-    // a pointer of std::string by mistake, in which case, compiler would
-    // call the void* version which crashes definitely.
+    // NOTE: first parameter is not std::string& because user may pass in
+    // a pointer of std::string by mistake, in which case, the void* overload
+    // would be wrongly called.
     size_t copy_to(std::string* s, size_t n = (size_t)-1L, size_t pos = 0) const;
     size_t append_to(std::string* s, size_t n = (size_t)-1L, size_t pos = 0) const;
 
@@ -306,7 +331,7 @@ public:
     // Get `n' front-side bytes with minimum copying. Length of `aux_buffer'
     // must not be less than `n'.
     // Returns:
-    //   NULL            -  n is greater than length()
+    //   nullptr            -  n is greater than length()
     //   aux_buffer      -  n bytes are copied into aux_buffer
     //   internal buffer -  the bytes are stored continuously in the internal
     //                      buffer, no copying is needed. This function does not
@@ -315,7 +340,8 @@ public:
     //                      the internal buffer.
     // If n == 0 and buffer is empty, return value is undefined.
     const void* fetch(void* aux_buffer, size_t n) const;
-    // Just fetch one character.
+    // Fetch one character from front side.
+    // Returns pointer to the character, nullptr on empty.
     const void* fetch1() const;
 
     // Remove all data
@@ -369,7 +395,14 @@ protected:
 
     // Pop a BlockRef from front side.
     // Returns: 0 on success and -1 on empty.
-    int _pop_front_ref();
+    int _pop_front_ref() { return _pop_or_moveout_front_ref<false>(); }
+
+    // Move a BlockRef out from front side.
+    // Returns: 0 on success and -1 on empty.
+    int _moveout_front_ref() { return _pop_or_moveout_front_ref<true>(); }
+
+    template <bool MOVEOUT>
+    int _pop_or_moveout_front_ref();
 
     // Pop a BlockRef from back side.
     // Returns: 0 on success and -1 on empty.
@@ -392,7 +425,7 @@ protected:
     const BlockRef& _ref_at(size_t i) const;
 
     // Get pointer to n-th BlockRef(counting from front)
-    // If i is out-of-range, NULL is returned.
+    // If i is out-of-range, nullptr is returned.
     const BlockRef* _pref_at(size_t i) const;
 
 private:    
@@ -421,8 +454,8 @@ inline bool operator!=(const butil::IOBuf& b1, const butil::IOBuf& b2)
 // Typically used as the buffer to store bytes from sockets.
 class IOPortal : public IOBuf {
 public:
-    IOPortal() : _block(NULL) { }
-    IOPortal(const IOPortal& rhs) : IOBuf(rhs), _block(NULL) { } 
+    IOPortal() : _block(nullptr) { }
+    IOPortal(const IOPortal& rhs) : IOBuf(rhs), _block(nullptr) { }
     ~IOPortal();
     IOPortal& operator=(const IOPortal& rhs);
         
@@ -463,6 +496,62 @@ private:
     Block* _block;
 };
 
+class IOReserveAlignedBuf : public IOBuf {
+public:
+    IOReserveAlignedBuf(size_t alignment)
+        : _alignment(alignment), _reserved(false) {}
+    Area reserve(size_t count);
+
+private:
+    size_t _alignment;
+    bool _reserved;
+};
+
+// Specialized utility to cut from IOBuf faster than using corresponding
+// methods in IOBuf.
+// Designed for efficiently parsing data from IOBuf.
+// The cut IOBuf can be appended during cutting.
+class IOBufCutter {
+public:
+    explicit IOBufCutter(butil::IOBuf* buf);
+    ~IOBufCutter();
+
+    // Cut off n bytes and APPEND to `out'
+    // Returns bytes cut.
+    size_t cutn(butil::IOBuf* out, size_t n);
+    size_t cutn(std::string* out, size_t n);
+    size_t cutn(void* out, size_t n);
+
+    // Cut off 1 byte from the front side and set to *c
+    // Return true on cut, false otherwise.
+    bool cut1(void* data);
+
+    // Copy n bytes into `data'
+    // Returns bytes copied.
+    size_t copy_to(void* data, size_t n);
+
+    // Fetch one character.
+    // Returns pointer to the character, nullptr on empty
+    const void* fetch1();
+
+    // Pop n bytes from front side
+    // Returns bytes popped.
+    size_t pop_front(size_t n);
+
+    // Uncut bytes
+    size_t remaining_bytes() const;
+
+private:
+    size_t slower_copy_to(void* data, size_t n);
+    bool load_next_ref();
+
+private:
+    void* _data;
+    void* _data_end;
+    IOBuf::Block* _block;
+    IOBuf* _buf;
+};
+
 // Parse protobuf message from IOBuf. Notice that this wrapper does not change
 // source IOBuf, which also should not change during lifetime of the wrapper.
 // Even if a IOBufAsZeroCopyInputStream is created but parsed, the source
@@ -480,12 +569,12 @@ public:
     bool Next(const void** data, int* size) override;
     void BackUp(int count) override;
     bool Skip(int count) override;
-    google::protobuf::int64 ByteCount() const override;
+    int64_t ByteCount() const override;
 
 private:
     int _ref_index;
     int _add_offset;
-    google::protobuf::int64 _byte_count;
+    int64_t _byte_count;
     const IOBuf* _buf;
 };
 
@@ -499,7 +588,7 @@ private:
 //     some_pb_message.SerializeToZeroCopyStream(&wrapper);
 //
 // NOTE: Blocks are by default shared among all the ZeroCopyOutputStream in one
-// thread. If there are many manuplated streams at one time, there may be many
+// thread. If there are many manipulated streams at one time, there may be many
 // fragments. You can create a ZeroCopyOutputStream which has its own block by 
 // passing a positive `block_size' argument to avoid this problem.
 class IOBufAsZeroCopyOutputStream
@@ -511,7 +600,7 @@ public:
 
     bool Next(void** data, int* size) override;
     void BackUp(int count) override; // `count' can be as long as ByteCount()
-    google::protobuf::int64 ByteCount() const override;
+    int64_t ByteCount() const override;
 
 private:
     void _release_block();
@@ -519,10 +608,169 @@ private:
     IOBuf* _buf;
     uint32_t _block_size;
     IOBuf::Block *_cur_block;
-    google::protobuf::int64 _byte_count;
+    int64_t _byte_count;
 };
 
-// Wrap IOBuf into input of snappy compresson.
+// Wrap IOBuf into a std::streambuf for std::istream-based parsers
+// (e.g. nlohmann::json::parse(std::istream&)).
+//
+// Read-only view: the streambuf never writes to the source IOBuf. Forward-only
+// (seekoff/seekpos are not overridden).
+//
+// NOTE: The source IOBuf MUST NOT be modified during the lifetime of this
+// streambuf, otherwise the StringPieces returned by backing_block() may be
+// invalidated and the stream will read garbage or crash.
+class IOBufAsInputStreamBuf : public std::streambuf {
+public:
+    // `buf' must outlive this streambuf and must not be modified while the
+    // streambuf is in use.
+    explicit IOBufAsInputStreamBuf(const IOBuf& buf) : _buf(buf) {}
+
+protected:
+    int_type underflow() override;
+    std::streamsize xsgetn(char* s, std::streamsize n) override;
+    std::streamsize showmanyc() override;
+
+private:
+    const IOBuf& _buf;
+    size_t _block_index{0};
+};
+
+// std::istream view over an IOBuf. The IOBuf must outlive this stream and
+// must not be modified while the stream is in use. Forward-only — seeking
+// is not supported.
+//
+// Typical use is feeding an IOBuf to a parser that takes std::istream&,
+// e.g. nlohmann::json:
+//
+//     butil::IOBufInputStream in(request_body);
+//     auto j = nlohmann::json::parse(in);
+//
+// Or formatted extraction:
+//
+//     butil::IOBuf buf;
+//     buf.append("42 3.14 hello");
+//     butil::IOBufInputStream in(buf);
+//     int i; double d;
+//     std::string s;
+//     in >> i >> d >> s;
+//
+// Bulk read into a buffer (goes through xsgetn, copies one block at a time):
+//
+//     std::string out(buf.length(), '\0');
+//     butil::IOBufInputStream in(buf);
+//     in.read(&out[0], out.size());
+class IOBufInputStream : public std::istream {
+public:
+    // `buf' must outlive this stream and must not be modified while the
+    // stream is in use.
+    explicit IOBufInputStream(const IOBuf& buf)
+        : std::istream(nullptr), _sb(buf) {
+        rdbuf(&_sb);
+    }
+
+private:
+    IOBufAsInputStreamBuf _sb;
+};
+
+// Wrap IOBuf into a std::streambuf for std::ostream-based serializers
+// (e.g. nlohmann::json's `os << j`). Bytes are appended directly into IOBuf
+// blocks with no intermediate string copy.
+//
+// Internally backed by IOBufAsZeroCopyOutputStream:
+//  - by default, blocks are taken from the per-thread TLS pool (8KB);
+//  - pass `block_size` to allocate dedicated blocks instead, which avoids
+//    fragmenting the TLS pool when many output streams coexist.
+//
+// Append-only — seekoff/seekpos are not overridden.
+//
+// IMPORTANT: The exact length of the source IOBuf only reflects what was
+// written AFTER shrink() / sync() / destruction — `Next()` over-claims the
+// remainder of each block and the unused tail is BackUp'd later. If you need
+// the precise length mid-stream, call sync() (e.g. via `os.flush()` or
+// `_sb.shrink()`).
+class IOBufAsOutputStreamBuf : public std::streambuf {
+public:
+    // `buf' must outlive this streambuf.
+    explicit IOBufAsOutputStreamBuf(IOBuf& buf) : _zc(&buf) {}
+    IOBufAsOutputStreamBuf(IOBuf& buf, uint32_t block_size)
+        : _zc(&buf, block_size) {}
+    ~IOBufAsOutputStreamBuf() override;
+
+    // Return the unused tail of the current put area to the underlying IOBuf
+    // so that the IOBuf length matches exactly what was written so far.
+    // Automatically invoked from sync() and the destructor.
+    void shrink();
+
+protected:
+    int_type overflow(int_type ch) override;
+    std::streamsize xsputn(const char* s, std::streamsize n) override;
+    int sync() override;
+
+private:
+    bool refresh_put_area();
+
+    IOBufAsZeroCopyOutputStream _zc;
+};
+
+// std::ostream view over an IOBuf. Appends written bytes to the referenced
+// IOBuf; the IOBuf must outlive this stream. Append-only — seeking is not
+// supported.
+//
+// The IOBuf's length only reflects bytes written AFTER flush()/destruction
+// (see IOBufAsOutputStreamBuf for details).
+//
+// Serialize with a library that writes to std::ostream&, e.g. nlohmann::json
+// (zero intermediate string copy — bytes flow straight into IOBuf blocks):
+//
+//     #include <nlohmann/json.hpp>
+//     using nlohmann::json;
+//
+//     json reply = {
+//         {"status", "ok"},
+//         {"items",  {1, 2, 3}},
+//     };
+//
+//     butil::IOBuf out;                          // e.g. controller->response_attachment()
+//     {
+//         butil::IOBufOutputStream os(out);
+//         os << reply;                           // compact:  {"items":[1,2,3],"status":"ok"}
+//         // os << std::setw(2) << reply;        // pretty-print with 2-space indent
+//     } // dtor runs shrink(); `out` now has the exact serialized bytes.
+//
+// Formatted insertion (works like any std::ostream):
+//
+//     butil::IOBuf out;
+//     butil::IOBufOutputStream os(out);
+//     os << "x=" << 42 << " y=" << 3.14;
+//     os.flush();                                // commit to `out` now
+//
+// Bulk write of a known-size buffer (goes through xsputn, memcpy per block):
+//
+//     butil::IOBufOutputStream os(out);
+//     os.write(payload.data(), payload.size());
+//
+// Pass `block_size` when many output streams coexist in one thread, to keep
+// each stream's allocations off the shared TLS block pool:
+//
+//     butil::IOBufOutputStream os(out, /*block_size=*/64 * 1024);
+class IOBufOutputStream : public std::ostream {
+public:
+    // `buf' must outlive this stream.
+    explicit IOBufOutputStream(IOBuf& buf)
+        : std::ostream(nullptr), _sb(buf) {
+        rdbuf(&_sb);
+    }
+    IOBufOutputStream(IOBuf& buf, uint32_t block_size)
+        : std::ostream(nullptr), _sb(buf, block_size) {
+        rdbuf(&_sb);
+    }
+
+private:
+    IOBufAsOutputStreamBuf _sb;
+};
+
+// Wrap IOBuf into input of snappy compression.
 class IOBufAsSnappySource : public butil::snappy::Source {
 public:
     explicit IOBufAsSnappySource(const butil::IOBuf& buf)
@@ -530,14 +778,14 @@ public:
     virtual ~IOBufAsSnappySource() {}
 
     // Return the number of bytes left to read from the source
-    virtual size_t Available() const;
+    size_t Available() const override;
 
     // Peek at the next flat region of the source.
-    virtual const char* Peek(size_t* len); 
+    const char* Peek(size_t* len) override; 
 
     // Skip the next n bytes.  Invalidates any buffer returned by
     // a previous call to Peek().
-    virtual void Skip(size_t n);
+    void Skip(size_t n) override;
     
 private:
     const butil::IOBuf* _buf;
@@ -551,10 +799,10 @@ public:
     virtual ~IOBufAsSnappySink() {}
 
     // Append "bytes[0,n-1]" to this.
-    virtual void Append(const char* bytes, size_t n);
+    void Append(const char* bytes, size_t n) override;
     
     // Returns a writable buffer of the specified length for appending.
-    virtual char* GetAppendBuffer(size_t length, char* scratch);
+    char* GetAppendBuffer(size_t length, char* scratch) override;
     
 private:
     char* _cur_buf;
@@ -607,6 +855,11 @@ public:
     // Returns 0 on success, -1 otherwise.
     int append(const void* data, size_t n);
     int append(const butil::StringPiece& str);
+
+    // Format integer |d| to back side of the internal buffer, which is much faster
+    // than snprintf(..., "%lu", d).
+    // Returns 0 on success, -1 otherwise.
+    int append_decimal(long d);
     
     // Push the character to back side of the internal buffer.
     // Costs ~3ns while IOBuf.push_back costs ~13ns on Intel(R) Xeon(R) CPU
@@ -627,6 +880,8 @@ private:
     int add_block();
 
     void* _data;
+    // Saving _data_end instead of _size avoid modifying _data and _size
+    // in each push_back() which is probably a hotspot.
     void* _data_end;
     IOBuf _buf;
     IOBufAsZeroCopyOutputStream _zc_stream;

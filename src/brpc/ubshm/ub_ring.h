@@ -1,0 +1,253 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#ifndef BRPC_UB_RING_H
+#define BRPC_UB_RING_H
+
+#include <sys/stat.h>
+#include <sys/file.h>
+#include "butil/macros.h"
+#include "butil/reader_writer.h"
+#include "brpc/ubshm/ubr_trx.h"
+#include "brpc/ubshm/shm/shm_mgr.h"
+#include "brpc/ubshm/timer/timer_mgr.h"
+
+namespace brpc {
+namespace ubring {
+DECLARE_int32(ub_flying_io_timeout_s);
+extern uint32_t g_sleep_time[UBR_TASK_STEP_NUM];
+
+class UBRing : public butil::IReader {
+public:
+    UBRing();
+    ~UBRing();
+    DISALLOW_COPY_AND_ASSIGN(UBRing);
+    
+    ssize_t ReadV(const iovec* iov, int iovcnt) override {
+        return UbrTrxReadv(iov, iovcnt);
+    }
+
+    RETURN_CODE UbrTrxMapShm(SHM *local_shm, SHM *remote_shm);
+
+    RETURN_CODE UbrTrxClose();
+
+    RETURN_CODE UbrAddCloseTimer();
+
+    RETURN_CODE UbrAddTimer();
+
+    static void *UbrTrxCloseCallback(void *args);
+
+    RETURN_CODE UbrAddHBTimer();
+
+    static void *UbrTrxHBCallback(void *args);
+
+    static RETURN_CODE UbrPassiveClearTrx(UbrTrx *trx, int fd, PASSIVE_DISC_TYPE type);
+
+    static RETURN_CODE UbrAddAsynClearTimer(UbrTrx *trx);
+
+    static void *UbrAsynClearCallback(void *args);
+
+    int UbrTrxSend(const void *buf, uint32_t buf_len);
+
+    int UbrTrxRecv(void *buf, uint32_t buf_len);
+
+    int UbrTrxRecvBlockMode(uint8_t *dest, uint32_t buf_len);
+
+    ssize_t UbrTrxWritev(const struct iovec *iov, int iovcnt);
+    ssize_t UbrTrxReadv(const struct iovec *iov, int iovcnt);
+    ssize_t UbrTrxReadvBlockMode(const struct iovec *iov, int iovcnt);
+
+    RETURN_CODE IsUbrTrxReadable(uint32_t ep_event);
+
+    RETURN_CODE IsUbrTrxWriteable(uint32_t ep_event);
+
+    RETURN_CODE UbrSetTimeout(UbrTaskStep task_type, int timeout);
+
+    static RETURN_CODE UbrTrxFreeShm(UbrTrx *trx);
+
+    RETURN_CODE UbrUnlinkLocalShm();
+
+    void PrewriteUbrTx(UbrTx *tx);
+    void PrewriteUbrRx(UbrRx *rx);
+
+    static inline void UbrSetSleepTask(UbrTaskStep task_type)
+    {
+        if (task_type >= UBR_TASK_STEP_NUM || task_type < 0) {
+            return;
+        }
+        uint32_t type = (uint32_t)task_type;
+        sleep(g_sleep_time[type]);
+        return;
+    }
+
+    static inline RETURN_CODE CheckTrxConnectParam(const char *listener_name, const char *local_name)
+    {
+        if (UNLIKELY(listener_name == nullptr)) {
+            LOG(ERROR) << "The request listener name is null.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(local_name == nullptr)) {
+            LOG(ERROR) << "The request trx shared memory name is null.";
+            return UBRING_ERR;
+        }
+        return UBRING_OK;
+    }
+
+    int UbrAllocateServerShm(SHM* remote_trx_shm, SHM* local_trx_shm,
+                             UbrDataFormat format);
+
+    // Prepare the IPC_V2 queue layout and connection-local cursors. This does
+    // not start timers, publish CONNECTED or enable the data path.
+    int UbrPrepareIpcV2Format();
+
+    UbrDataFormat data_format() const {
+        return _trx == nullptr ? UBR_DATA_FORMAT_NONE : _trx->data_format;
+    }
+
+#ifdef UNIT_TEST
+    void SetTrxForTest(UbrTrx* trx) { _trx = trx; }
+#endif
+
+    int UbrMapRemoteShm(SHM *local_trx_shm, const char *local_name,
+                       uint64_t remote_shm_len, UbrDataFormat format);
+
+    int UbrAllocateLocalShm(SHM *local_trx_shm, const char *shm_name);
+
+    RETURN_CODE UbrMapRemoteShmAddTimer(SHM *local_trx_shm, const char *local_name,
+                                      uint64_t remote_shm_len,
+                                      UbrDataFormat format);
+
+    static inline RETURN_CODE CheckTrxSendPreCheck(UbrTrx *trx)
+    {
+        if (UNLIKELY(trx == nullptr)) {
+            LOG(ERROR) << "Trx send failed, trx is null.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(trx->ubr_tx.trx_state != UBR_STATE_CONNECTED)) {
+            LOG(ERROR) << "Trx send failed, trx is not connected state.";
+            return UBRING_ERR;
+        }
+
+        return UBRING_OK;
+    }
+    static RETURN_CODE CheckTrxRecvParam(UbrTrx *trx, const void *buf, uint32_t buf_len)
+    {
+        if (UNLIKELY(trx == nullptr)) {
+            LOG(ERROR) << "Trx recv failed, trx is null.";
+            return UBRING_ERR;
+        }
+
+        if (UNLIKELY((UbrEventQMsg *)trx->ubr_rx.local_rx_event_q.addr == nullptr)) {
+            LOG(ERROR) << "Trx send failed, local_tx_event_q addr is NULL.";
+            return UBRING_ERR;
+        }
+
+        if (UNLIKELY(trx->ubr_rx.trx_state != UBR_STATE_CONNECTED)) {
+            LOG(ERROR) << "Trx recv failed, trx is not connected statep=" << trx->ubr_rx.trx_state;
+            return UBR_NOT_CONNECTED;
+        }
+        if (UNLIKELY(buf == nullptr)) {
+            LOG(ERROR) << "Trx recv failed, buf is null.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(buf_len == 0)) {
+            LOG(ERROR) << "Trx recv failed, buf_len is 0.";
+            return UBRING_ERR;
+        }
+        return UBRING_OK;
+    }
+
+    static inline RETURN_CODE CheckTrxRecvPreCheck(UbrTrx *trx)
+    {
+        if (UNLIKELY(trx->ubr_rx.trx_state != UBR_STATE_CONNECTED)) {
+            LOG(ERROR) << "Trx recv failed, trx is not connected state.";
+            return UBRING_ERR;
+        }
+        return UBRING_OK;
+    }
+
+    // The message length and current offset of a received chunk are read out
+    // of the receive ring, which the remote peer writes. The peer is trusted
+    // to keep msg_len within the payload capacity and cur_index within msg_len
+    // (the send path clamps msg_len to UBR_MSG_PAYLOAD_LEN), but nothing
+    // enforces that on the receive side. When msg_len > UBR_MSG_PAYLOAD_LEN or
+    // cur_index > msg_len, reading `payload.inner + cur_index' for
+    // `msg_len - cur_index' bytes runs past the 60-byte payload (the uint8_t
+    // subtraction also wraps when cur_index > msg_len), so validate the header
+    // before using it.
+    static inline bool IsRecvChunkHeaderValid(uint8_t chunk_msg_len,
+                                              uint8_t cur_index)
+    {
+        return chunk_msg_len <= UBR_MSG_PAYLOAD_LEN && cur_index <= chunk_msg_len;
+    }
+
+    static inline void UpdateDataQTail(UbrTrx *trx)
+    {
+        ((UbrDataStatusQMsg *)trx->ubr_rx.remote_data_status_q.addr)->tail = trx->ubr_rx.read_pos;
+    }
+
+    static RETURN_CODE UbrTrxCallbackCheck(UbrTrx *trx)
+    {
+        if (trx == nullptr) {
+            LOG(ERROR) << "Trx close callback failed, trx is null.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(trx->local_shm.addr == nullptr)) {
+            LOG(ERROR) << "Trx close failed, local_shm addr is NULL.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(trx->ubr_rx.local_rx_event_q.addr == nullptr)) {
+            LOG(ERROR) << "Trx close failed, local_rx_event_q addr is NULL.";
+            return UBRING_ERR;
+        }
+        if (UNLIKELY(trx->ubr_tx.local_tx_event_q.addr == nullptr)) {
+            LOG(ERROR) << "Trx close failed, local_tx_event_q addr is NULL.";
+            return UBRING_ERR;
+        }
+        return UBRING_OK;
+    }
+
+private:
+    ssize_t UbrIpcV2Writev(const struct iovec* iov, int iovcnt);
+    ssize_t UbrIpcV2Readv(const struct iovec* iov, int iovcnt);
+    RETURN_CODE IsIpcV2Readable(uint32_t ep_event);
+    RETURN_CODE IsIpcV2Writeable(uint32_t ep_event);
+    RETURN_CODE UbrTrxMapLocalShm(SHM *local_shm);
+    RETURN_CODE UbrTrxMapRemoteShm(SHM *remote_shm);
+    RETURN_CODE ApplyAndMapLocalShm(SHM *local_trx_shm, const char *local_name);
+    RETURN_CODE ApplyAndMapRemoteShm(SHM *remote_trx_shm);
+    static RETURN_CODE UbrTrxCloseCheck(UbrTrx *trx);
+    void ReleaseFileLock(int lock_fd);
+    ssize_t StartReadv(UbrTrx *trx, const struct iovec *iov, int iovcnt, size_t remain_buf_len);
+    void PreWriteAddr(uint8_t *addr, size_t len);
+    RETURN_CODE WritevHasEnoughSpace(size_t buf_len);
+    RETURN_CODE UbrServerTrxInit(SHM* local_shm, SHM* remote_shm,
+                                 UbrDataFormat format);
+    RETURN_CODE InitializeServerLegacyFormat();
+    RETURN_CODE InitializeClientLocalLegacyFormat();
+    void InitializeClientRemoteLegacyFormat();
+    void InitializeClientLegacyFormat();
+    void ActivateClientFormat();
+    static RETURN_CODE UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrCloseType close_type);
+    static RETURN_CODE ClearTrxResource(UbrTrx *trx, uint64_t start_time, UbrCloseType close_type, int op=0);
+
+    UbrTrx* _trx{nullptr};
+};
+}
+}
+
+#endif //BRPC_UB_RING_H

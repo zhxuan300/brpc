@@ -1,18 +1,20 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 // Access many http servers in parallel, much faster than curl (even called in batch)
 
@@ -90,21 +92,21 @@ void* access_thread(void* void_args) {
         done->cntl.http_request().uri() = url;
         done->args = args;
         done->url = url;
-        channel.CallMethod(NULL, &done->cntl, NULL, NULL, done);
+        channel.CallMethod(nullptr, &done->cntl, nullptr, nullptr, done);
     }
-    return NULL;
+    return nullptr;
 }
 
 int main(int argc, char** argv) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     
     // if (FLAGS_path.empty() || FLAGS_path[0] != '/') {
     //     FLAGS_path = "/" + FLAGS_path;
     // }
 
     butil::ScopedFILE fp_guard;
-    FILE* fp = NULL;
+    FILE* fp = nullptr;
     if (!FLAGS_url_file.empty()) {
         fp_guard.reset(fopen(FLAGS_url_file.c_str(), "r"));
         if (!fp_guard) {
@@ -115,7 +117,7 @@ int main(int argc, char** argv) {
     } else {
         fp = stdin;
     }
-    char* line_buf = NULL;
+    char* line_buf = nullptr;
     size_t line_len = 0;
     ssize_t nr = 0;
     std::deque<std::string> url_list;
@@ -142,7 +144,7 @@ int main(int argc, char** argv) {
     std::vector<bthread_t> tids;
     tids.resize(FLAGS_thread_num);
     for (int i = 0; i < FLAGS_thread_num; ++i) {
-        CHECK_EQ(0, bthread_start_background(&tids[i], NULL, access_thread, &args[i]));
+        CHECK_EQ(0, bthread_start_background(&tids[i], nullptr, access_thread, &args[i]));
     }
     std::deque<std::pair<std::string, butil::IOBuf> > output_queue;
     size_t nprinted = 0;
@@ -198,12 +200,14 @@ int main(int argc, char** argv) {
     }
 
     for (int i = 0; i < FLAGS_thread_num; ++i) {
-        bthread_join(tids[i], NULL);
+        bthread_join(tids[i], nullptr);
     }
     for (int i = 0; i < FLAGS_thread_num; ++i) {
         while (args[i].current_concurrency.load(butil::memory_order_relaxed) != 0) {
             usleep(10000);
         }
     }
+
+    delete[] args;
     return 0;
 }

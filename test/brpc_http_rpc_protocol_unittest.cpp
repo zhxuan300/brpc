@@ -1,38 +1,81 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
+#include <atomic>
+#include <cstddef>
+#include <string>
 #include <sys/ioctl.h>
-#include <sys/types.h>
 #include <sys/socket.h>
+#include <butil/build_config.h> // OS_MACOSX
+#if defined(OS_MACOSX)
+#include <sys/event.h>
+#endif
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
-#include <google/protobuf/descriptor.h>
-#include "butil/time.h"
-#include "butil/macros.h"
+#include <google/protobuf/text_format.h>
+#include <unistd.h>
+#include <butil/strings/string_number_conversions.h>
+#include <brpc/policy/http_rpc_protocol.h>
+#include <butil/base64.h>
+#include "brpc/http_method.h"
+#include "butil/iobuf.h"
+#include "butil/logging.h"
 #include "butil/files/scoped_file.h"
+#include "butil/fd_guard.h"
+#include "butil/file_util.h"
 #include "brpc/socket.h"
 #include "brpc/acceptor.h"
 #include "brpc/server.h"
 #include "brpc/channel.h"
 #include "brpc/policy/most_common_message.h"
-#include "brpc/controller.h"
 #include "echo.pb.h"
 #include "brpc/policy/http_rpc_protocol.h"
 #include "brpc/policy/http2_rpc_protocol.h"
 #include "json2pb/pb_to_json.h"
 #include "json2pb/json_to_pb.h"
 #include "brpc/details/method_status.h"
+#include "brpc/rpc_dump.h"
+#include "bthread/unstable.h"
+
+namespace brpc {
+DECLARE_bool(rpc_dump);
+DECLARE_string(rpc_dump_dir);
+DECLARE_int32(rpc_dump_max_requests_in_one_file);
+DECLARE_bool(allow_chunked_length);
+DECLARE_int32(max_connection_pool_size);
+DECLARE_uint64(max_body_size);
+DECLARE_int64(socket_max_unwritten_bytes);
+DECLARE_uint32(http_max_header_count);
+DECLARE_uint32(http_max_query_count);
+extern bvar::CollectorSpeedLimit g_rpc_dump_sl;
+}
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
-    if (GFLAGS_NS::SetCommandLineOption("socket_max_unwritten_bytes", "2000000").empty()) {
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    if (GFLAGS_NAMESPACE::SetCommandLineOption("socket_max_unwritten_bytes", "2000000").empty()) {
         std::cerr << "Fail to set -socket_max_unwritten_bytes" << std::endl;
         return -1;
     }
-    if (GFLAGS_NS::SetCommandLineOption("crash_on_fatal_log", "true").empty()) {
+    if (GFLAGS_NAMESPACE::SetCommandLineOption("crash_on_fatal_log", "true").empty()) {
         std::cerr << "Fail to set -crash_on_fatal_log" << std::endl;
         return -1;
     }
@@ -43,6 +86,8 @@ namespace {
 
 static const std::string EXP_REQUEST = "hello";
 static const std::string EXP_RESPONSE = "world";
+static const std::string EXP_RESPONSE_CONTENT_LENGTH = "1024";
+static const std::string EXP_RESPONSE_TRANSFER_ENCODING = "chunked";
 
 static const std::string MOCK_CREDENTIAL = "mock credential";
 static const std::string MOCK_USER = "mock user";
@@ -77,10 +122,8 @@ public:
         const std::string* sleep_ms_str =
             cntl->http_request().uri().GetQuery("sleep_ms");
         if (sleep_ms_str) {
-            bthread_usleep(strtol(sleep_ms_str->data(), NULL, 10) * 1000);
+            bthread_usleep(strtol(sleep_ms_str->data(), nullptr, 10) * 1000);
         }
-
-        EXPECT_EQ(EXP_REQUEST, req->message());
         res->set_message(EXP_RESPONSE);
     }
 };
@@ -94,7 +137,10 @@ protected:
         // Hack: Regard `_server' as running 
         _server._status = brpc::Server::RUNNING;
         _server._options.auth = &_auth;
-        
+        if (!_server._options.rpc_pb_message_factory) {
+            _server._options.rpc_pb_message_factory = new brpc::DefaultRpcPBMessageFactory();
+        }
+
         EXPECT_EQ(0, pipe(_pipe_fds));
 
         brpc::SocketId id;
@@ -115,16 +161,33 @@ protected:
     virtual void TearDown() {};
 
     void VerifyMessage(brpc::InputMessageBase* msg, bool expect) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
         EXPECT_EQ(expect, brpc::policy::VerifyHttpRequest(msg));
     }
 
+    void VerifyMessageFromLocalPort(brpc::InputMessageBase* msg,
+                                    bool expect,
+                                    int local_port) {
+        brpc::SocketId id;
+        brpc::SocketOptions options;
+        options.fd = dup(_pipe_fds[1]);
+        EXPECT_GE(options.fd, 0);
+        options.local_side = butil::EndPoint(butil::my_ip(), local_port);
+        EXPECT_EQ(0, brpc::Socket::Create(options, &id));
+
+        brpc::SocketUniquePtr socket;
+        EXPECT_EQ(0, brpc::Socket::Address(id, &socket));
+        socket->ReAddress(&msg->_socket);
+        msg->_arg = &_server;
+        EXPECT_EQ(expect, brpc::policy::VerifyHttpRequest(msg));
+    }
+
     void ProcessMessage(void (*process)(brpc::InputMessageBase*),
                         brpc::InputMessageBase* msg, bool set_eof) {
-        if (msg->_socket == NULL) {
+        if (msg->_socket == nullptr) {
             _socket->ReAddress(&msg->_socket);
         }
         msg->_arg = &_server;
@@ -144,7 +207,36 @@ protected:
         test::EchoRequest req;
         req.set_message(EXP_REQUEST);
         butil::IOBufAsZeroCopyOutputStream req_stream(&msg->body());
-        EXPECT_TRUE(json2pb::ProtoMessageToJson(req, &req_stream, NULL));
+        EXPECT_TRUE(json2pb::ProtoMessageToJson(req, &req_stream, nullptr));
+        return msg;
+    }
+
+    brpc::policy::HttpContext* MakePostProtoJsonRequestMessage(const std::string& path) {
+        brpc::policy::HttpContext* msg = new brpc::policy::HttpContext(false);
+        msg->header().uri().set_path(path);
+        msg->header().set_content_type("application/proto-json");
+        msg->header().set_method(brpc::HTTP_METHOD_POST);
+
+        test::EchoRequest req;
+        req.set_message(EXP_REQUEST);
+        butil::IOBufAsZeroCopyOutputStream req_stream(&msg->body());
+        json2pb::Pb2ProtoJsonOptions options;
+        std::string error;
+        EXPECT_TRUE(json2pb::ProtoMessageToProtoJson(req, &req_stream, options, &error)) << error;
+        return msg;
+    }
+
+    brpc::policy::HttpContext* MakePostProtoTextRequestMessage(
+        const std::string& path) {
+        brpc::policy::HttpContext* msg = new brpc::policy::HttpContext(false);
+        msg->header().uri().set_path(path);
+        msg->header().set_content_type("application/proto-text");
+        msg->header().set_method(brpc::HTTP_METHOD_POST);
+
+        test::EchoRequest req;
+        req.set_message(EXP_REQUEST);
+        butil::IOBufAsZeroCopyOutputStream req_stream(&msg->body());
+        EXPECT_TRUE(google::protobuf::TextFormat::Print(req, &req_stream));
         return msg;
     }
 
@@ -153,6 +245,33 @@ protected:
         msg->header().uri().set_path(path);
         msg->header().set_method(brpc::HTTP_METHOD_GET);
         return msg;
+    }
+
+    void InitHttpPooledChannel(brpc::Channel* channel,
+                               const butil::EndPoint& ep,
+                               const std::string& connection_group) {
+        brpc::ChannelOptions options;
+        options.protocol = brpc::PROTOCOL_HTTP;
+        options.connection_type = brpc::CONNECTION_TYPE_POOLED;
+        options.connection_group = connection_group;
+        options.max_retry = 0;
+        ASSERT_EQ(0, channel->Init(ep, &options));
+    }
+
+    void CallVersion(brpc::Channel* channel, brpc::Controller* cntl) {
+        cntl->http_request().uri() = "/status";
+        cntl->http_request().set_method(brpc::HTTP_METHOD_GET);
+        channel->CallMethod(nullptr, cntl, nullptr, nullptr, nullptr);
+    }
+
+    void CallHttpEcho(brpc::Channel* channel, brpc::Controller* cntl) {
+        test::EchoRequest req;
+        test::EchoResponse res;
+        req.set_message(EXP_REQUEST);
+        cntl->http_request().uri() = "/EchoService/Echo";
+        cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
+        cntl->http_request().set_content_type("application/json");
+        channel->CallMethod(nullptr, cntl, &req, &res, nullptr);
     }
 
 
@@ -164,7 +283,7 @@ protected:
         test::EchoResponse res;
         res.set_message(EXP_RESPONSE);
         butil::IOBufAsZeroCopyOutputStream res_stream(&msg->body());
-        EXPECT_TRUE(json2pb::ProtoMessageToJson(res, &res_stream, NULL));
+        EXPECT_TRUE(json2pb::ProtoMessageToJson(res, &res_stream, nullptr));
         return msg;
     }
 
@@ -181,7 +300,7 @@ protected:
         EXPECT_EQ((ssize_t)bytes_in_pipe,
                   buf.append_from_file_descriptor(_pipe_fds[0], 1024));
         brpc::ParseResult pr =
-                brpc::policy::ParseHttpMessage(&buf, _socket.get(), false, NULL);
+                brpc::policy::ParseHttpMessage(&buf, _socket.get(), false, nullptr);
         EXPECT_EQ(brpc::PARSE_OK, pr.error());
         brpc::policy::HttpContext* msg =
             static_cast<brpc::policy::HttpContext*>(pr.message());
@@ -199,9 +318,9 @@ protected:
         ASSERT_FALSE(cntl->Failed());
         brpc::policy::H2UnsentRequest* h2_req = brpc::policy::H2UnsentRequest::New(cntl);
         cntl->_current_call.stream_user_data = h2_req;
-        brpc::SocketMessage* socket_message = NULL;
-        brpc::policy::PackH2Request(NULL, &socket_message, cntl->call_id().value,
-                                    NULL, cntl, request_buf, NULL);
+        brpc::SocketMessage* socket_message = nullptr;
+        brpc::policy::PackH2Request(nullptr, &socket_message, cntl->call_id().value,
+                                    nullptr, cntl, request_buf, nullptr);
         butil::Status st = socket_message->AppendAndDestroySelf(out, _h2_client_sock.get());
         ASSERT_TRUE(st.ok());
         *h2_stream_id = h2_req->_stream_id;
@@ -229,6 +348,51 @@ protected:
     MyEchoService _svc;
     MyAuthenticator _auth;
 };
+
+TEST_F(HttpTest, reject_oversized_http_body) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 4;
+    butil::IOBuf buf;
+    buf.append("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+
+    brpc::ParseResult result =
+        brpc::policy::ParseHttpMessage(&buf, _socket.get(), false, nullptr);
+    EXPECT_EQ(brpc::PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
+    int bytes_in_pipe = 0;
+    ASSERT_EQ(0, ioctl(_pipe_fds[0], FIONREAD, &bytes_in_pipe));
+    ASSERT_GT(bytes_in_pipe, 0);
+    butil::IOPortal response;
+    ASSERT_EQ(bytes_in_pipe,
+              response.append_from_file_descriptor(_pipe_fds[0], bytes_in_pipe));
+    EXPECT_NE(std::string::npos, response.to_string().find(" 413 "));
+}
+
+TEST_F(HttpTest, reject_oversized_chunked_http_body) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 4;
+    butil::IOBuf buf;
+    buf.append("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+               "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+
+    brpc::ParseResult result =
+        brpc::policy::ParseHttpMessage(&buf, _socket.get(), false, nullptr);
+    EXPECT_EQ(brpc::PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
+    int bytes_in_pipe = 0;
+    ASSERT_EQ(0, ioctl(_pipe_fds[0], FIONREAD, &bytes_in_pipe));
+    ASSERT_GT(bytes_in_pipe, 0);
+    butil::IOPortal response;
+    ASSERT_EQ(bytes_in_pipe,
+              response.append_from_file_descriptor(_pipe_fds[0], bytes_in_pipe));
+    EXPECT_NE(std::string::npos, response.to_string().find(" 413 "));
+}
+
+int AllocateFreePortOrDie() {
+    butil::fd_guard fd(tcp_listen(butil::EndPoint(butil::my_ip(), 0)));
+    EXPECT_GE(fd, 0);
+    butil::EndPoint point;
+    EXPECT_EQ(0, butil::get_local_side(fd, &point));
+    return point.port;
+}
 
 TEST_F(HttpTest, indenting_ostream) {
     std::ostringstream os1;
@@ -279,12 +443,18 @@ TEST_F(HttpTest, parse_http_address) {
 TEST_F(HttpTest, verify_request) {
     {
         brpc::policy::HttpContext* msg =
-                MakePostRequestMessage("/EchoService/Echo");
+            MakePostRequestMessage("/EchoService/Echo");
         VerifyMessage(msg, false);
         msg->Destroy();
     }
     {
         brpc::policy::HttpContext* msg = MakeGetRequestMessage("/status");
+        VerifyMessage(msg, false);
+        msg->Destroy();
+    }
+    {
+        brpc::policy::HttpContext* msg = MakeGetRequestMessage("/status");
+        msg->header().SetHeader("Authorization", MOCK_CREDENTIAL);
         VerifyMessage(msg, true);
         msg->Destroy();
     }
@@ -295,6 +465,138 @@ TEST_F(HttpTest, verify_request) {
         VerifyMessage(msg, false);
         msg->Destroy();
     }
+    {
+        brpc::policy::HttpContext* msg =
+            MakePostProtoJsonRequestMessage("/EchoService/Echo");
+        VerifyMessage(msg, false);
+        msg->Destroy();
+    }
+    {
+        brpc::policy::HttpContext* msg =
+                MakePostProtoTextRequestMessage("/EchoService/Echo");
+        VerifyMessage(msg, false);
+        msg->Destroy();
+    }
+}
+
+TEST_F(HttpTest, verify_builtin_request_on_internal_port) {
+    _server._options.internal_port = 9527;
+    {
+        brpc::policy::HttpContext* msg = MakeGetRequestMessage("/status");
+        VerifyMessage(msg, false);
+        msg->Destroy();
+    }
+    {
+        brpc::policy::HttpContext* msg = MakeGetRequestMessage("/status");
+        VerifyMessageFromLocalPort(msg, true, _server._options.internal_port);
+        msg->Destroy();
+    }
+}
+
+TEST_F(HttpTest, builtin_auth_policy_on_public_and_internal_port) {
+    const int saved_max_connection_pool_size = brpc::FLAGS_max_connection_pool_size;
+    brpc::FLAGS_max_connection_pool_size = 1;
+
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:0", &ep));
+
+    brpc::Server server;
+    MyEchoService svc;
+    MyAuthenticator auth;
+    brpc::ServerOptions options;
+    options.auth = &auth;
+    options.internal_port = AllocateFreePortOrDie();
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(ep, &options));
+    ep = server.listen_address();
+    const butil::EndPoint internal_ep(ep.ip, options.internal_port);
+
+    {
+        brpc::Channel chan;
+        brpc::ChannelOptions copt;
+        copt.protocol = brpc::PROTOCOL_HTTP;
+        copt.max_retry = 0;
+        ASSERT_EQ(0, chan.Init(ep, &copt));
+
+        brpc::Controller cntl;
+        cntl.http_request().uri() = "/status";
+        cntl.http_request().set_method(brpc::HTTP_METHOD_GET);
+        chan.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+        ASSERT_TRUE(cntl.Failed());
+        ASSERT_EQ(brpc::EHTTP, cntl.ErrorCode()) << cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_FORBIDDEN, cntl.http_response().status_code());
+    }
+
+    {
+        brpc::Channel chan;
+        brpc::ChannelOptions copt;
+        copt.protocol = brpc::PROTOCOL_HTTP;
+        copt.max_retry = 0;
+        ASSERT_EQ(0, chan.Init(internal_ep, &copt));
+
+        brpc::Controller cntl;
+        cntl.http_request().uri() = "/status";
+        cntl.http_request().set_method(brpc::HTTP_METHOD_GET);
+        chan.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_OK, cntl.http_response().status_code());
+    }
+
+    {
+        const std::string connection_group = "builtin-auth-policy";
+        brpc::Channel builtin_channel;
+        brpc::Channel protected_channel;
+        brpc::ChannelOptions copt;
+        copt.protocol = brpc::PROTOCOL_HTTP;
+        copt.connection_type = brpc::CONNECTION_TYPE_POOLED;
+        copt.connection_group = connection_group;
+        copt.max_retry = 0;
+        ASSERT_EQ(0, builtin_channel.Init(ep, &copt));
+        ASSERT_EQ(0, protected_channel.Init(ep, &copt));
+
+        brpc::Controller builtin_cntl;
+        CallVersion(&builtin_channel, &builtin_cntl);
+        ASSERT_TRUE(builtin_cntl.Failed());
+        ASSERT_EQ(brpc::EHTTP, builtin_cntl.ErrorCode()) << builtin_cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_FORBIDDEN, builtin_cntl.http_response().status_code());
+
+        brpc::Controller protected_cntl;
+        CallHttpEcho(&protected_channel, &protected_cntl);
+        ASSERT_TRUE(protected_cntl.Failed());
+    }
+
+    {
+        // A builtin request is exempted from authentication on internal_port
+        // and its verdict latches the whole connection, so the exemption would
+        // carry over to whatever is sent next on that very connection. Only
+        // builtin services are served there, which keeps the latch harmless.
+        const std::string connection_group = "builtin-auth-policy-internal";
+        brpc::Channel builtin_channel;
+        brpc::Channel protected_channel;
+        brpc::ChannelOptions copt;
+        copt.protocol = brpc::PROTOCOL_HTTP;
+        copt.connection_type = brpc::CONNECTION_TYPE_POOLED;
+        copt.connection_group = connection_group;
+        copt.max_retry = 0;
+        ASSERT_EQ(0, builtin_channel.Init(internal_ep, &copt));
+        ASSERT_EQ(0, protected_channel.Init(internal_ep, &copt));
+
+        brpc::Controller builtin_cntl;
+        CallVersion(&builtin_channel, &builtin_cntl);
+        ASSERT_FALSE(builtin_cntl.Failed()) << builtin_cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_OK, builtin_cntl.http_response().status_code());
+
+        brpc::Controller protected_cntl;
+        CallHttpEcho(&protected_channel, &protected_cntl);
+        ASSERT_TRUE(protected_cntl.Failed());
+        ASSERT_EQ(brpc::EHTTP, protected_cntl.ErrorCode()) << protected_cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_FORBIDDEN,
+                  protected_cntl.http_response().status_code());
+    }
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+    brpc::FLAGS_max_connection_pool_size = saved_max_connection_pool_size;
 }
 
 TEST_F(HttpTest, process_request_failed_socket) {
@@ -401,13 +703,13 @@ TEST_F(HttpTest, complete_flow) {
     brpc::policy::SerializeHttpRequest(&request_buf, &cntl, &req);
     ASSERT_FALSE(cntl.Failed());
     brpc::policy::PackHttpRequest(
-        &total_buf, NULL, cntl.call_id().value,
+        &total_buf, nullptr, cntl.call_id().value,
         cntl._method, &cntl, request_buf, &_auth);
     ASSERT_FALSE(cntl.Failed());
 
     // Verify and handle request
     brpc::ParseResult req_pr =
-            brpc::policy::ParseHttpMessage(&total_buf, _socket.get(), false, NULL);
+            brpc::policy::ParseHttpMessage(&total_buf, _socket.get(), false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, req_pr.error());
     brpc::InputMessageBase* req_msg = req_pr.message();
     VerifyMessage(req_msg, true);
@@ -417,7 +719,7 @@ TEST_F(HttpTest, complete_flow) {
     butil::IOPortal response_buf;
     response_buf.append_from_file_descriptor(_pipe_fds[0], 1024);
     brpc::ParseResult res_pr =
-            brpc::policy::ParseHttpMessage(&response_buf, _socket.get(), false, NULL);
+            brpc::policy::ParseHttpMessage(&response_buf, _socket.get(), false, nullptr);
     ASSERT_EQ(brpc::PARSE_OK, res_pr.error());
     brpc::InputMessageBase* res_msg = res_pr.message();
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_msg, false);
@@ -427,10 +729,10 @@ TEST_F(HttpTest, complete_flow) {
 }
 
 TEST_F(HttpTest, chunked_uploading) {
-    const int port = 8923;
     brpc::Server server;
-    EXPECT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
 
     // Send request via curl using chunked encoding
     const std::string req = "{\"message\":\"hello\"}";
@@ -467,9 +769,13 @@ static void CopyPAPrefixedWithSeqNo(char* buf, uint64_t seq_no) {
 class DownloadServiceImpl : public ::test::DownloadService {
 public:
     DownloadServiceImpl(DonePlace done_place = DONE_BEFORE_CREATE_PA,
-                        size_t num_repeat = 1)
+                        size_t num_repeat = 1,
+                        int write_interval_us = 0,
+                        int initial_write_delay_us = 0)
         : _done_place(done_place)
         , _nrep(num_repeat)
+        , _write_interval_us(write_interval_us)
+        , _initial_write_delay_us(initial_write_delay_us)
         , _nwritten(0)
         , _ever_full(false)
         , _last_errno(0) {}
@@ -484,14 +790,17 @@ public:
         cntl->http_response().set_content_type("text/plain");
         brpc::StopStyle stop_style = (_nrep == std::numeric_limits<size_t>::max() 
                 ? brpc::FORCE_STOP : brpc::WAIT_FOR_STOP);
-        butil::intrusive_ptr<brpc::ProgressiveAttachment> pa(
-                cntl->CreateProgressiveAttachment(stop_style));
-        if (pa == NULL) {
+        butil::intrusive_ptr<brpc::ProgressiveAttachment> pa
+            = cntl->CreateProgressiveAttachment(stop_style);
+        if (pa == nullptr) {
             cntl->SetFailed("The socket was just failed");
             return;
         }
         if (_done_place == DONE_BEFORE_CREATE_PA) {
-            done_guard.reset(NULL);
+            done_guard.reset(nullptr);
+        }
+        if (_initial_write_delay_us > 0) {
+            bthread_usleep(_initial_write_delay_us);
         }
         ASSERT_GT(PA_DATA_LEN, 8u);  // long enough to hold a 64-bit decimal.
         char buf[PA_DATA_LEN];
@@ -509,16 +818,19 @@ public:
                 }
             } else {
                 _nwritten += PA_DATA_LEN;
+                if (_write_interval_us > 0) {
+                    bthread_usleep(_write_interval_us);
+                }
             }
             ++c;
         }
         if (_done_place == DONE_AFTER_CREATE_PA_BEFORE_DESTROY_PA) {
-            done_guard.reset(NULL);
+            done_guard.reset(nullptr);
         }
         LOG(INFO) << "Destroy pa="  << pa.get();
-        pa.reset(NULL);
+        pa.reset(nullptr);
         if (_done_place == DONE_AFTER_DESTROY_PA) {
-            done_guard.reset(NULL);
+            done_guard.reset(nullptr);
         }
     }
 
@@ -532,9 +844,9 @@ public:
         cntl->http_response().set_content_type("text/plain");
         brpc::StopStyle stop_style = (_nrep == std::numeric_limits<size_t>::max() 
                 ? brpc::FORCE_STOP : brpc::WAIT_FOR_STOP);
-        butil::intrusive_ptr<brpc::ProgressiveAttachment> pa(
-                cntl->CreateProgressiveAttachment(stop_style));
-        if (pa == NULL) {
+        butil::intrusive_ptr<brpc::ProgressiveAttachment> pa
+            = cntl->CreateProgressiveAttachment(stop_style);
+        if (pa == nullptr) {
             cntl->SetFailed("The socket was just failed");
             return;
         }
@@ -555,7 +867,7 @@ public:
         // The remote client will not receive the data written to the
         // progressive attachment when the controller failed.
         cntl->SetFailed("Intentionally set controller failed");
-        done_guard.reset(NULL);
+        done_guard.reset(nullptr);
         
         // Return value of Write after controller has failed should
         // be less than zero.
@@ -571,17 +883,19 @@ public:
 private:
     DonePlace _done_place;
     size_t _nrep;
+    int _write_interval_us;
+    int _initial_write_delay_us;
     size_t _nwritten;
     bool _ever_full;
     int _last_errno;
 };
     
 TEST_F(HttpTest, read_chunked_response_normally) {
-    const int port = 8923;
     brpc::Server server;
     DownloadServiceImpl svc;
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
 
     for (int i = 0; i < 3; ++i) {
         svc.set_done_place((DonePlace)i);
@@ -591,7 +905,7 @@ TEST_F(HttpTest, read_chunked_response_normally) {
         ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
         brpc::Controller cntl;
         cntl.http_request().uri() = "/DownloadService/Download";
-        channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
 
         std::string expected(PA_DATA_LEN, 0);
@@ -601,11 +915,11 @@ TEST_F(HttpTest, read_chunked_response_normally) {
 }
 
 TEST_F(HttpTest, read_failed_chunked_response) {
-    const int port = 8923;
     brpc::Server server;
     DownloadServiceImpl svc;
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
 
     brpc::Channel channel;
     brpc::ChannelOptions options;
@@ -615,7 +929,7 @@ TEST_F(HttpTest, read_failed_chunked_response) {
     brpc::Controller cntl;
     cntl.http_request().uri() = "/DownloadService/DownloadFailed";
     cntl.response_will_be_read_progressively();
-    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
     EXPECT_TRUE(cntl.response_attachment().empty());
     ASSERT_TRUE(cntl.Failed());
     ASSERT_NE(cntl.ErrorText().find("HTTP/1.1 500 Internal Server Error"),
@@ -672,17 +986,62 @@ private:
     butil::Status _destroying_st;
 };
 
+class TimeoutReadBody : public brpc::ProgressiveReader,
+                        public brpc::SharedObject {
+public:
+    explicit TimeoutReadBody(int read_delay_us = 0, int read_error = 0)
+        : _read_delay_us(read_delay_us)
+        , _read_error(read_error)
+        , _nread(0)
+        , _nend(0)
+        , _end_error(0) {
+        butil::intrusive_ptr<TimeoutReadBody>(this).detach();
+    }
+
+    butil::Status OnReadOnePart(const void*, size_t length) override {
+        if (_read_delay_us > 0) {
+            bthread_usleep(_read_delay_us);
+        }
+        _nread.fetch_add(length);
+        if (_read_error != 0) {
+            return butil::Status(_read_error, "intended progressive read failure");
+        }
+        return butil::Status::OK();
+    }
+
+    void OnEndOfMessage(const butil::Status& status) override {
+        _end_error.store(status.error_code());
+        _nend.fetch_add(1);
+        butil::intrusive_ptr<TimeoutReadBody>(this, false);
+    }
+
+    size_t read_bytes() const { return _nread.load(); }
+    int end_count() const { return _nend.load(); }
+    int end_error() const { return _end_error.load(); }
+
+private:
+    const int _read_delay_us;
+    const int _read_error;
+    std::atomic<size_t> _nread;
+    std::atomic<int> _nend;
+    std::atomic<int> _end_error;
+};
+
+#ifdef BUTIL_USE_ASAN
+static const int GENERAL_DELAY_US = 1000000; // 1s
+#else
 static const int GENERAL_DELAY_US = 300000; // 0.3s
+#endif
 
 TEST_F(HttpTest, read_long_body_progressively) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
+                            std::numeric_limits<size_t>::max());
     butil::intrusive_ptr<ReadBody> reader;
     {
-        const int port = 8923;
         brpc::Server server;
-        DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
-                                std::numeric_limits<size_t>::max());
-        EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-        EXPECT_EQ(0, server.Start(port, NULL));
+        ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+        ASSERT_EQ(0, server.Start(0, nullptr));
+        int port = server.listen_address().port;
         {
             brpc::Channel channel;
             brpc::ChannelOptions options;
@@ -692,7 +1051,7 @@ TEST_F(HttpTest, read_long_body_progressively) {
                 brpc::Controller cntl;
                 cntl.response_will_be_read_progressively();
                 cntl.http_request().uri() = "/DownloadService/Download";
-                channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+                channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
                 ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
                 ASSERT_TRUE(cntl.response_attachment().empty());
                 reader.reset(new ReadBody);
@@ -706,7 +1065,7 @@ TEST_F(HttpTest, read_long_body_progressively) {
                     last_read = current_read;
                 }
                 // Read something in past N seconds.
-                ASSERT_GT(last_read, 100000);
+                ASSERT_GT(last_read, (size_t)100000);
             }
             // the socket still holds a ref.
             ASSERT_FALSE(reader->destroyed());
@@ -725,12 +1084,12 @@ TEST_F(HttpTest, read_long_body_progressively) {
 
 TEST_F(HttpTest, read_short_body_progressively) {
     butil::intrusive_ptr<ReadBody> reader;
-    const int port = 8923;
     brpc::Server server;
     const int NREP = 10000;
     DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, NREP);
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
     {
         brpc::Channel channel;
         brpc::ChannelOptions options;
@@ -740,7 +1099,7 @@ TEST_F(HttpTest, read_short_body_progressively) {
             brpc::Controller cntl;
             cntl.response_will_be_read_progressively();
             cntl.http_request().uri() = "/DownloadService/Download";
-            channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+            channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
             ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
             ASSERT_TRUE(cntl.response_attachment().empty());
             reader.reset(new ReadBody);
@@ -761,15 +1120,197 @@ TEST_F(HttpTest, read_short_body_progressively) {
     }
 }
 
+TEST_F(HttpTest, progressive_read_timeout_keeps_active_reader_alive) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 8, 100000);
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    cntl.response_will_be_read_progressively();
+    cntl.set_progressive_read_timeout_ms(500);
+    cntl.http_request().uri() = "/DownloadService/Download";
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(new TimeoutReadBody);
+    cntl.ReadProgressiveAttachmentBy(reader.get());
+    for (int i = 0; i < 200 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(0, reader->end_error());
+    EXPECT_EQ(8 * PA_DATA_LEN, reader->read_bytes());
+}
+
+TEST_F(HttpTest, progressive_read_timeout_closes_idle_http1_reader_once) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 2, 300000);
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(new TimeoutReadBody);
+    {
+        brpc::Channel channel;
+        brpc::ChannelOptions options;
+        options.protocol = brpc::PROTOCOL_HTTP;
+        ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+        {
+            brpc::Controller cntl;
+            cntl.response_will_be_read_progressively();
+            cntl.set_progressive_read_timeout_ms(50);
+            cntl.http_request().uri() = "/DownloadService/Download";
+            channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+            ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+            cntl.ReadProgressiveAttachmentBy(reader.get());
+            bthread_usleep(400000);
+            EXPECT_EQ(0, reader->end_count());
+        }
+    }
+    for (int i = 0; i < 100 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(brpc::EPROGREADTIMEOUT, reader->end_error());
+    bthread_usleep(400000);
+    EXPECT_EQ(1, reader->end_count());
+}
+
+TEST_F(HttpTest, progressive_read_timeout_before_first_body_part) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 1, 0, 300000);
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(new TimeoutReadBody);
+    {
+        brpc::Channel channel;
+        brpc::ChannelOptions options;
+        options.protocol = brpc::PROTOCOL_HTTP;
+        ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+        {
+            brpc::Controller cntl;
+            cntl.response_will_be_read_progressively();
+            cntl.set_progressive_read_timeout_ms(50);
+            cntl.http_request().uri() = "/DownloadService/Download";
+            channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+            ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+            cntl.ReadProgressiveAttachmentBy(reader.get());
+            bthread_usleep(400000);
+            EXPECT_EQ(size_t(0), reader->read_bytes());
+            EXPECT_EQ(0, reader->end_count());
+        }
+    }
+    for (int i = 0; i < 100 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(brpc::EPROGREADTIMEOUT, reader->end_error());
+}
+
+TEST_F(HttpTest, progressive_read_timeout_ignores_slow_user_callback) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 3, 50000);
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    cntl.response_will_be_read_progressively();
+    cntl.set_progressive_read_timeout_ms(50);
+    cntl.http_request().uri() = "/DownloadService/Download";
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(
+        new TimeoutReadBody(200000));
+    cntl.ReadProgressiveAttachmentBy(reader.get());
+    for (int i = 0; i < 100 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(0, reader->end_error());
+    EXPECT_EQ(3 * PA_DATA_LEN, reader->read_bytes());
+}
+
+TEST_F(HttpTest, progressive_read_timeout_preserves_reader_error) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 10);
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    cntl.response_will_be_read_progressively();
+    cntl.set_progressive_read_timeout_ms(1000);
+    cntl.http_request().uri() = "/DownloadService/Download";
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(
+        new TimeoutReadBody(0, EIO));
+    cntl.ReadProgressiveAttachmentBy(reader.get());
+    for (int i = 0; i < 100 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(EIO, reader->end_error());
+}
+
+TEST_F(HttpTest, progressive_read_timeout_rejects_http2) {
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_H2;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    cntl.response_will_be_read_progressively();
+    cntl.set_progressive_read_timeout_ms(1000);
+    cntl.http_request().uri() = "/EchoService/Echo";
+    test::EchoRequest req;
+    req.set_message(EXP_REQUEST);
+    channel.CallMethod(nullptr, &cntl, &req, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    butil::intrusive_ptr<TimeoutReadBody> reader(new TimeoutReadBody);
+    cntl.ReadProgressiveAttachmentBy(reader.get());
+    ASSERT_EQ(1, reader->end_count());
+    EXPECT_EQ(ENOTSUP, reader->end_error());
+    EXPECT_EQ(size_t(0), reader->read_bytes());
+}
+
 TEST_F(HttpTest, read_progressively_after_cntl_destroys) {
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
+                            std::numeric_limits<size_t>::max());
     butil::intrusive_ptr<ReadBody> reader;
     {
-        const int port = 8923;
         brpc::Server server;
-        DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
-                                std::numeric_limits<size_t>::max());
-        EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-        EXPECT_EQ(0, server.Start(port, NULL));
+        ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+        ASSERT_EQ(0, server.Start(0, nullptr));
+        int port = server.listen_address().port;
         {
             brpc::Channel channel;
             brpc::ChannelOptions options;
@@ -779,7 +1320,7 @@ TEST_F(HttpTest, read_progressively_after_cntl_destroys) {
                 brpc::Controller cntl;
                 cntl.response_will_be_read_progressively();
                 cntl.http_request().uri() = "/DownloadService/Download";
-                channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+                channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
                 ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
                 ASSERT_TRUE(cntl.response_attachment().empty());
                 reader.reset(new ReadBody);
@@ -794,7 +1335,7 @@ TEST_F(HttpTest, read_progressively_after_cntl_destroys) {
                 last_read = current_read;
             }
             // Read something in past N seconds.
-            ASSERT_GT(last_read, 100000);
+            ASSERT_GT(last_read, (size_t)100000);
             ASSERT_FALSE(reader->destroyed());
         }
         // Wait for recycling of the main socket.
@@ -809,13 +1350,13 @@ TEST_F(HttpTest, read_progressively_after_cntl_destroys) {
 
 TEST_F(HttpTest, read_progressively_after_long_delay) {
     butil::intrusive_ptr<ReadBody> reader;
+    DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
+                            std::numeric_limits<size_t>::max());
     {
-        const int port = 8923;
         brpc::Server server;
-        DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
-                                std::numeric_limits<size_t>::max());
-        EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-        EXPECT_EQ(0, server.Start(port, NULL));
+        ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+        ASSERT_EQ(0, server.Start(0, nullptr));
+        int port = server.listen_address().port;
         {
             brpc::Channel channel;
             brpc::ChannelOptions options;
@@ -825,7 +1366,7 @@ TEST_F(HttpTest, read_progressively_after_long_delay) {
                 brpc::Controller cntl;
                 cntl.response_will_be_read_progressively();
                 cntl.http_request().uri() = "/DownloadService/Download";
-                channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+                channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
                 ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
                 ASSERT_TRUE(cntl.response_attachment().empty());
                 LOG(INFO) << "Sleep 3 seconds to make PA at server-side full";
@@ -843,7 +1384,7 @@ TEST_F(HttpTest, read_progressively_after_long_delay) {
                     last_read = current_read;
                 }
                 // Read something in past N seconds.
-                ASSERT_GT(last_read, 100000);
+                ASSERT_GT(last_read, (size_t)100000);
             }
             ASSERT_FALSE(reader->destroyed());
         }
@@ -858,12 +1399,12 @@ TEST_F(HttpTest, read_progressively_after_long_delay) {
 }
 
 TEST_F(HttpTest, skip_progressive_reading) {
-    const int port = 8923;
-    brpc::Server server;
     DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
                             std::numeric_limits<size_t>::max());
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
     brpc::Channel channel;
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_HTTP;
@@ -872,7 +1413,7 @@ TEST_F(HttpTest, skip_progressive_reading) {
         brpc::Controller cntl;
         cntl.response_will_be_read_progressively();
         cntl.http_request().uri() = "/DownloadService/Download";
-        channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_TRUE(cntl.response_attachment().empty());
     }
@@ -883,7 +1424,7 @@ TEST_F(HttpTest, skip_progressive_reading) {
     ASSERT_EQ(0, svc.last_errno());
     LOG(INFO) << "Server still wrote " << new_written_bytes - old_written_bytes;
     // The server side still wrote things.
-    ASSERT_GT(new_written_bytes - old_written_bytes, 100000);
+    ASSERT_GT(new_written_bytes - old_written_bytes, (size_t)100000);
 }
 
 class AlwaysFailRead : public brpc::ProgressiveReader {
@@ -899,12 +1440,12 @@ public:
 };
 
 TEST_F(HttpTest, failed_on_read_one_part) {
-    const int port = 8923;
     brpc::Server server;
     DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
                             std::numeric_limits<size_t>::max());
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
     brpc::Channel channel;
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_HTTP;
@@ -913,7 +1454,7 @@ TEST_F(HttpTest, failed_on_read_one_part) {
         brpc::Controller cntl;
         cntl.response_will_be_read_progressively();
         cntl.http_request().uri() = "/DownloadService/Download";
-        channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_TRUE(cntl.response_attachment().empty());
         cntl.ReadProgressiveAttachmentBy(new AlwaysFailRead);
@@ -925,12 +1466,12 @@ TEST_F(HttpTest, failed_on_read_one_part) {
 
 TEST_F(HttpTest, broken_socket_stops_progressive_reading) {
     butil::intrusive_ptr<ReadBody> reader;
-    const int port = 8923;
     brpc::Server server;
     DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA,
                             std::numeric_limits<size_t>::max());
-    EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
         
     brpc::Channel channel;
     brpc::ChannelOptions options;
@@ -940,7 +1481,7 @@ TEST_F(HttpTest, broken_socket_stops_progressive_reading) {
         brpc::Controller cntl;
         cntl.response_will_be_read_progressively();
         cntl.http_request().uri() = "/DownloadService/Download";
-        channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_TRUE(cntl.response_attachment().empty());
         reader.reset(new ReadBody);
@@ -954,7 +1495,7 @@ TEST_F(HttpTest, broken_socket_stops_progressive_reading) {
             last_read = current_read;
         }
         // Read something in past N seconds.
-        ASSERT_GT(last_read, 100000);
+        ASSERT_GT(last_read, (size_t)100000);
     }
     // the socket still holds a ref.
     ASSERT_FALSE(reader->destroyed());
@@ -968,29 +1509,197 @@ TEST_F(HttpTest, broken_socket_stops_progressive_reading) {
     ASSERT_EQ(ECONNRESET, reader->destroying_status().error_code());
 }
 
-TEST_F(HttpTest, http2_sanity) {
-    const int port = 8923;
+#ifndef BUTIL_USE_ASAN
+static const std::string TEST_PROGRESSIVE_HEADER = "Progressive";
+static const std::string TEST_PROGRESSIVE_HEADER_VAL = "Progressive-val";
+
+class ServerProgressiveReader : public ReadBody {
+public:
+    ServerProgressiveReader(brpc::Controller* cntl, google::protobuf::Closure* done) 
+        : _cntl(cntl)
+        , _done(done) {}
+
+    // @ProgressiveReader
+    void OnEndOfMessage(const butil::Status& st) {
+        butil::intrusive_ptr<ReadBody>(this);
+        brpc::ClosureGuard done_guard(_done);
+        ASSERT_LT(_buf.size(), PA_DATA_LEN);
+        ASSERT_EQ(0, memcmp(_buf.data(), PA_DATA, _buf.size()));
+        _destroyed = true;
+        _destroying_st = st;
+        LOG(INFO) << "Destroy ReadBody=" << this << ", " << st;
+        _cntl->response_attachment().append("Success");
+    }
+private:
+    brpc::Controller* _cntl;
+    google::protobuf::Closure* _done;
+};
+
+class ServerAlwaysFailReader : public brpc::ProgressiveReader {
+public:
+    ServerAlwaysFailReader(brpc::Controller* cntl, google::protobuf::Closure* done) 
+        : _cntl(cntl)
+        , _done(done) {}
+
+    // @ProgressiveReader
+    butil::Status OnReadOnePart(const void* /*data*/, size_t /*length*/) {
+        return butil::Status(-1, "intended fail at %s:%d", __FILE__, __LINE__);
+    }    
+
+    void OnEndOfMessage(const butil::Status& st) {
+        brpc::ClosureGuard done_guard(_done);
+        CHECK_EQ(-1, st.error_code());
+        _cntl->SetFailed("Must Failed");
+        LOG(INFO) << "Destroy " << this << ": " << st;
+        delete this;
+    }
+private:
+    brpc::Controller* _cntl;
+    google::protobuf::Closure* _done;
+};
+
+class UploadServiceImpl : public ::test::UploadService {
+public:
+    void Upload(::google::protobuf::RpcController* controller,
+                        const ::test::HttpRequest* request,
+                        ::test::HttpResponse* response,
+                        ::google::protobuf::Closure* done) {
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(controller);
+        check_header(cntl);
+        cntl->request_will_be_read_progressively();
+        cntl->ReadProgressiveAttachmentBy(new ServerProgressiveReader(cntl, done));
+    }
+                        
+    void UploadFailed(::google::protobuf::RpcController* controller,
+                        const ::test::HttpRequest* request,
+                        ::test::HttpResponse* response,
+                        ::google::protobuf::Closure* done) {
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(controller);
+        check_header(cntl);
+        cntl->request_will_be_read_progressively();
+        cntl->ReadProgressiveAttachmentBy(new ServerAlwaysFailReader(cntl, done));
+    }
+
+private:
+    void check_header(brpc::Controller* cntl) {
+        const std::string* test_header = cntl->http_request().GetHeader(TEST_PROGRESSIVE_HEADER);
+        CHECK(test_header != nullptr);
+        CHECK_EQ(*test_header, TEST_PROGRESSIVE_HEADER_VAL);
+    }
+};
+
+TEST_F(HttpTest, server_end_read_short_body_progressively) {
+    brpc::ServiceOptions opt;
+    opt.enable_progressive_read = true;
+    opt.ownership = brpc::SERVER_DOESNT_OWN_SERVICE;
+    UploadServiceImpl upsvc;
     brpc::Server server;
-    EXPECT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&upsvc, opt));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+    brpc::Controller cntl;
+    cntl.http_request().uri() = "/UploadService/Upload";
+    cntl.http_request().SetHeader(TEST_PROGRESSIVE_HEADER, TEST_PROGRESSIVE_HEADER_VAL);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    
+    ASSERT_GT(PA_DATA_LEN, 8u);  // long enough to hold a 64-bit decimal.
+    char buf[PA_DATA_LEN];
+    for (size_t c = 0; c < 10000;) {
+        CopyPAPrefixedWithSeqNo(buf, c);
+        if (cntl.request_attachment().append(buf, sizeof(buf)) != 0) {
+            if (errno == brpc::EOVERCROWDED) {
+                LOG(INFO) << "full msg=" << cntl.request_attachment().to_string();
+            } else {
+                LOG(INFO) << "Error:" << errno;
+            }
+            break;
+        }
+        ++c;
+    }
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+}
+
+// Fixme!!! Server progressive reader has a heap-use-after-free bug detected by ASan.
+// For details, see https://github.com/apache/brpc/issues/2145#issuecomment-2329413363
+TEST_F(HttpTest, server_end_read_failed) {
+    brpc::ServiceOptions opt;
+    opt.enable_progressive_read = true;
+    opt.ownership = brpc::SERVER_DOESNT_OWN_SERVICE;
+    UploadServiceImpl upsvc;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&upsvc, opt));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+    brpc::Controller cntl;
+    cntl.http_request().uri() = "/UploadService/UploadFailed";
+    cntl.http_request().SetHeader(TEST_PROGRESSIVE_HEADER, TEST_PROGRESSIVE_HEADER_VAL);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+
+    ASSERT_GT(PA_DATA_LEN, 8u);  // long enough to hold a 64-bit decimal.
+    char buf[PA_DATA_LEN];
+    for (size_t c = 0; c < 10;) {
+        CopyPAPrefixedWithSeqNo(buf, c);
+        if (cntl.request_attachment().append(buf, sizeof(buf)) != 0) {
+            if (errno == brpc::EOVERCROWDED) {
+                LOG(INFO) << "full msg=" << cntl.request_attachment().to_string();
+            } else {
+                LOG(INFO) << "Error:" << errno;
+            }
+            break;
+        }
+        ++c;
+    }
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(cntl.Failed());
+}
+#endif // BUTIL_USE_ASAN
+
+TEST_F(HttpTest, http2_sanity) {
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
 
     brpc::Channel channel;
     brpc::ChannelOptions options;
     options.protocol = "h2";
     ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
 
-    // 1) complete flow and
-    // 2) socket replacement when streamId runs out, the initial streamId is a special
-    // value set in ctor of H2Context
+    // Check that the first request larger than the default window completes
+    // after SETTINGS and WINDOW_UPDATE make more capacity available.
+    brpc::Controller cntl;
+    test::EchoRequest big_req;
+    test::EchoResponse res;
+    std::string message(128 * 1024, 'x');
+    big_req.set_message(message);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    cntl.http_request().uri() = "/EchoService/Echo";
+    channel.CallMethod(nullptr, &cntl, &big_req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+
+    // socket replacement when streamId runs out, the initial streamId is a special
+    // value set in ctor of H2Context so that the number 15000 is enough to run out
+    // of stream.
     test::EchoRequest req;
     req.set_message(EXP_REQUEST);
-    test::EchoResponse res;
     for (int i = 0; i < 15000; ++i) {
         brpc::Controller cntl;
         cntl.http_request().set_content_type("application/json");
         cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
         cntl.http_request().uri() = "/EchoService/Echo";
-        channel.CallMethod(NULL, &cntl, &req, &res, NULL);
+        channel.CallMethod(nullptr, &cntl, &req, &res, nullptr);
         ASSERT_FALSE(cntl.Failed());
         ASSERT_EQ(EXP_RESPONSE, res.message());
     }
@@ -999,7 +1708,7 @@ TEST_F(HttpTest, http2_sanity) {
     brpc::SocketUniquePtr main_ptr;
     brpc::SocketUniquePtr agent_ptr;
     EXPECT_EQ(brpc::Socket::Address(channel._server_id, &main_ptr), 0);
-    EXPECT_EQ(main_ptr->GetAgentSocket(&agent_ptr, NULL), 0);
+    EXPECT_EQ(main_ptr->GetAgentSocket(&agent_ptr, nullptr), 0);
     brpc::policy::H2Context* ctx = static_cast<brpc::policy::H2Context*>(agent_ptr->parsing_context());
     ASSERT_GT(ctx->_remote_window_left.load(butil::memory_order_relaxed),
              brpc::H2Settings::DEFAULT_INITIAL_WINDOW_SIZE / 2);
@@ -1024,7 +1733,7 @@ TEST_F(HttpTest, http2_ping) {
     res_out.append(pingbuf, sizeof(pingbuf));
     // parse response
     brpc::ParseResult res_pr =
-            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_TRUE(res_pr.is_ok());
     // process response
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_pr.message(), false);
@@ -1054,7 +1763,7 @@ TEST_F(HttpTest, http2_rst_before_header) {
     MakeH2EchoResponseBuf(&res_out, h2_stream_id);
     // parse response
     brpc::ParseResult res_pr =
-            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_TRUE(res_pr.is_ok());
     // process response
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_pr.message(), false);
@@ -1078,7 +1787,7 @@ TEST_F(HttpTest, http2_rst_after_header_and_data) {
     res_out.append(rstbuf, sizeof(rstbuf));
     // parse response
     brpc::ParseResult res_pr =
-            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_TRUE(res_pr.is_ok());
     // process response
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_pr.message(), false);
@@ -1086,7 +1795,7 @@ TEST_F(HttpTest, http2_rst_after_header_and_data) {
     ASSERT_TRUE(cntl.http_response().status_code() == brpc::HTTP_STATUS_OK);
 }
 
-TEST_F(HttpTest, http2_window_used_up) {
+TEST_F(HttpTest, http2_window_used_up_buffers_request) {
     brpc::Controller cntl;
     butil::IOBuf request_buf;
     test::EchoRequest req;
@@ -1096,24 +1805,39 @@ TEST_F(HttpTest, http2_window_used_up) {
     cntl.http_request().set_content_type("application/proto");
     brpc::policy::SerializeHttpRequest(&request_buf, &cntl, &req);
 
+    char settingsbuf[brpc::policy::FRAME_HEAD_SIZE + 36];
+    brpc::H2Settings h2_settings;
+    // The fake server advertises an unlimited stream count so the test can
+    // fill the flow-control window with many streams: this test exercises
+    // WINDOW_UPDATE buffering, not SETTINGS_MAX_CONCURRENT_STREAMS (which
+    // defaults to a bounded value now).
+    h2_settings.max_concurrent_streams = std::numeric_limits<uint32_t>::max();
+    const size_t nb = brpc::policy::SerializeH2Settings(h2_settings, settingsbuf + brpc::policy::FRAME_HEAD_SIZE);
+    brpc::policy::SerializeFrameHead(settingsbuf, nb, brpc::policy::H2_FRAME_SETTINGS, 0, 0);
+    butil::IOBuf buf;
+    buf.append(settingsbuf, brpc::policy::FRAME_HEAD_SIZE + nb);
+    brpc::policy::ParseH2Message(&buf, _h2_client_sock.get(), false, nullptr);
+
+    brpc::policy::H2Context* ctx = static_cast<brpc::policy::H2Context*>(
+        _h2_client_sock->parsing_context());
     int nsuc = brpc::H2Settings::DEFAULT_INITIAL_WINDOW_SIZE / cntl.request_attachment().size();
     for (int i = 0; i <= nsuc; i++) {
         brpc::policy::H2UnsentRequest* h2_req = brpc::policy::H2UnsentRequest::New(&cntl);
         cntl._current_call.stream_user_data = h2_req;
-        brpc::SocketMessage* socket_message = NULL;
-        brpc::policy::PackH2Request(NULL, &socket_message, cntl.call_id().value,
-                                    NULL, &cntl, request_buf, NULL);
+        brpc::SocketMessage* socket_message = nullptr;
+        brpc::policy::PackH2Request(nullptr, &socket_message, cntl.call_id().value,
+                                    nullptr, &cntl, request_buf, nullptr);
         butil::IOBuf dummy;
         butil::Status st = socket_message->AppendAndDestroySelf(&dummy, _h2_client_sock.get());
+        ASSERT_TRUE(st.ok());
         if (i == nsuc) {
-            // the last message should fail according to flow control policy.
-            ASSERT_FALSE(st.ok());
-            ASSERT_TRUE(st.error_code() == brpc::ELIMIT);
-            ASSERT_TRUE(butil::StringPiece(st.error_str()).starts_with("remote_window_left is not enough"));
+            ASSERT_GT(ctx->_pending_data_size, 0u);
+            h2_req->DestroyStreamUserData(
+                _h2_client_sock, &cntl, ECANCELED, false);
+            ASSERT_EQ(0u, ctx->_pending_data_size);
         } else {
-            ASSERT_TRUE(st.ok());
+            h2_req->DestroyStreamUserData(_h2_client_sock, &cntl, 0, false);
         }
-        h2_req->DestroyStreamUserData(_h2_client_sock, &cntl, 0, false);
     }
 }
 
@@ -1128,12 +1852,12 @@ TEST_F(HttpTest, http2_settings) {
     butil::IOBuf buf;
     buf.append(settingsbuf, brpc::policy::FRAME_HEAD_SIZE + nb);
 
-    brpc::policy::H2Context* ctx = new brpc::policy::H2Context(_socket.get(), NULL);
+    brpc::policy::H2Context* ctx = new brpc::policy::H2Context(_socket.get(), nullptr);
     CHECK_EQ(ctx->Init(), 0);
     _socket->initialize_parsing_context(&ctx);
     ctx->_conn_state = brpc::policy::H2_CONNECTION_READY;
     // parse settings
-    brpc::policy::ParseH2Message(&buf, _socket.get(), false, NULL);
+    brpc::policy::ParseH2Message(&buf, _socket.get(), false, nullptr);
 
     butil::IOPortal response_buf;
     CHECK_EQ(response_buf.append_from_file_descriptor(_pipe_fds[0], 1024),
@@ -1149,34 +1873,510 @@ TEST_F(HttpTest, http2_settings) {
     ASSERT_TRUE(ctx->_remote_settings.stream_window_size == (1u << 29) - 1);
 }
 
+TEST_F(HttpTest, http2_header_list_size_limit) {
+    // HPACK bomb regression: 1-byte indexed references to a large
+    // dynamic-table entry amplify a tiny HEADERS frame into an unbounded
+    // decoded header list. SETTINGS_MAX_HEADER_LIST_SIZE is advertise-but-
+    // never-enforce without the fix, so ConsumeHeaders accepts the overflow.
+    // The default must be bounded, not unlimited.
+    brpc::H2Settings default_settings;
+    ASSERT_EQ(brpc::H2Settings::DEFAULT_MAX_HEADER_LIST_SIZE,
+              default_settings.max_header_list_size);
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+    // Tiny limit so the amplification is visible in a few bytes.
+    ctx->_unack_local_settings.max_header_list_size = 4096;
+
+    brpc::policy::H2StreamContext sctx(false);
+    sctx.Init(ctx, 1);
+
+    // Literal header field with incremental indexing: name "x", value 3000
+    // bytes, entry size = 3000 + 1 + 32 = 3033, which fits both the dynamic
+    // table (4096) and the decoded-list budget (4096).
+    butil::IOBuf buf;
+    const uint8_t literal_prefix[] = { 0x40, 0x01, 'x', 0x7F, 0xB9, 0x16 };
+    buf.append(literal_prefix, sizeof(literal_prefix));
+    buf.append(std::string(3000, 'v'));
+    {
+        butil::IOBufBytesIterator it(buf);
+        ASSERT_EQ(0, sctx.ConsumeHeaders(it));
+    }
+
+    // One more header referencing the table entry (dynamic index 62) costs
+    // another 3033 decoded bytes and must be refused: the decoded list would
+    // reach 6066 > 4096.
+    butil::IOBuf ref_buf;
+    const uint8_t indexed_ref[] = { 0xBE };  // indexed entry 62
+    ref_buf.append(indexed_ref, sizeof(indexed_ref));
+    {
+        butil::IOBufBytesIterator it(ref_buf);
+        ASSERT_LT(sctx.ConsumeHeaders(it), 0);
+    }
+
+    // A list that stays within the limit keeps working.
+    brpc::policy::H2StreamContext sctx2(false);
+    sctx2.Init(ctx, 3);
+    butil::IOBuf ok_buf;
+    const uint8_t ok_prefix[] = { 0x40, 0x01, 'y', 0x01, 'v' };
+    ok_buf.append(ok_prefix, sizeof(ok_prefix));
+    {
+        butil::IOBufBytesIterator it(ok_buf);
+        ASSERT_EQ(0, sctx2.ConsumeHeaders(it));
+    }
+}
+
+TEST_F(HttpTest, h2_header_list_budget_resets_per_block) {
+    // The decoded header-list budget is per header block (RFC 7540
+    // section 10.5.1): trailing headers on the same stream start a fresh
+    // block. The counter must be reset at the start of a new block, otherwise
+    // legit trailers are rejected once the first block used most of the
+    // budget.
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+    ctx->_unack_local_settings.max_header_list_size = 4096;
+
+    brpc::policy::H2StreamContext* sctx =
+        new brpc::policy::H2StreamContext(false);
+    sctx->Init(ctx, 1);
+
+    // First block: a 3000-byte header costs 3033 of the 4096 budget.
+    butil::IOBuf first;
+    const uint8_t p1[] = { 0x40, 0x01, 'x', 0x7F, 0xB9, 0x16 };
+    first.append(p1, sizeof(p1));
+    first.append(std::string(3000, 'v'));
+    butil::IOBufBytesIterator it1(first);
+    ASSERT_EQ(0, sctx->ConsumeHeaders(it1));
+
+    // Second block (trailers) on the same stream: a 2000-byte header (2033
+    // bytes) exceeds the remaining budget (4096 - 3033 = 1063) but must be
+    // accepted because its counter starts at zero.
+    butil::IOBuf second;
+    const uint8_t p2[] = { 0x40, 0x01, 'x', 0x7F, 0xD1, 0x0E };
+    second.append(p2, sizeof(p2));
+    second.append(std::string(2000, 'v'));
+    butil::IOBufBytesIterator it2(second);
+    brpc::policy::H2FrameHead head;
+    head.payload_size = second.size();
+    head.type = brpc::policy::H2_FRAME_HEADERS;
+    head.flags = 0x4;  // H2_FLAGS_END_HEADERS
+    head.stream_id = 1;
+    const brpc::policy::H2ParseResult res =
+        sctx->OnHeaders(it2, head, second.size(), 0);
+    ASSERT_TRUE(res.is_ok());
+    delete sctx;
+}
+
+// Literal header field with a new name, with both lengths in a single 7-bit
+// prefix octet. `first_octet` selects the representation: 0x00 is "without
+// indexing" (RFC 7541 6.2.2), 0x40 is "with incremental indexing" (6.2.1)
+// which also adds the field to the dynamic table.
+// 0x80 of a length octet is the Huffman flag and a length of 128 or more needs
+// the multi-octet form, so refuse what does not fit instead of emitting a
+// corrupt header block.
+void AppendLiteralHeader(butil::IOBuf* out, const std::string& name,
+                         const std::string& value, uint8_t first_octet = 0x00) {
+    ASSERT_LT(name.size(), 0x80u);
+    ASSERT_LT(value.size(), 0x80u);
+    uint8_t prefix[] = { first_octet, (uint8_t)name.size() };
+    out->append(prefix, sizeof(prefix));
+    out->append(name);
+    uint8_t value_len = (uint8_t)value.size();
+    out->append(&value_len, 1);
+    out->append(value);
+}
+
+// Feed `payload` to `sctx` as one complete HEADERS block, the way
+// H2Context::Consume() would. A non-zero stream_id in the result means the
+// frame handler asked for a RST_STREAM, a zero one means a GOAWAY that closes
+// the whole connection.
+brpc::policy::H2ParseResult ConsumeHeadersBlock(
+        brpc::policy::H2StreamContext* sctx, const butil::IOBuf& payload,
+        int stream_id) {
+    brpc::policy::H2FrameHead head;
+    head.payload_size = payload.size();
+    head.type = brpc::policy::H2_FRAME_HEADERS;
+    head.flags = 0x4;  // H2_FLAGS_END_HEADERS
+    head.stream_id = stream_id;
+    butil::IOBufBytesIterator it(payload);
+    return sctx->OnHeaders(it, head, payload.size(), 0);
+}
+
+TEST_F(HttpTest, h2_too_many_headers) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_http_max_header_count = 8;
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+
+    {
+        std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+            new brpc::policy::H2StreamContext(false));
+        sctx->Init(ctx, 1);
+        butil::IOBuf payload;
+        for (int i = 0; i < 8; ++i) {
+            AppendLiteralHeader(&payload, "h" + std::to_string(i), "v");
+        }
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(sctx.get(), payload, 1);
+        ASSERT_TRUE(res.is_ok()) << brpc::H2ErrorToString(res.error());
+        ASSERT_EQ(8u, sctx->header().HeaderCount());
+    }
+    {
+        std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+            new brpc::policy::H2StreamContext(false));
+        sctx->Init(ctx, 3);
+        butil::IOBuf payload;
+        for (int i = 0; i < 9; ++i) {
+            AppendLiteralHeader(&payload, "h" + std::to_string(i), "v");
+        }
+        // Refusing the request must not cost the connection its other
+        // streams, so the frame handler asks for a RST_STREAM (non-zero
+        // stream_id) rather than a GOAWAY.
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(sctx.get(), payload, 3);
+        ASSERT_FALSE(res.is_ok());
+        ASSERT_EQ(brpc::H2_ENHANCE_YOUR_CALM, res.error());
+        ASSERT_EQ(3, res.stream_id());
+    }
+}
+
+TEST_F(HttpTest, h2_too_many_queries_in_path) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_http_max_query_count = 4;
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+
+    {
+        std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+            new brpc::policy::H2StreamContext(false));
+        sctx->Init(ctx, 1);
+        butil::IOBuf payload;
+        AppendLiteralHeader(&payload, ":path", "/s?a=1&b=2&c=3&d=4");
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(sctx.get(), payload, 1);
+        ASSERT_TRUE(res.is_ok()) << brpc::H2ErrorToString(res.error());
+    }
+    {
+        std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+            new brpc::policy::H2StreamContext(false));
+        sctx->Init(ctx, 3);
+        butil::IOBuf payload;
+        AppendLiteralHeader(&payload, ":path", "/s?a=1&b=2&c=3&d=4&e=5");
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(sctx.get(), payload, 3);
+        ASSERT_FALSE(res.is_ok());
+        ASSERT_EQ(brpc::H2_ENHANCE_YOUR_CALM, res.error());
+        ASSERT_EQ(3, res.stream_id());
+    }
+}
+
+// A refused header block still has to be fed to the HPACK decoder in full.
+// The dynamic table belongs to the connection, so dropping the tail of a block
+// would leave it out of step with the encoding table of the peer and turn
+// every later block into garbage, which is why RFC 9113 section 10.5.1 says
+// the field block MUST be processed unless the connection is closed.
+TEST_F(HttpTest, h2_refused_header_block_keeps_hpack_in_sync) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_http_max_header_count = 2;
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+
+    // Four headers with incremental indexing, two of them past the limit.
+    std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+        new brpc::policy::H2StreamContext(false));
+    sctx->Init(ctx, 1);
+    butil::IOBuf payload;
+    AppendLiteralHeader(&payload, "a", "1", 0x40);
+    AppendLiteralHeader(&payload, "b", "2", 0x40);
+    AppendLiteralHeader(&payload, "c", "3", 0x40);
+    AppendLiteralHeader(&payload, "d", "4", 0x40);
+    brpc::policy::H2ParseResult res =
+        ConsumeHeadersBlock(sctx.get(), payload, 1);
+    ASSERT_FALSE(res.is_ok());
+    ASSERT_EQ(brpc::H2_ENHANCE_YOUR_CALM, res.error());
+    ASSERT_EQ(1, res.stream_id());
+    // Everything after the offending field is decoded but thrown away.
+    ASSERT_EQ(3u, sctx->header().HeaderCount());
+
+    // The static table ends at index 61, so 62 names the newest dynamic entry.
+    // That is "d" only because decoding ran to the end of the block; had it
+    // stopped at the limit, 62 would still be "c".
+    std::unique_ptr<brpc::policy::H2StreamContext> sctx2(
+        new brpc::policy::H2StreamContext(false));
+    sctx2->Init(ctx, 3);
+    butil::IOBuf indexed;
+    const uint8_t indexed_field[] = { 0x80 | 62 };  // Indexed Header Field
+    indexed.append(indexed_field, sizeof(indexed_field));
+    brpc::policy::H2ParseResult res2 =
+        ConsumeHeadersBlock(sctx2.get(), indexed, 3);
+    ASSERT_TRUE(res2.is_ok()) << brpc::H2ErrorToString(res2.error());
+    const std::string* value = sctx2->header().GetHeader("d");
+    ASSERT_TRUE(value != nullptr);
+    ASSERT_EQ("4", *value);
+}
+
+// RFC 9113 section 8.1.1: "Malformed requests or responses that are detected
+// MUST be treated as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
+// A bad pseudo-header says nothing about the health of the connection, so it
+// must not cost the other streams theirs. :path has its own case table in
+// HttpTest.http2_reject_path_not_starting_with_slash.
+TEST_F(HttpTest, h2_malformed_pseudo_header_resets_stream_only) {
+    struct MalformedField {
+        const char* name;
+        const char* value;
+    };
+    MalformedField malformed[] = {
+        { ":method", "NOSUCH" },
+        { ":status", "20x" },
+        { ":nosuchheader", "1" },  // 8.3: undefined pseudo-header
+    };
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+
+    int stream_id = 1;
+    for (const auto& bad : malformed) {
+        std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+            new brpc::policy::H2StreamContext(false));
+        sctx->Init(ctx, stream_id);
+        butil::IOBuf payload;
+        AppendLiteralHeader(&payload, bad.name, bad.value);
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(sctx.get(), payload, stream_id);
+        std::string desc = std::string(bad.name) + '=' + bad.value;
+        ASSERT_FALSE(res.is_ok()) << desc;
+        ASSERT_EQ(brpc::H2_PROTOCOL_ERROR, res.error())
+            << desc << ": " << brpc::H2ErrorToString(res.error());
+        ASSERT_EQ(stream_id, res.stream_id()) << desc;
+        stream_id += 2;
+    }
+
+    // A malformed block is drained like any other refusal, so a field that
+    // follows the bad pseudo-header still reaches the dynamic table. RFC 9113
+    // section 4.3 leaves no choice here: only a decoding error may take down
+    // the connection, so everything else has to be decoded to the end.
+    std::unique_ptr<brpc::policy::H2StreamContext> sctx(
+        new brpc::policy::H2StreamContext(false));
+    sctx->Init(ctx, stream_id);
+    butil::IOBuf payload;
+    AppendLiteralHeader(&payload, ":path", "foo");
+    AppendLiteralHeader(&payload, "after-the-bad-one", "1", 0x40);
+    brpc::policy::H2ParseResult res =
+        ConsumeHeadersBlock(sctx.get(), payload, stream_id);
+    ASSERT_EQ(brpc::H2_PROTOCOL_ERROR, res.error());
+    ASSERT_EQ(stream_id, res.stream_id());
+
+    stream_id += 2;
+    std::unique_ptr<brpc::policy::H2StreamContext> sctx2(
+        new brpc::policy::H2StreamContext(false));
+    sctx2->Init(ctx, stream_id);
+    butil::IOBuf indexed;
+    const uint8_t indexed_field[] = { 0x80 | 62 };  // newest dynamic entry
+    indexed.append(indexed_field, sizeof(indexed_field));
+    brpc::policy::H2ParseResult res2 =
+        ConsumeHeadersBlock(sctx2.get(), indexed, stream_id);
+    ASSERT_TRUE(res2.is_ok()) << brpc::H2ErrorToString(res2.error());
+    const std::string* value = sctx2->header().GetHeader("after-the-bad-one");
+    ASSERT_TRUE(value != nullptr);
+    ASSERT_EQ("1", *value);
+}
+
+TEST_F(HttpTest, h2_oversized_single_headers_block_rejected) {
+    // A single HEADERS frame whose decoded header list exceeds
+    // max_header_list_size must be rejected at the block boundary (before
+    // any CONTINUATION), not accepted into _remaining_header_fragment.
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+    ctx->_unack_local_settings.max_header_list_size = 64;
+
+    brpc::policy::H2StreamContext* sctx =
+        new brpc::policy::H2StreamContext(false);
+    sctx->Init(ctx, 1);
+
+    // One literal-with-incremental-indexing header with a 200-byte value:
+    // its decoded cost (200 + 1 + 32 = 233) exceeds the 64-byte budget.
+    butil::IOBuf payload;
+    const uint8_t p[] = { 0x40, 0x01, 'x', 0x7F, 0xC1, 0x01 };
+    payload.append(p, sizeof(p));
+    payload.append(std::string(200, 'v'));
+    butil::IOBufBytesIterator it(payload);
+    brpc::policy::H2FrameHead head;
+    head.payload_size = payload.size();
+    head.type = brpc::policy::H2_FRAME_HEADERS;
+    head.flags = 0x4;  // H2_FLAGS_END_HEADERS
+    head.stream_id = 1;
+    const brpc::policy::H2ParseResult res =
+        sctx->OnHeaders(it, head, payload.size(), 0);
+    ASSERT_FALSE(res.is_ok());
+    delete sctx;
+}
+
+TEST_F(HttpTest, http2_server_enforces_max_concurrent_streams) {
+    // The server advertises SETTINGS_MAX_CONCURRENT_STREAMS but never
+    // enforced it: every odd stream id was accepted, so a peer could pin an
+    // unbounded number of streams per connection. Pending streams beyond the
+    // limit must be refused.
+    // The default must be bounded, not unlimited.
+    brpc::H2Settings default_settings;
+    ASSERT_EQ(brpc::H2Settings::DEFAULT_MAX_CONCURRENT_STREAMS,
+              default_settings.max_concurrent_streams);
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_socket.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _socket->initialize_parsing_context(&ctx);
+    ASSERT_TRUE(ctx->is_server_side());
+    ctx->_unack_local_settings.max_concurrent_streams = 2;
+
+    brpc::policy::H2StreamContext* s1 = new brpc::policy::H2StreamContext(false);
+    s1->Init(ctx, 1);
+    ASSERT_EQ(0, ctx->TryToInsertStream(1, s1));
+    brpc::policy::H2StreamContext* s3 = new brpc::policy::H2StreamContext(false);
+    s3->Init(ctx, 3);
+    ASSERT_EQ(0, ctx->TryToInsertStream(3, s3));
+
+    // The third concurrent stream must be refused (rc=2 -> REFUSED_STREAM)
+    // instead of inserted.
+    brpc::policy::H2StreamContext s5(false);
+    s5.Init(ctx, 5);
+    ASSERT_EQ(2, ctx->TryToInsertStream(5, &s5));
+    ASSERT_EQ(2u, ctx->VolatilePendingStreamSize());
+
+    // Closing a stream frees a slot again.
+    delete ctx->RemoveStreamAndDeferWU(1);
+    brpc::policy::H2StreamContext* s7 = new brpc::policy::H2StreamContext(false);
+    s7->Init(ctx, 7);
+    ASSERT_EQ(0, ctx->TryToInsertStream(7, s7));
+}
+
+TEST_F(HttpTest, h2_ping_ack_respects_socket_write_cap) {
+    // A peer flooding PING frames while withholding TCP reads must not make
+    // this side queue PONGs past -socket_max_unwritten_bytes. Use a dedicated
+    // pipe so the fixture pipe stays readable for other tests.
+    int fds[2];
+    ASSERT_EQ(0, pipe(fds));
+    brpc::SocketOptions options;
+    options.fd = fds[1];
+    brpc::SocketId id;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr sock;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &sock));
+
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_socket_max_unwritten_bytes = 64;
+
+    // Write far more than the pipe capacity (nobody reads the other end), so
+    // bytes stay queued well past the cap and the socket is overcrowded.
+    butil::IOBuf big;
+    big.append(std::string(1024 * 1024, 'x'));
+    brpc::Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = false;
+    ASSERT_EQ(0, sock->Write(&big, &wopt));
+    ASSERT_TRUE(sock->_overcrowded);
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(sock.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    sock->initialize_parsing_context(&ctx);
+    ctx->_conn_state = brpc::policy::H2_CONNECTION_READY;
+
+    // The PING must not be answered by bypassing the write cap: when the
+    // connection is overcrowded the ack write fails, the connection errors
+    // out (RFC 7540 5.4.1) and no PONG is queued. Before the fix the ack
+    // write always succeeded (ignore_eovercrowded) and the connection kept
+    // asking for more data, so this parse ended with NOT_ENOUGH_DATA.
+    butil::IOBuf ping;
+    char pingbuf[brpc::policy::FRAME_HEAD_SIZE + 8];
+    brpc::policy::SerializeFrameHead(
+        pingbuf, 8, brpc::policy::H2_FRAME_PING, 0, 0);
+    ping.append(pingbuf, sizeof(pingbuf));
+    ping.append(std::string(8, '\0'));  // opaque payload
+    const int64_t before =
+        sock->_unwritten_bytes.load(butil::memory_order_relaxed);
+    const brpc::ParseResult pr =
+        brpc::policy::ParseH2Message(&ping, sock.get(), false, nullptr);
+    ASSERT_EQ(before,
+              sock->_unwritten_bytes.load(butil::memory_order_relaxed));
+    // The overcrowded connection must terminate parsing instead of accepting
+    // the PING and queueing a PONG past the socket write cap.
+    ASSERT_EQ(brpc::PARSE_ERROR_ABSOLUTELY_WRONG, pr.error());
+}
+
+TEST_F(HttpTest, http2_goaway_with_debug_data) {
+    // GOAWAY payload is Last-Stream-ID(4) | Error Code(4) | Debug Data(*).
+    const uint32_t payload_size = 16;
+    char goawaybuf[brpc::policy::FRAME_HEAD_SIZE + payload_size];
+    brpc::policy::SerializeFrameHead(goawaybuf, payload_size,
+                                     brpc::policy::H2_FRAME_GOAWAY, 0, 0);
+    char* p = goawaybuf + brpc::policy::FRAME_HEAD_SIZE;
+    // Last-Stream-ID=1, with the reserved bit set so it must be masked off.
+    p[0] = (char)0x80; p[1] = 0; p[2] = 0; p[3] = 1;
+    // Error Code = H2_NO_ERROR
+    p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;
+    // Debug Data whose last 8 bytes would be read as the two fields above.
+    p[8] = (char)0xff; p[9] = (char)0xff; p[10] = (char)0xff; p[11] = (char)0xff;
+    p[12] = 0; p[13] = 0; p[14] = 0; p[15] = 0;
+
+    butil::IOBuf buf;
+    buf.append(goawaybuf, brpc::policy::FRAME_HEAD_SIZE + payload_size);
+
+    brpc::policy::H2Context* ctx =
+        new brpc::policy::H2Context(_h2_client_sock.get(), nullptr);
+    CHECK_EQ(ctx->Init(), 0);
+    _h2_client_sock->initialize_parsing_context(&ctx);
+    ctx->_conn_state = brpc::policy::H2_CONNECTION_READY;
+    brpc::policy::ParseH2Message(&buf, _h2_client_sock.get(), false, nullptr);
+
+    // Reading the debug data instead would leave -1 here, which disables the
+    // `_goaway_stream_id >= 0' check in TryToInsertStream.
+    ASSERT_EQ(1, ctx->_goaway_stream_id);
+}
+
 TEST_F(HttpTest, http2_invalid_settings) {
     {
         brpc::Server server;
         brpc::ServerOptions options;
         options.h2_settings.stream_window_size = brpc::H2Settings::MAX_WINDOW_SIZE + 1;
-        ASSERT_EQ(-1, server.Start("127.0.0.1:8924", &options));
+        ASSERT_EQ(-1, server.Start("127.0.0.1:0", &options));
     }
     {
         brpc::Server server;
         brpc::ServerOptions options;
         options.h2_settings.max_frame_size =
             brpc::H2Settings::DEFAULT_MAX_FRAME_SIZE - 1;
-        ASSERT_EQ(-1, server.Start("127.0.0.1:8924", &options));
+        ASSERT_EQ(-1, server.Start("127.0.0.1:0", &options));
     }
     {
         brpc::Server server;
         brpc::ServerOptions options;
         options.h2_settings.max_frame_size =
             brpc::H2Settings::MAX_OF_MAX_FRAME_SIZE + 1;
-        ASSERT_EQ(-1, server.Start("127.0.0.1:8924", &options));
+        ASSERT_EQ(-1, server.Start("127.0.0.1:0", &options));
     }
 }
 
 TEST_F(HttpTest, http2_not_closing_socket_when_rpc_timeout) {
-    const int port = 8923;
     brpc::Server server;
-    EXPECT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, NULL));
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
     brpc::Channel channel;
     brpc::ChannelOptions options;
     options.protocol = "h2";
@@ -1190,7 +2390,7 @@ TEST_F(HttpTest, http2_not_closing_socket_when_rpc_timeout) {
         brpc::Controller cntl;
         cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
         cntl.http_request().uri() = "/EchoService/Echo";
-        channel.CallMethod(NULL, &cntl, &req, &res, NULL);
+        channel.CallMethod(nullptr, &cntl, &req, &res, nullptr);
         ASSERT_FALSE(cntl.Failed());
         ASSERT_EQ(EXP_RESPONSE, res.message());
     }
@@ -1204,7 +2404,7 @@ TEST_F(HttpTest, http2_not_closing_socket_when_rpc_timeout) {
         cntl.set_timeout_ms(50);
         cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
         cntl.http_request().uri() = "/EchoService/Echo?sleep_ms=300";
-        channel.CallMethod(NULL, &cntl, &req, &res, NULL);
+        channel.CallMethod(nullptr, &cntl, &req, &res, nullptr);
         ASSERT_TRUE(cntl.Failed());
 
         brpc::SocketUniquePtr ptr;
@@ -1217,7 +2417,7 @@ TEST_F(HttpTest, http2_not_closing_socket_when_rpc_timeout) {
         brpc::Controller cntl;
         cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
         cntl.http_request().uri() = "/EchoService/Echo";
-        channel.CallMethod(NULL, &cntl, &req, &res, NULL);
+        channel.CallMethod(nullptr, &cntl, &req, &res, nullptr);
         ASSERT_FALSE(cntl.Failed());
         ASSERT_EQ(EXP_RESPONSE, res.message());
         brpc::SocketUniquePtr ptr;
@@ -1257,7 +2457,7 @@ TEST_F(HttpTest, http2_header_after_data) {
         }
         {
             brpc::HPacker::Header header("content-length",
-                    butil::string_printf("%" PRIu64, data_buf.size()));
+                    butil::string_printf("%llu", (unsigned long long)data_buf.size()));
             hpacker.Encode(&header1_appender, header, options);
         }
         {
@@ -1309,7 +2509,7 @@ TEST_F(HttpTest, http2_header_after_data) {
     }
     // parse response
     brpc::ParseResult res_pr =
-            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_TRUE(res_pr.is_ok());
     // process response
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_pr.message(), false);
@@ -1319,12 +2519,12 @@ TEST_F(HttpTest, http2_header_after_data) {
     ASSERT_EQ(res_header.content_type(), "application/proto");
     // Check overlapped header is overwritten by the latter.
     const std::string* user_defined1 = res_header.GetHeader("user-defined1");
-    ASSERT_EQ(*user_defined1, "overwrite-a");
+    ASSERT_EQ(*user_defined1, "a,overwrite-a");
     const std::string* user_defined2 = res_header.GetHeader("user-defined2");
     ASSERT_EQ(*user_defined2, "b");
 }
 
-TEST_F(HttpTest, http2_goaway) {
+TEST_F(HttpTest, http2_goaway_sanity) {
     brpc::Controller cntl;
     // Prepare request
     butil::IOBuf req_out;
@@ -1341,26 +2541,693 @@ TEST_F(HttpTest, http2_goaway) {
     res_out.append(goawaybuf, sizeof(goawaybuf));
     // parse response
     brpc::ParseResult res_pr =
-            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+            brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_TRUE(res_pr.is_ok());
     // process response
     ProcessMessage(brpc::policy::ProcessHttpResponse, res_pr.message(), false);
     ASSERT_TRUE(!cntl.Failed());
 
     // parse GOAWAY
-    res_pr = brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, NULL);
+    res_pr = brpc::policy::ParseH2Message(&res_out, _h2_client_sock.get(), false, nullptr);
     ASSERT_EQ(res_pr.error(), brpc::PARSE_ERROR_NOT_ENOUGH_DATA);
 
     // Since GOAWAY has been received, the next request should fail
     brpc::policy::H2UnsentRequest* h2_req = brpc::policy::H2UnsentRequest::New(&cntl);
     cntl._current_call.stream_user_data = h2_req;
-    brpc::SocketMessage* socket_message = NULL;
-    brpc::policy::PackH2Request(NULL, &socket_message, cntl.call_id().value,
-                                NULL, &cntl, butil::IOBuf(), NULL);
+    brpc::SocketMessage* socket_message = nullptr;
+    brpc::policy::PackH2Request(nullptr, &socket_message, cntl.call_id().value,
+                                nullptr, &cntl, butil::IOBuf(), nullptr);
     butil::IOBuf dummy;
     butil::Status st = socket_message->AppendAndDestroySelf(&dummy, _h2_client_sock.get());
     ASSERT_EQ(st.error_code(), brpc::ELOGOFF);
     ASSERT_TRUE(st.error_data().ends_with("the connection just issued GOAWAY"));
+    // Release the reference held by stream_user_data (which is normally released
+    // by Controller::Call::OnComplete) to avoid leaking the H2UnsentRequest.
+    h2_req->DestroyStreamUserData(_h2_client_sock, &cntl, 0, false);
+}
+
+class AfterRecevingGoAway : public ::google::protobuf::Closure {
+public:
+    void Run() {
+        ASSERT_EQ(brpc::EHTTP, cntl.ErrorCode());
+        delete this;
+    }
+    brpc::Controller cntl;
+};
+
+TEST_F(HttpTest, http2_handle_goaway_streams) {
+    const butil::EndPoint ep(butil::IP_ANY, 5961);
+    butil::fd_guard listenfd(butil::tcp_listen(ep));
+    ASSERT_GT(listenfd, 0);
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_H2;
+    ASSERT_EQ(0, channel.Init(ep, &options));
+
+    int req_size = 10;
+    std::vector<brpc::CallId> ids(req_size);
+    for (int i = 0; i < req_size; i++) {
+        AfterRecevingGoAway* done = new AfterRecevingGoAway;
+        brpc::Controller& cntl = done->cntl;
+        ids.push_back(cntl.call_id());
+        cntl.set_timeout_ms(-1);
+        cntl.http_request().uri() = "/it-doesnt-matter";
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, done);
+    }
+
+    int servfd = accept(listenfd, nullptr, nullptr);
+    ASSERT_GT(servfd, 0);
+    // Sleep for a while to make sure that server has received all data.
+    bthread_usleep(2000);
+    char goawaybuf[brpc::policy::FRAME_HEAD_SIZE + 8];
+    SerializeFrameHead(goawaybuf, 8, brpc::policy::H2_FRAME_GOAWAY, 0, 0);
+    SaveUint32(goawaybuf + brpc::policy::FRAME_HEAD_SIZE, 0);
+    SaveUint32(goawaybuf + brpc::policy::FRAME_HEAD_SIZE + 4, 0);
+    ASSERT_EQ((ssize_t)brpc::policy::FRAME_HEAD_SIZE + 8, ::write(servfd, goawaybuf, brpc::policy::FRAME_HEAD_SIZE + 8));
+
+    // After receving GOAWAY, the callbacks in client should be run correctly.
+    for (int i = 0; i < req_size; i++) {
+        brpc::Join(ids[i]);
+    }
+}
+
+// RFC 9113 8.3.1: :path MUST NOT be empty and MUST begin with '/', the only
+// exception being the asterisk-form that OPTIONS uses. Violating that makes
+// the request malformed, which 8.1.1 turns into a stream error.
+TEST_F(HttpTest, http2_reject_path_not_starting_with_slash) {
+    brpc::policy::H2Context* h2_ctx =
+        new brpc::policy::H2Context(_socket.get(), &_server);
+    ASSERT_EQ(0, h2_ctx->Init());
+    _socket->initialize_parsing_context(&h2_ctx);
+
+    // Encoding and decoding go through the same HPacker here, which is fine:
+    // it keeps the encoding and decoding tables apart and the header below is
+    // indexed into neither.
+    brpc::HPackOptions options;
+    options.index_policy = brpc::HPACK_NOT_INDEX_HEADER;
+
+    struct PathCase {
+        const char* path;
+        bool accepted;
+    };
+    const PathCase kCases[] = {
+        { "/flags", true },
+        { "/", true },
+        { "/flags?setvalue=1", true },
+        // Asterisk-form. Only OPTIONS may use it, but it is taken from any
+        // method here, see the comment on the check.
+        { "*", true },
+        { "flags", false },
+        { "", false },
+        { "flags/port", false },
+        { "*/flags", false },
+        { "http://somewhere/flags", false },  // absolute-form
+    };
+    int stream_id = 1;
+    for (const PathCase& c : kCases) {
+        butil::IOBufAppender appender;
+        brpc::HPacker::Header header(":path", c.path);
+        h2_ctx->hpacker().Encode(&appender, header, options);
+        butil::IOBuf buf;
+        appender.move_to(buf);
+
+        brpc::policy::H2StreamContext* h2_msg =
+            new brpc::policy::H2StreamContext(false);
+        h2_msg->Init(h2_ctx, stream_id);
+        brpc::policy::H2ParseResult res =
+            ConsumeHeadersBlock(h2_msg, buf, stream_id);
+        if (c.accepted) {
+            ASSERT_TRUE(res.is_ok()) << "path=`" << c.path << "': "
+                                     << brpc::H2ErrorToString(res.error());
+        } else {
+            // A bad :path makes the request malformed, not the connection
+            // unusable, so only this stream is reset.
+            ASSERT_EQ(brpc::H2_PROTOCOL_ERROR, res.error())
+                << "path=`" << c.path << '\'';
+            ASSERT_EQ(stream_id, res.stream_id()) << "path=`" << c.path << '\'';
+        }
+        stream_id += 2;
+        h2_msg->Destroy();
+    }
+}
+
+TEST_F(HttpTest, spring_protobuf_content_type) {
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = "http";
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    cntl.http_request().uri() = "/EchoService/Echo";
+    cntl.http_request().set_content_type("application/x-protobuf");
+    cntl.request_attachment().append(req.SerializeAsString());
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+    ASSERT_EQ("application/x-protobuf", cntl.http_response().content_type());
+    ASSERT_TRUE(res.ParseFromString(cntl.response_attachment().to_string()));
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+
+    brpc::Controller cntl2;
+    test::EchoService_Stub stub(&channel);
+    res.Clear();
+    cntl2.http_request().set_content_type("application/x-protobuf");
+    stub.Echo(&cntl2, &req, &res, nullptr);
+    ASSERT_FALSE(cntl2.Failed());
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+    ASSERT_EQ("application/x-protobuf", cntl2.http_response().content_type());
+}
+
+TEST_F(HttpTest, dump_http_request) {
+    // save origin value of gflag
+    auto rpc_dump_dir = brpc::FLAGS_rpc_dump_dir;
+    auto rpc_dump_max_requests_in_one_file = brpc::FLAGS_rpc_dump_max_requests_in_one_file;
+
+    // set gflag and global variable in order to be sure to dump request
+    brpc::FLAGS_rpc_dump = true;
+    brpc::FLAGS_rpc_dump_dir = "dump_http_request";
+    brpc::FLAGS_rpc_dump_max_requests_in_one_file = 1;
+    brpc::g_rpc_dump_sl.ever_grabbed = true;
+    brpc::g_rpc_dump_sl.sampling_range = bvar::COLLECTOR_SAMPLING_BASE;
+
+    // init channel
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = "http";
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    // send request and dump it to file
+    {
+        test::EchoRequest req;
+        req.set_message(EXP_REQUEST);
+        std::string req_json;
+        ASSERT_TRUE(json2pb::ProtoMessageToJson(req, &req_json));
+
+        brpc::Controller cntl;
+        cntl.http_request().uri() = "/EchoService/Echo";
+        cntl.http_request().set_content_type("application/json");
+        cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+        cntl.request_attachment() = req_json;
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+
+        // sleep 1s, because rpc_dump doesn't run immediately
+        sleep(1);
+    }
+
+    // replay request from dump file
+    {
+        brpc::SampleIterator it(brpc::FLAGS_rpc_dump_dir);
+        brpc::SampledRequest* sample = it.Next();
+        ASSERT_NE(nullptr, sample);
+
+        std::unique_ptr<brpc::SampledRequest> sample_guard(sample);
+
+        // the logic of next code is same as that in rpc_replay.cpp
+        ASSERT_EQ(sample->meta.protocol_type(), brpc::PROTOCOL_HTTP);
+        brpc::Controller cntl;
+        cntl.reset_sampled_request(sample_guard.release());
+        brpc::HttpMessage http_message;
+        http_message.ParseFromIOBuf(sample->request);
+        cntl.http_request().Swap(http_message.header());
+        // clear origin Host in header
+        cntl.http_request().RemoveHeader("Host");
+        cntl.http_request().uri().set_host("");
+        cntl.request_attachment() = http_message.body().movable();
+
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+        ASSERT_EQ("application/json", cntl.http_response().content_type());
+
+        std::string res_json = cntl.response_attachment().to_string();
+        test::EchoResponse res;
+        json2pb::Json2PbOptions options;
+        ASSERT_TRUE(json2pb::JsonToProtoMessage(res_json, &res, options));
+        ASSERT_EQ(EXP_RESPONSE, res.message());
+    }
+
+    // delete dump directory
+    butil::DeleteFile(butil::FilePath(brpc::FLAGS_rpc_dump_dir), true);
+
+    // restore gflag and global variable
+    brpc::FLAGS_rpc_dump = false;
+    brpc::FLAGS_rpc_dump_dir = rpc_dump_dir;
+    brpc::FLAGS_rpc_dump_max_requests_in_one_file = rpc_dump_max_requests_in_one_file;
+    brpc::g_rpc_dump_sl.ever_grabbed = false;
+    brpc::g_rpc_dump_sl.sampling_range = 0;
+}
+
+TEST_F(HttpTest, proto_text_content_type) {
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = "http";
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    cntl.http_request().uri() = "/EchoService/Echo";
+    cntl.http_request().set_content_type("application/proto-text");
+    std::string req_text;
+    ASSERT_TRUE(google::protobuf::TextFormat::PrintToString(req, &req_text));
+    cntl.request_attachment().append(req_text);
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << req_text;
+    ASSERT_EQ("application/proto-text", cntl.http_response().content_type());
+    ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+            cntl.response_attachment().to_string(), &res));
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+
+    test::EchoService_Stub stub(&channel);
+    cntl.Reset();
+    cntl.http_request().set_content_type("application/proto-text");
+    res.Clear();
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+    ASSERT_EQ("application/proto-text", cntl.http_response().content_type());
+}
+
+TEST_F(HttpTest, proto_json_content_type) {
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&_svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = "http";
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+
+    brpc::Controller cntl;
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    cntl.http_request().uri() = "/EchoService/Echo";
+    cntl.http_request().set_content_type("application/proto-json");
+    json2pb::Pb2ProtoJsonOptions json_options;
+    butil::IOBufAsZeroCopyOutputStream output_stream(&cntl.request_attachment());
+    ASSERT_TRUE(json2pb::ProtoMessageToProtoJson(req, &output_stream, json_options));
+    channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ("application/proto-json", cntl.http_response().content_type());
+    json2pb::ProtoJson2PbOptions parse_options;
+    parse_options.ignore_unknown_fields = true;
+    butil::IOBufAsZeroCopyInputStream input_stream(cntl.response_attachment());
+    ASSERT_TRUE(json2pb::ProtoJsonToProtoMessage(&input_stream, &res, parse_options));
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+
+    test::EchoService_Stub stub(&channel);
+    cntl.Reset();
+    cntl.http_request().set_content_type("application/proto-json");
+    res.Clear();
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+    ASSERT_EQ("application/proto-json", cntl.http_response().content_type());
+}
+
+class HttpServiceImpl : public ::test::HttpService {
+    public:
+    void Head(::google::protobuf::RpcController* cntl_base,
+        const ::test::HttpRequest*,
+        ::test::HttpResponse*,
+        ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        ASSERT_EQ(cntl->http_request().method(), brpc::HTTP_METHOD_HEAD);
+        const std::string* index = cntl->http_request().GetHeader("x-db-index");
+        ASSERT_NE(nullptr, index);
+        int i;
+        ASSERT_TRUE(butil::StringToInt(*index, &i));
+        cntl->http_response().set_content_type("text/plain");
+        if (i % 2 == 0) {
+            cntl->http_response().SetHeader("Content-Length",
+                EXP_RESPONSE_CONTENT_LENGTH);
+        } else {
+            cntl->http_response().SetHeader("Transfer-Encoding",
+                EXP_RESPONSE_TRANSFER_ENCODING);
+        }
+    }
+
+    void Expect(::google::protobuf::RpcController* cntl_base,
+        const ::test::HttpRequest*,
+        ::test::HttpResponse*,
+        ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        const std::string* expect = cntl->http_request().GetHeader("Expect");
+        ASSERT_TRUE(expect != nullptr);
+        ASSERT_EQ("100-continue", *expect);
+        ASSERT_EQ(cntl->http_request().method(), brpc::HTTP_METHOD_POST);
+        cntl->response_attachment().append("world");
+    }
+};
+
+TEST_F(HttpTest, http_head) {
+    brpc::Server server;
+    HttpServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    int port = server.listen_address().port;
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_HTTP;
+    ASSERT_EQ(0, channel.Init(butil::EndPoint(butil::my_ip(), port), &options));
+    for (int i = 0; i < 100; ++i) {
+        brpc::Controller cntl;
+        cntl.http_request().set_method(brpc::HTTP_METHOD_HEAD);
+        cntl.http_request().uri().set_path("/HttpService/Head");
+        cntl.http_request().SetHeader("x-db-index", butil::IntToString(i));
+        channel.CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        if (i % 2 == 0) {
+            const std::string* content_length
+                = cntl.http_response().GetHeader("content-length");
+            ASSERT_NE(nullptr, content_length);
+            ASSERT_EQ(EXP_RESPONSE_CONTENT_LENGTH, *content_length);
+        } else {
+            const std::string* transfer_encoding
+                = cntl.http_response().GetHeader("Transfer-Encoding");
+            ASSERT_NE(nullptr, transfer_encoding);
+            ASSERT_EQ(EXP_RESPONSE_TRANSFER_ENCODING, *transfer_encoding);
+        }
+    }
+}
+
+#define BRPC_CRLF "\r\n"
+
+void MakeHttpRequestHeaders(butil::IOBuf* out,
+                            brpc::HttpHeader* h,
+                            const butil::EndPoint& remote_side) {
+    butil::IOBufBuilder os;
+    os << HttpMethod2Str(h->method()) << ' ';
+    const brpc::URI& uri = h->uri();
+    uri.PrintWithoutHost(os); // host is sent by "Host" header.
+    os << " HTTP/" << h->major_version() << '.'
+       << h->minor_version() << BRPC_CRLF;
+    //rfc 7230#section-5.4:
+    //A client MUST send a Host header field in all HTTP/1.1 request
+    //messages. If the authority component is missing or undefined for
+    //the target URI, then a client MUST send a Host header field with an
+    //empty field-value.
+    //rfc 7231#sec4.3:
+    //the request-target consists of only the host name and port number of
+    //the tunnel destination, seperated by a colon. For example,
+    //Host: server.example.com:80
+    if (h->GetHeader("host") == nullptr) {
+        os << "Host: ";
+        if (!uri.host().empty()) {
+            os << uri.host();
+            if (uri.port() >= 0) {
+                os << ':' << uri.port();
+            }
+        } else if (remote_side.port != 0) {
+            os << remote_side;
+        }
+        os << BRPC_CRLF;
+    }
+    if (!h->content_type().empty()) {
+        os << "Content-Type: " << h->content_type()
+           << BRPC_CRLF;
+    }
+    for (brpc::HttpHeader::HeaderIterator it = h->HeaderBegin();
+         it != h->HeaderEnd(); ++it) {
+        os << it->first << ": " << it->second << BRPC_CRLF;
+    }
+    if (h->GetHeader("Accept") == nullptr) {
+        os << "Accept: */*" BRPC_CRLF;
+    }
+    // The fake "curl" user-agent may let servers return plain-text results.
+    if (h->GetHeader("User-Agent") == nullptr) {
+        os << "User-Agent: brpc/1.0 curl/7.0" BRPC_CRLF;
+    }
+    const std::string& user_info = h->uri().user_info();
+    if (!user_info.empty() && h->GetHeader("Authorization") == nullptr) {
+        // NOTE: just assume user_info is well formatted, namely
+        // "<user_name>:<password>". Users are very unlikely to add extra
+        // characters in this part and even if users did, most of them are
+        // invalid and rejected by http_parser_parse_url().
+        std::string encoded_user_info;
+        butil::Base64Encode(user_info, &encoded_user_info);
+        os << "Authorization: Basic " << encoded_user_info << BRPC_CRLF;
+    }
+    os << BRPC_CRLF;  // CRLF before content
+    os.move_to(*out);
+}
+
+#undef BRPC_CRLF
+
+void ReadOneResponse(brpc::SocketUniquePtr& sock,
+    brpc::DestroyingPtr<brpc::policy::HttpContext>& imsg_guard) {
+#if defined(OS_LINUX)
+    ASSERT_EQ(0, bthread_fd_wait(sock->fd(), EPOLLIN));
+#elif defined(OS_MACOSX)
+    ASSERT_EQ(0, bthread_fd_wait(sock->fd(), EVFILT_READ));
+#endif
+
+    butil::IOPortal read_buf;
+    int64_t start_time = butil::cpuwide_time_us();
+    while (true) {
+        const ssize_t nr = read_buf.append_from_file_descriptor(sock->fd(), 4096);
+        LOG(INFO) << "nr=" << nr;
+        LOG(INFO) << butil::ToPrintableString(read_buf);
+        ASSERT_TRUE(nr > 0 || (nr < 0 && errno == EAGAIN));
+        if (errno == EAGAIN) {
+            ASSERT_LT(butil::cpuwide_time_us(), start_time + 1000000L) << "Too long!";
+            bthread_usleep(1000);
+            continue;
+        }
+        brpc::ParseResult pr = brpc::policy::ParseHttpMessage(&read_buf, sock.get(), false, nullptr);
+        ASSERT_TRUE(pr.error() == brpc::PARSE_ERROR_NOT_ENOUGH_DATA || pr.is_ok());
+        if (pr.is_ok()) {
+            imsg_guard.reset(static_cast<brpc::policy::HttpContext*>(pr.message()));
+            break;
+        }
+    }
+    ASSERT_TRUE(read_buf.empty());
+}
+
+TEST_F(HttpTest, http_expect) {
+    brpc::Server server;
+    HttpServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+
+    const butil::EndPoint ep = server.listen_address();
+    brpc::SocketOptions options;
+    options.remote_side = ep;
+    brpc::SocketId id;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr sock;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &sock));
+
+    butil::IOBuf content;
+    content.append("hello");
+    brpc::HttpHeader header;
+    header.set_method(brpc::HTTP_METHOD_POST);
+    header.uri().set_path("/HttpService/Expect");
+    header.SetHeader("Expect", "100-continue");
+    header.SetHeader("Content-Length", std::to_string(content.size()));
+    butil::IOBuf header_buf;
+    MakeHttpRequestHeaders(&header_buf, &header, ep);
+    LOG(INFO) << butil::ToPrintableString(header_buf);
+    butil::IOBuf request_buf(header_buf);
+    request_buf.append(content);
+
+    ASSERT_EQ(0, sock->Write(&header_buf));
+    int64_t start_time = butil::cpuwide_time_us();
+    while (sock->fd() < 0) {
+        bthread_usleep(1000);
+        ASSERT_LT(butil::cpuwide_time_us(), start_time + 1000000L) << "Too long!";
+    }
+    // 100 Continue
+    brpc::DestroyingPtr<brpc::policy::HttpContext> imsg_guard;
+    ReadOneResponse(sock, imsg_guard);
+    ASSERT_EQ(imsg_guard->header().status_code(), brpc::HTTP_STATUS_CONTINUE);
+
+    ASSERT_EQ(0, sock->Write(&content));
+    // 200 Ok
+    ReadOneResponse(sock, imsg_guard);
+    ASSERT_EQ(imsg_guard->header().status_code(), brpc::HTTP_STATUS_OK);
+
+    ASSERT_EQ(0, sock->Write(&request_buf));
+    // 200 Ok
+    ReadOneResponse(sock, imsg_guard);
+    ASSERT_EQ(imsg_guard->header().status_code(), brpc::HTTP_STATUS_OK);
+}
+
+// Test gRPC authentication failure response format
+TEST_F(HttpTest, grpc_auth_failed_response) {
+  // Set up an authenticator that returns authentication failure
+  class FailingAuthenticator : public brpc::Authenticator {
+  public:
+    int GenerateCredential(std::string*) const override { return 0; }
+    int VerifyCredential(const std::string&, const butil::EndPoint&, brpc::AuthContext*) const override {
+      return -1;  // Simulate authentication failure
+    }
+    std::string GetUnauthorizedErrorText() const override {
+      return "Authentication failed for gRPC";
+    }
+  };
+
+  FailingAuthenticator failing_auth;
+  const brpc::Authenticator* original_auth = _server._options.auth;
+  _server._options.auth = &failing_auth;
+
+  // Test HTTP/2.0 gRPC request authentication failure using H2StreamContext
+  {
+    // Create H2Context for the connection
+    brpc::policy::H2Context* h2_ctx = new brpc::policy::H2Context(_socket.get(), &_server);
+    ASSERT_EQ(0, h2_ctx->Init());
+    _socket->initialize_parsing_context(&h2_ctx);
+
+    // Create H2StreamContext representing a gRPC request
+    brpc::policy::H2StreamContext* h2_msg = new brpc::policy::H2StreamContext(false);
+    h2_msg->header().set_content_type("application/grpc");  // gRPC content type
+    h2_msg->header().uri().set_path("/EchoService/Echo");
+    h2_msg->header().set_method(brpc::HTTP_METHOD_POST);
+
+    // Initialize the stream context with connection context and stream ID
+    h2_msg->Init(h2_ctx, 1); // stream_id = 1
+
+    // Set socket and arg using existing test pattern
+    if (h2_msg->_socket == nullptr) {
+      _socket->ReAddress(&h2_msg->_socket);
+    }
+    h2_msg->_arg = &_server;
+
+    // Verify that authentication should fail for HTTP/2 gRPC request
+    bool verify_result = brpc::policy::VerifyHttpRequest(h2_msg);
+    EXPECT_FALSE(verify_result);
+
+    // Check if response has been written to pipe for HTTP/2
+    int bytes_in_pipe = 0;
+    ioctl(_pipe_fds[0], FIONREAD, &bytes_in_pipe);
+    EXPECT_GT(bytes_in_pipe, 0);
+
+    // Read and verify HTTP/2 response content
+    butil::IOPortal buf;
+    EXPECT_EQ((ssize_t)bytes_in_pipe, buf.append_from_file_descriptor(_pipe_fds[0], 1024));
+
+    // For HTTP/2, the response format should be different from HTTP/1.1
+    // Let's check if it contains HTTP/2 frame data
+    std::string response_str = buf.to_string();
+    EXPECT_GT(response_str.length(), 0);
+
+    // HTTP/2 gRPC response should contain:
+    // 1. grpc-status header (error code)
+    // 2. grpc-message header (error message)
+    // 3. Our authentication failure text (might be URL encoded)
+    EXPECT_TRUE(response_str.find("grpc-status") != std::string::npos);
+    EXPECT_TRUE(response_str.find("grpc-message") != std::string::npos);
+    EXPECT_TRUE(response_str.find("Authentication") != std::string::npos);
+    EXPECT_TRUE(response_str.find("failed") != std::string::npos);
+    EXPECT_TRUE(response_str.find("gRPC") != std::string::npos);
+
+    h2_msg->Destroy();
+  }
+
+  // Restore original auth settings
+  _server._options.auth = original_auth;
+}
+
+// Test HTTP/1.0 authentication failure response format
+TEST_F(HttpTest, http10_auth_failed_response) {
+  // Set up an authenticator that returns authentication failure
+  class FailingAuthenticator : public brpc::Authenticator {
+  public:
+    int GenerateCredential(std::string*) const override { return 0; }
+    int VerifyCredential(const std::string&, const butil::EndPoint&, brpc::AuthContext*) const override {
+      return -1;  // Simulate authentication failure
+    }
+    std::string GetUnauthorizedErrorText() const override {
+      return "Authentication failed for HTTP/1.0";
+    }
+  };
+
+  FailingAuthenticator failing_auth;
+  const brpc::Authenticator* original_auth = _server._options.auth;
+  _server._options.auth = &failing_auth;
+
+  // Test HTTP/1.0 request authentication failure (should return HTTP 403)
+  {
+    brpc::policy::HttpContext* http_msg = MakePostRequestMessage("/EchoService/Echo");
+    http_msg->header().set_version(1, 0);  // Set to HTTP/1.0
+    http_msg->header().set_content_type("application/json");  // Regular HTTP request
+
+    // Use VerifyMessage to properly set up socket and arg (like other tests)
+    VerifyMessage(http_msg, false);
+
+    // Verify that authentication should fail for HTTP/1.0 request
+    bool verify_result = brpc::policy::VerifyHttpRequest(http_msg);
+    EXPECT_FALSE(verify_result);
+
+    // Check HTTP/1.0 response format
+    int bytes_in_pipe = 0;
+    ioctl(_pipe_fds[0], FIONREAD, &bytes_in_pipe);
+    EXPECT_GT(bytes_in_pipe, 0);
+
+    butil::IOPortal buf;
+    EXPECT_EQ((ssize_t)bytes_in_pipe, buf.append_from_file_descriptor(_pipe_fds[0], 1024));
+
+    // Parse HTTP/1.0 response and verify format
+    brpc::ParseResult pr = brpc::policy::ParseHttpMessage(&buf, _socket.get(), false, nullptr);
+    EXPECT_EQ(brpc::PARSE_OK, pr.error());
+    brpc::policy::HttpContext* response_msg = static_cast<brpc::policy::HttpContext*>(pr.message());
+
+    // Verify HTTP/1.x response format (server may respond with 1.1 even for 1.0 requests)
+    EXPECT_EQ(1, response_msg->header().major_version());
+    EXPECT_TRUE(response_msg->header().minor_version() >= 0);
+    EXPECT_EQ(brpc::HTTP_STATUS_FORBIDDEN, response_msg->header().status_code());
+
+    // Check response body content
+    std::string body_content = response_msg->body().to_string();
+    EXPECT_TRUE(body_content.find("Authentication failed") != std::string::npos);
+    EXPECT_TRUE(body_content.find("1004") != std::string::npos);  // brpc error code
+
+    // Verify HTTP headers for HTTP/1.0
+    const std::string* content_length = response_msg->header().GetHeader("Content-Length");
+    EXPECT_TRUE(content_length != nullptr);
+    EXPECT_GT(std::stoi(*content_length), 0);
+
+    // Content-Type may not always be set for error responses, check if present
+    const std::string* content_type = response_msg->header().GetHeader("Content-Type");
+    if (content_type != nullptr) {
+      // If present, should contain text
+      EXPECT_TRUE(content_type->find("text") != std::string::npos);
+    }
+
+    response_msg->Destroy();
+    http_msg->Destroy();
+  }
+
+  // Restore original auth settings
+  _server._options.auth = original_auth;
 }
 
 } //namespace

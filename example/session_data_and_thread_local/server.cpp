@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A server to receive EchoRequest and send back EchoResponse asynchronously.
 
@@ -23,8 +26,6 @@ DEFINE_bool(echo_attachment, true, "Echo attachment as well");
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 DEFINE_int32(max_concurrency, 0, "Limit of request processing in parallel");
 
 butil::atomic<int> nsd(0);
@@ -95,7 +96,7 @@ struct AsyncJob {
 static void* process_thread(void* args) {
     AsyncJob* job = static_cast<AsyncJob*>(args);
     job->run_and_delete();
-    return NULL;
+    return nullptr;
 }
 
 // Your implementation of example::EchoService
@@ -119,7 +120,7 @@ public:
         // and reused between different RPC. All session-local data are
         // destroyed upon server destruction.
         MySessionLocalData* sd = static_cast<MySessionLocalData*>(cntl->session_local_data());
-        if (sd == NULL) {
+        if (sd == nullptr) {
             cntl->SetFailed("Require ServerOptions.session_local_data_factory to be"
                             " set with a correctly implemented instance");
             LOG(ERROR) << cntl->ErrorText();
@@ -134,7 +135,7 @@ public:
         // "tls" is short for "thread local storage".
         MyThreadLocalData* tls =
             static_cast<MyThreadLocalData*>(brpc::thread_local_data());
-        if (tls == NULL) {
+        if (tls == nullptr) {
             cntl->SetFailed("Require ServerOptions.thread_local_data_factory "
                             "to be set with a correctly implemented instance");
             LOG(ERROR) << cntl->ErrorText();
@@ -150,7 +151,7 @@ public:
         //   pthread_setspecific -> bthread_setspecific
         MyThreadLocalData* tls2 = 
             static_cast<MyThreadLocalData*>(bthread_getspecific(_tls2_key));
-        if (tls2 == NULL) {
+        if (tls2 == nullptr) {
             tls2 = new MyThreadLocalData;
             CHECK_EQ(0, bthread_setspecific(_tls2_key, tls2));
         }
@@ -175,7 +176,7 @@ public:
         job->response = response;
         job->done = done;
         bthread_t th;
-        CHECK_EQ(0, bthread_start_background(&th, NULL, process_thread, job));
+        CHECK_EQ(0, bthread_start_background(&th, nullptr, process_thread, job));
 
         // We don't want to call done->Run() here, release the guard.
         done_guard.release();
@@ -210,7 +211,7 @@ void AsyncJob::run() {
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // The factory to create MySessionLocalData. Must be valid when server is running.
     MySessionLocalDataFactory session_local_data_factory;

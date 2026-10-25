@@ -1,20 +1,23 @@
-// Copyright (c) 2018 brpc authors.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Jiashun Zhu(zhujiashun@bilibili.com)
 
 
+#include <cstdint>                  // int64_t
 #include <sstream>                  // std::stringstream
 #include <iomanip>                  // std::setw
 #include "brpc/grpc.h"
@@ -36,7 +39,7 @@ const char* GrpcStatusToString(GrpcStatus s) {
         case GRPC_PERMISSIONDENIED: return "GRPC_PERMISSIONDENIED";
         case GRPC_RESOURCEEXHAUSTED: return "GRPC_RESOURCEEXHAUSTED";
         case GRPC_FAILEDPRECONDITION: return "GRPC_FAILEDPRECONDITION";
-        case GPRC_ABORTED: return "GPRC_ABORTED";
+        case GRPC_ABORTED: return "GRPC_ABORTED";
         case GRPC_OUTOFRANGE: return "GRPC_OUTOFRANGE";
         case GRPC_UNIMPLEMENTED: return "GRPC_UNIMPLEMENTED";
         case GRPC_INTERNAL: return "GRPC_INTERNAL";
@@ -98,7 +101,7 @@ int GrpcStatusToErrorCode(GrpcStatus grpc_status) {
     case GRPC_RESOURCEEXHAUSTED:
         return ELIMIT;
     case GRPC_FAILEDPRECONDITION:
-    case GPRC_ABORTED:
+    case GRPC_ABORTED:
     case GRPC_OUTOFRANGE:
          return EINTERNAL;
     case GRPC_UNIMPLEMENTED:
@@ -166,11 +169,16 @@ void PercentDecode(const std::string& str, std::string* str_out) {
     }
 }
 
+// The gRPC wire format limits TimeoutValue to "an ASCII string of at most 8
+// digits", so this is the largest value a conforming peer can send. See
+// doc/PROTOCOL-HTTP2.md in grpc/grpc.
+static const int64_t MAX_GRPC_TIMEOUT_VALUE = 99999999;
+
 int64_t ConvertGrpcTimeoutToUS(const std::string* grpc_timeout) {
     if (!grpc_timeout || grpc_timeout->empty()) {
         return -1;
     }
-    char* endptr = NULL;
+    char* endptr = nullptr;
     int64_t timeout_value = (int64_t)strtol(grpc_timeout->data(), &endptr, 10);
     // Only the format that the digit number is equal to (timeout header size - 1)
     // is valid. Otherwise the format is not valid and is treated as no deadline.
@@ -181,6 +189,14 @@ int64_t ConvertGrpcTimeoutToUS(const std::string* grpc_timeout) {
     //      "123ASH" is not vaid since the digit number is 3, while the size is 6.
     //      "HHH" is not valid since the dight number is 0, while the size is 3.
     if ((size_t)(endptr - grpc_timeout->data()) != grpc_timeout->size() - 1) {
+        return -1;
+    }
+    // A value outside this range is not a valid timeout, and a large one makes
+    // the conversions below overflow int64_t, so treat it as no deadline like
+    // any other malformed value. strtol() saturates at LONG_MAX/LONG_MIN for
+    // input that does not fit, which is rejected here as well. Zero keeps
+    // going through and yields an already-expired deadline, as before.
+    if (timeout_value < 0 || timeout_value > MAX_GRPC_TIMEOUT_VALUE) {
         return -1;
     }
     switch (*endptr) {

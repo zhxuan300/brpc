@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
 
 #include <ostream>
 #include <vector>
@@ -43,9 +45,18 @@ void BadMethodService::no_method(::google::protobuf::RpcController* cntl_base,
 
     std::ostringstream os;
     os << "Missing method name for service=" << request->service_name() << '.';
+
+    // Requests from the public port must not learn anything more about the
+    // services of the server when ServerOptions.internal_port is set,
+    // especially not the methods of a builtin service.
+    if (cntl->is_security_mode()) {
+        cntl->SetFailed(ENOMETHOD, "%s", os.str().c_str());
+        return;
+    }
+
     const Server::ServiceProperty* sp = ServerPrivateAccessor(server)
         .FindServicePropertyAdaptively(request->service_name());
-    if (sp != NULL && sp->service != NULL) {
+    if (sp != nullptr && sp->service != nullptr) {
         const google::protobuf::ServiceDescriptor* sd =
             sp->service->GetDescriptor();
         os << " Available methods are: " << newline << newline;
@@ -56,7 +67,7 @@ void BadMethodService::no_method(::google::protobuf::RpcController* cntl_base,
                << ");" << newline;
         }
     }
-    if (sp != NULL && sp->restful_map != NULL) {
+    if (sp != nullptr && sp->restful_map != nullptr) {
         os << " This path is associated with a RestfulMap!";
     }
     cntl->SetFailed(ENOMETHOD, "%s", os.str().c_str());

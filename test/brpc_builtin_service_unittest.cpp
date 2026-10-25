@@ -1,5 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
@@ -9,7 +25,7 @@
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <google/protobuf/descriptor.h>
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "brpc/socket.h"
@@ -31,15 +47,30 @@
 #include "brpc/builtin/rpcz_service.h"         // RpczService
 #include "brpc/builtin/dir_service.h"          // DirService
 #include "brpc/builtin/pprof_service.h"        // PProfService
+#include "brpc/builtin/hotspots_service.h"     // HotspotsService
 #include "brpc/builtin/bthreads_service.h"     // BthreadsService
 #include "brpc/builtin/ids_service.h"          // IdsService
 #include "brpc/builtin/sockets_service.h"      // SocketsService
+#include "brpc/builtin/memory_service.h"
 #include "brpc/builtin/common.h"
 #include "brpc/builtin/bad_method_service.h"
 #include "echo.pb.h"
+#include "brpc/grpc_health_check.pb.h"
+#include "json2pb/pb_to_json.h"
 
 DEFINE_bool(foo, false, "Flags for UT");
 BRPC_VALIDATE_GFLAG(foo, brpc::PassValidate);
+
+// A reloadable string gflag so that FlagsService is able to modify its
+// value via ?setvalue=. String flags must register the validator manually,
+// see comments in butil/reloadable_flags.h.
+DEFINE_string(reloadable_string_flag_for_ut, "", "Flags for UT");
+static bool PassValidateStringFlag(const char*, const std::string&) {
+    return true;
+}
+const bool ALLOW_UNUSED dummy_validate_reloadable_string_flag_for_ut =
+    GFLAGS_NAMESPACE::RegisterFlagValidator(
+        &FLAGS_reloadable_string_flag_for_ut, PassValidateStringFlag);
 
 namespace brpc {
 DECLARE_bool(enable_rpcz);
@@ -47,9 +78,19 @@ DECLARE_bool(rpcz_hex_log_id);
 DECLARE_int32(idle_timeout_second);
 } // namespace rpc
 
+#ifdef BRPC_BTHREAD_TRACER
+namespace bthread {
+DECLARE_int32(signal_number_for_trace);
+}
+#endif
+
 int main(int argc, char* argv[]) {
     brpc::FLAGS_idle_timeout_second = 0;
     testing::InitGoogleTest(&argc, argv);
+#ifdef BRPC_BTHREAD_TRACER
+    // test using signal number other than SIGURG
+    bthread::FLAGS_signal_number_for_trace = SIGUSR2;
+#endif
     return RUN_ALL_TESTS();
 }
 
@@ -94,7 +135,7 @@ void MyVLogSite() {
 void CheckContent(const brpc::Controller& cntl, const char* name) {
     const std::string& content = cntl.response_attachment().to_string();
     std::size_t pos = content.find(name);
-    ASSERT_TRUE(pos != std::string::npos) << "name=" << name;
+    ASSERT_TRUE(pos != std::string::npos) << "name=" << name << " content=" << content;
 }
 
 void CheckErrorText(const brpc::Controller& cntl, const char* error) {
@@ -207,7 +248,7 @@ protected:
         SetUpController(&cntl, use_html);
         butil::EndPoint ep;
         ASSERT_EQ(0, str2endpoint("127.0.0.1:9798", &ep));
-        ASSERT_EQ(0, _server.Start(ep, NULL));
+        ASSERT_EQ(0, _server.Start(ep, nullptr));
         int self_port = -1;
         const int cfd = tcp_connect(ep, &self_port);
         ASSERT_GT(cfd, 0);
@@ -359,9 +400,9 @@ protected:
                                         brpc::SERVER_OWNS_SERVICE));
         butil::EndPoint ep;
         ASSERT_EQ(0, str2endpoint("127.0.0.1:9748", &ep));
-        ASSERT_EQ(0, _server.Start(ep, NULL));
+        ASSERT_EQ(0, _server.Start(ep, nullptr));
         brpc::Channel channel;
-        ASSERT_EQ(0, channel.Init(ep, NULL));
+        ASSERT_EQ(0, channel.Init(ep, nullptr));
         test::EchoService_Stub stub(&channel);
         int64_t log_id = 1234567890;
         char querystr_buf[128];
@@ -373,7 +414,7 @@ protected:
             brpc::Controller echo_cntl;
             echo_req.set_message("hello");
             echo_cntl.set_log_id(++log_id);
-            stub.Echo(&echo_cntl, &echo_req, &echo_res, NULL);
+            stub.Echo(&echo_cntl, &echo_req, &echo_res, nullptr);
             EXPECT_FALSE(echo_cntl.Failed());
 
             // Wait for level db to commit span information
@@ -397,7 +438,7 @@ protected:
             echo_req.set_message("hello");
             echo_req.set_sleep_us(150000);
             echo_cntl.set_log_id(++log_id);
-            stub.Echo(&echo_cntl, &echo_req, &echo_res, NULL);
+            stub.Echo(&echo_cntl, &echo_req, &echo_res, nullptr);
             EXPECT_FALSE(echo_cntl.Failed());
 
             // Wait for level db to commit span information
@@ -421,7 +462,7 @@ protected:
             std::string request_str(1500, 'a');
             echo_req.set_message(request_str);
             echo_cntl.set_log_id(++log_id);
-            stub.Echo(&echo_cntl, &echo_req, &echo_res, NULL);
+            stub.Echo(&echo_cntl, &echo_req, &echo_res, nullptr);
             EXPECT_FALSE(echo_cntl.Failed());
 
             // Wait for level db to commit span information
@@ -444,7 +485,7 @@ protected:
             brpc::Controller echo_cntl;
             echo_req.set_message("hello");
             echo_cntl.set_log_id(++log_id);
-            stub.Echo(&echo_cntl, &echo_req, &echo_res, NULL);
+            stub.Echo(&echo_cntl, &echo_req, &echo_res, nullptr);
             EXPECT_FALSE(echo_cntl.Failed());
 
             // Wait for level db to commit span information
@@ -522,18 +563,85 @@ TEST_F(BuiltinServiceTest, customized_health) {
     brpc::ServerOptions opt;
     MyHealthReporter hr;
     opt.health_reporter = &hr;
-    ASSERT_EQ(0, _server.Start(9798, &opt));
+    ASSERT_EQ(0, _server.Start(0, &opt));
     brpc::HealthRequest req;
     brpc::HealthResponse res;
     brpc::ChannelOptions copt;
     copt.protocol = brpc::PROTOCOL_HTTP;
     brpc::Channel chan;
-    ASSERT_EQ(0, chan.Init("127.0.0.1:9798", &copt));
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
     brpc::Controller cntl;
     cntl.http_request().uri() = "/health";
-    chan.CallMethod(NULL, &cntl, &req, &res, NULL);
+    chan.CallMethod(nullptr, &cntl, &req, &res, nullptr);
     EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
     EXPECT_EQ("i'm ok", cntl.response_attachment());
+}
+
+class MyGrpcHealthReporter : public brpc::HealthReporter {
+public:
+    void GenerateReport(brpc::Controller* cntl,
+                        google::protobuf::Closure* done) {
+        grpc::health::v1::HealthCheckResponse response;
+        response.set_status(grpc::health::v1::HealthCheckResponse_ServingStatus_UNKNOWN);
+
+        if (cntl->response()) {
+            cntl->response()->CopyFrom(response);
+        } else {
+            std::string json;
+            json2pb::ProtoMessageToJson(response, &json);
+            cntl->http_response().set_content_type("application/json");
+            cntl->response_attachment().append(json);
+        }
+        done->Run();
+    }
+};
+
+TEST_F(BuiltinServiceTest, normal_grpc_health) {
+    brpc::ServerOptions opt;
+    ASSERT_EQ(0, _server.Start(0, &opt));
+
+    grpc::health::v1::HealthCheckResponse response;
+    grpc::health::v1::HealthCheckRequest request;
+    request.set_service("grpc_req_from_brpc");
+    brpc::Controller cntl;
+    brpc::ChannelOptions copt;
+    copt.protocol = "h2:grpc";
+    brpc::Channel chan;
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
+    grpc::health::v1::Health_Stub stub(&chan);
+    stub.Check(&cntl, &request, &response, nullptr);
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_EQ(response.status(), grpc::health::v1::HealthCheckResponse_ServingStatus_SERVING);
+
+    response.Clear();
+    brpc::Controller cntl1;
+    cntl1.http_request().uri() = "/grpc.health.v1.Health/Check";
+    chan.CallMethod(nullptr, &cntl1, &request, &response, nullptr);
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_EQ(response.status(), grpc::health::v1::HealthCheckResponse_ServingStatus_SERVING);
+}
+
+TEST_F(BuiltinServiceTest, customized_grpc_health) {
+    brpc::ServerOptions opt;
+    MyGrpcHealthReporter hr;
+    opt.health_reporter = &hr;
+    ASSERT_EQ(0, _server.Start(0, &opt));
+
+    grpc::health::v1::HealthCheckResponse response;
+    grpc::health::v1::HealthCheckRequest request;
+    request.set_service("grpc_req_from_brpc");
+    brpc::Controller cntl;
+
+    brpc::ChannelOptions copt;
+    copt.protocol = "h2:grpc";
+    brpc::Channel chan;
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
+
+    grpc::health::v1::Health_Stub stub(&chan);
+    stub.Check(&cntl, &request, &response, nullptr);
+
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_EQ(response.status(), grpc::health::v1::HealthCheckResponse_ServingStatus_UNKNOWN);
 }
 
 TEST_F(BuiltinServiceTest, status) {
@@ -557,7 +665,7 @@ TEST_F(BuiltinServiceTest, list) {
 
 void* sleep_thread(void*) {
     sleep(1);
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(BuiltinServiceTest, threads) {
@@ -567,12 +675,12 @@ TEST_F(BuiltinServiceTest, threads) {
     brpc::Controller cntl;
     ClosureChecker done;
     pthread_t tid;
-    ASSERT_EQ(0, pthread_create(&tid, NULL, sleep_thread, NULL));
+    ASSERT_EQ(0, pthread_create(&tid, nullptr, sleep_thread, nullptr));
     service.default_method(&cntl, &req, &res, &done);
     EXPECT_FALSE(cntl.Failed());
     // Doesn't work under gcc 4.8.2
     // CheckContent(cntl, "sleep_thread");
-    pthread_join(tid, NULL);
+    pthread_join(tid, nullptr);
 }
 
 TEST_F(BuiltinServiceTest, vlog) {
@@ -590,6 +698,124 @@ TEST_F(BuiltinServiceTest, flags) {
     TestFlags(true);
 }
 
+TEST_F(BuiltinServiceTest, flags_escaping) {
+    // Save all flags and restore them on any exit of this test, since the
+    // /flags service below modifies `reloadable_string_flag_for_ut'.
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FlagsService service;
+    const std::string payload = "<svg onload=alert(1)>&\"'";
+    const std::string escaped = brpc::WebEscape(payload);
+
+    // Reflected: the ?setvalue= value is echoed into the html page.
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        brpc::FlagsRequest req;
+        brpc::FlagsResponse res;
+        SetUpController(&cntl, true);
+        cntl.http_request()._unresolved_path = "reloadable_string_flag_for_ut";
+        cntl.http_request().uri().SetQuery(brpc::SETVALUE_STR, payload);
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        const std::string& body = cntl.response_attachment().to_string();
+        EXPECT_EQ(std::string::npos, body.find(payload))
+            << "unescaped payload in html: " << body;
+        CheckContent(cntl, escaped.c_str());
+    }
+    // Stored: ?setvalue&withform renders the flag value stored above.
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        brpc::FlagsRequest req;
+        brpc::FlagsResponse res;
+        SetUpController(&cntl, true);
+        cntl.http_request()._unresolved_path = "reloadable_string_flag_for_ut";
+        cntl.http_request().uri().SetQuery(brpc::SETVALUE_STR, "");
+        cntl.http_request().uri().SetQuery("withform", "");
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        const std::string& body = cntl.response_attachment().to_string();
+        EXPECT_EQ(std::string::npos, body.find(payload))
+            << "unescaped payload in html: " << body;
+        CheckContent(cntl, escaped.c_str());
+    }
+    // Plain text output is not html-escaped.
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        brpc::FlagsRequest req;
+        brpc::FlagsResponse res;
+        SetUpController(&cntl, false);
+        cntl.http_request()._unresolved_path = "reloadable_string_flag_for_ut";
+        cntl.http_request().uri().SetQuery(brpc::SETVALUE_STR, payload);
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        CheckContent(cntl, payload.c_str());
+    }
+}
+
+TEST_F(BuiltinServiceTest, hotspots_query_escaping) {
+    // `view' and `base' are written into the inline script of the page and
+    // are forwarded to /hotspots/*_non_responsive, which rejects them with
+    // ValidProfilePath.
+    const std::string payload =
+        "\" + alert(1) + \"</script><script>alert(2)</script>";
+    brpc::HotspotsService service;
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        brpc::HotspotsRequest req;
+        brpc::HotspotsResponse res;
+        SetUpController(&cntl, true);
+        cntl.http_request().uri().SetQuery("view", payload);
+        service.cpu(&cntl, &req, &res, &done);
+        EXPECT_TRUE(cntl.Failed());
+        EXPECT_EQ(EINVAL, cntl.ErrorCode());
+        const std::string body = cntl.response_attachment().to_string();
+        EXPECT_EQ(std::string::npos, body.find(payload))
+            << "unescaped payload in html: " << body;
+    }
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        brpc::HotspotsRequest req;
+        brpc::HotspotsResponse res;
+        SetUpController(&cntl, true);
+        // A well-formed `view' so that `base' is reached.
+        cntl.http_request().uri().SetQuery(
+            "view", brpc::FLAGS_rpc_profiling_dir + "/0/20240101.000000.cpu");
+        cntl.http_request().uri().SetQuery("base", payload);
+        service.cpu(&cntl, &req, &res, &done);
+        EXPECT_TRUE(cntl.Failed());
+        EXPECT_EQ(EINVAL, cntl.ErrorCode());
+        const std::string body = cntl.response_attachment().to_string();
+        EXPECT_EQ(std::string::npos, body.find(payload))
+            << "unescaped payload in html: " << body;
+    }
+}
+
+TEST_F(BuiltinServiceTest, rpcz_query_escaping) {
+    // Restore -enable_rpcz on any exit of this test.
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+                     "enable_rpcz", "true").empty());
+    const std::string payload = "<svg onload=alert(1)>&\"'";
+    const std::string escaped = brpc::WebEscape(payload);
+    ClosureChecker done;
+    brpc::Controller cntl;
+    brpc::RpczRequest req;
+    brpc::RpczResponse res;
+    brpc::RpczService service;
+    SetUpController(&cntl, true);
+    cntl.http_request().uri().SetQuery(brpc::TIME_STR, payload);
+    service.default_method(&cntl, &req, &res, &done);
+    EXPECT_FALSE(cntl.Failed());
+    const std::string body = cntl.response_attachment().to_string();
+    EXPECT_EQ(std::string::npos, body.find(payload))
+        << "unescaped payload in html: " << body;
+    CheckContent(cntl, escaped.c_str());
+}
+
 TEST_F(BuiltinServiceTest, bad_method) {
     TestBadMethod(false);
     TestBadMethod(true);
@@ -597,19 +823,66 @@ TEST_F(BuiltinServiceTest, bad_method) {
 
 TEST_F(BuiltinServiceTest, vars) {
     // Start server to show bvars inside 
-    ASSERT_EQ(0, _server.Start("127.0.0.1:9798", NULL));
+    ASSERT_EQ(0, _server.Start(0, nullptr));
     brpc::VarsService service;
     brpc::VarsRequest req;
     brpc::VarsResponse res;
+    bvar::Adder<int64_t> myvar;
+    myvar.expose("myvar");
+    myvar << 9;
     {
         ClosureChecker done;
         brpc::Controller cntl;
-        bvar::Adder<int64_t> myvar;
-        myvar.expose("myvar");
-        myvar << 9;
         service.default_method(&cntl, &req, &res, &done);
         EXPECT_FALSE(cntl.Failed());
+        EXPECT_EQ("text/plain", cntl.http_response().content_type());
         CheckFieldInContent(cntl, "myvar : ", 9);
+        EXPECT_EQ(std::string::npos,
+                  cntl.response_attachment().to_string().find("<table"));
+    }
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        SetUpController(&cntl, true);
+        cntl.http_request()._unresolved_path = "myvar";
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        EXPECT_EQ("text/html", cntl.http_response().content_type());
+        CheckContent(cntl,
+                     "<table class=\"gridtable\" border=\"1\"><tr><th>Name</th><th>Value</th></tr>");
+        CheckContent(cntl,
+                     "<tr class=\"variable\"><td>myvar</td><td><span id=\"value-myvar\">9</span></td></tr>");
+        CheckContent(cntl,
+                     "<tr class=\"detail-row\"><td colspan=\"2\"><div class=\"detail\"><div id=\"myvar\" class=\"flot-placeholder\"></div></div></td></tr>");
+    }
+    {
+        // A Histogram writes one metric per bucket and the name of each carries
+        // a `le` label. Quotes cannot go into an html id, and no series is
+        // exposed under such a name anyway, so the value must come out plainly
+        // instead of inside a <span id="value-...">.
+        bvar::Histogram myhist("myhist", bvar::Histogram::BucketSchema({10, 20}));
+        myhist << 5;
+        ClosureChecker done;
+        brpc::Controller cntl;
+        SetUpController(&cntl, true);
+        cntl.http_request()._unresolved_path = "myhist";
+        service.default_method(&cntl, &req, &res, &done);
+        ASSERT_FALSE(cntl.Failed());
+        CheckContent(cntl, "<tr class=\"nonplot-variable\">"
+                           "<td>myhist_bucket{le=\"10\"}</td><td>1</td></tr>");
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_bucket"));
+        // `_sum` and `_count` carry no label and so no quotes, but they are no
+        // more a bvar of their own than the buckets are: the script refreshes
+        // a span by looking its name up among the exposed bvars, so one here
+        // would sit at the value of the page load forever, next to neighbours
+        // that do tick.
+        CheckContent(cntl, "<td>myhist_sum</td><td>5</td></tr>");
+        CheckContent(cntl, "<td>myhist_count</td><td>1</td></tr>");
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_sum"));
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_count"));
     }
     {
         ClosureChecker done;
@@ -631,13 +904,14 @@ TEST_F(BuiltinServiceTest, rpcz) {
     }
 }
 
+#if defined(BRPC_ENABLE_CPU_PROFILER) || defined(BAIDU_RPC_ENABLE_CPU_PROFILER)
 TEST_F(BuiltinServiceTest, pprof) {
     brpc::PProfService service;
     {
         ClosureChecker done;
         brpc::Controller cntl;
         cntl.http_request().uri().SetQuery("seconds", "1");
-        service.profile(&cntl, NULL, NULL, &done);
+        service.profile(&cntl, nullptr, nullptr, &done);
         // Just for loading symbols in gperftools/profiler.h
         ProfilerFlush();
         EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
@@ -646,32 +920,33 @@ TEST_F(BuiltinServiceTest, pprof) {
     {
         ClosureChecker done;
         brpc::Controller cntl;
-        service.heap(&cntl, NULL, NULL, &done);
-        const int rc = getenv("TCMALLOC_SAMPLE_PARAMETER") ? 0 : brpc::ENOMETHOD;
-        EXPECT_EQ(rc, cntl.ErrorCode());
+        service.heap(&cntl, nullptr, nullptr, &done);
+        const int rc = getenv("TCMALLOC_SAMPLE_PARAMETER") != nullptr ? 0 : brpc::ENOMETHOD;
+        EXPECT_EQ(rc, cntl.ErrorCode()) << cntl.ErrorText();
     }
     {
         ClosureChecker done;
         brpc::Controller cntl;
-        service.growth(&cntl, NULL, NULL, &done);
+        service.growth(&cntl, nullptr, nullptr, &done);
         // linked tcmalloc in UT
-        EXPECT_EQ(0, cntl.ErrorCode());
+        EXPECT_EQ(0, cntl.ErrorCode()) << cntl.ErrorText();
     }
     {
         ClosureChecker done;
         brpc::Controller cntl;
-        service.symbol(&cntl, NULL, NULL, &done);
+        service.symbol(&cntl, nullptr, nullptr, &done);
         EXPECT_FALSE(cntl.Failed());
         CheckContent(cntl, "num_symbols");
     }
     {
         ClosureChecker done;
         brpc::Controller cntl;
-        service.cmdline(&cntl, NULL, NULL, &done);
+        service.cmdline(&cntl, nullptr, nullptr, &done);
         EXPECT_FALSE(cntl.Failed());
         CheckContent(cntl, "brpc_builtin_service_unittest");
     }
 }
+#endif // BRPC_ENABLE_CPU_PROFILER || BAIDU_RPC_ENABLE_CPU_PROFILER
 
 TEST_F(BuiltinServiceTest, dir) {
     brpc::DirService service;
@@ -734,7 +1009,7 @@ TEST_F(BuiltinServiceTest, ids) {
     }    
     {
         bthread_id_t id;
-        EXPECT_EQ(0, bthread_id_create(&id, NULL, NULL));
+        EXPECT_EQ(0, bthread_id_create(&id, nullptr, nullptr));
         ClosureChecker done;
         brpc::Controller cntl;
         std::string id_string;
@@ -748,7 +1023,48 @@ TEST_F(BuiltinServiceTest, ids) {
 
 void* dummy_bthread(void*) {
     bthread_usleep(1000000);
-    return NULL;
+    return nullptr;
+}
+
+
+#ifdef BRPC_BTHREAD_TRACER
+bool g_bthread_trace_start = false;
+bool g_bthread_trace_stop = false;
+void* bthread_trace(void*) {
+    g_bthread_trace_start = true;
+    while (!g_bthread_trace_stop) {
+        bthread_usleep(1000 * 100);
+    }
+    return nullptr;
+}
+#endif // BRPC_BTHREAD_TRACER
+
+// check all living bthreads without need to specify bthread id
+bool check_all_bthreads(bthread_t expected_th, bool enable_trace) {
+    brpc::BthreadsService service;
+    brpc::BthreadsRequest req;
+    brpc::BthreadsResponse res;
+    ClosureChecker done;
+    brpc::Controller cntl;
+    std::string all_string("all");
+    if (enable_trace) {
+        all_string.append("?st=1");
+    }
+    cntl.http_request()._unresolved_path = all_string;
+    cntl.http_request().uri().SetHttpURL("/bthreads/" + all_string);
+    service.default_method(&cntl, &req, &res, &done);
+    EXPECT_FALSE(cntl.Failed());
+    const std::string& content = cntl.response_attachment().to_string();
+    std::string expected_str = butil::string_printf("bthread=%llu",
+        (unsigned long long)expected_th);
+    bool ok = content.find("stop=0") != std::string::npos &&
+        content.find(expected_str) != std::string::npos;
+    if (ok && enable_trace) {
+        ok = content.find("bthread_trace") != std::string::npos;
+    } else if (ok && !enable_trace) {
+        ok = content.find("bthread_trace") == std::string::npos;
+    }
+    return ok;
 }
 
 TEST_F(BuiltinServiceTest, bthreads) {
@@ -768,11 +1084,19 @@ TEST_F(BuiltinServiceTest, bthreads) {
         cntl.http_request()._unresolved_path = "not_valid";
         service.default_method(&cntl, &req, &res, &done);
         EXPECT_TRUE(cntl.Failed());
-        CheckErrorText(cntl, "is not a bthread id");
+        CheckErrorText(cntl, "is not a bthread id or all");
     }    
     {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        cntl.http_request()._unresolved_path = "all";
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        CheckContent(cntl, "stop=0");
+    }
+    {
         bthread_t th;
-        EXPECT_EQ(0, bthread_start_background(&th, NULL, dummy_bthread, NULL));
+        EXPECT_EQ(0, bthread_start_background(&th, nullptr, dummy_bthread, nullptr));
         ClosureChecker done;
         brpc::Controller cntl;
         std::string id_string;
@@ -781,7 +1105,39 @@ TEST_F(BuiltinServiceTest, bthreads) {
         service.default_method(&cntl, &req, &res, &done);
         EXPECT_FALSE(cntl.Failed());
         CheckContent(cntl, "stop=0");
-    }    
+    }
+
+#ifdef BRPC_BTHREAD_TRACER
+    bool ok = false, check_all_ok = false;
+    for (int i = 0; i < 10; ++i) {
+        bthread_t th;
+        EXPECT_EQ(0, bthread_start_background(&th, nullptr, bthread_trace, nullptr));
+        while (!g_bthread_trace_start) {
+            bthread_usleep(1000 * 10);
+        }
+        LOG(INFO) << "start bthread = " << th;
+        ClosureChecker done;
+        brpc::Controller cntl;
+        std::string id_string;
+        butil::string_printf(&id_string, "%llu?st=1", (unsigned long long)th);
+        cntl.http_request().uri().SetHttpURL("/bthreads/" + id_string);
+        cntl.http_request()._unresolved_path = id_string;
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        const std::string& content = cntl.response_attachment().to_string();
+        ok = content.find("stop=0") != std::string::npos &&
+             content.find("bthread_trace") != std::string::npos;
+        check_all_ok = check_all_bthreads(th, true) && check_all_bthreads(th, false);
+        g_bthread_trace_stop = true;
+        bthread_join(th, nullptr);
+        // the `bthread_trace` bthread should not be queried now
+        EXPECT_TRUE(!check_all_bthreads(th, true) && !check_all_bthreads(th, false));
+        if (ok && check_all_ok) {
+            break;
+        }
+    }
+    ASSERT_TRUE(ok && check_all_ok);
+#endif // BRPC_BTHREAD_TRACER
 }
 
 TEST_F(BuiltinServiceTest, sockets) {
@@ -817,3 +1173,23 @@ TEST_F(BuiltinServiceTest, sockets) {
         CheckContent(cntl, "fd=-1");
     }    
 }
+
+#if defined(BRPC_ENABLE_CPU_PROFILER) || defined(BAIDU_RPC_ENABLE_CPU_PROFILER)
+TEST_F(BuiltinServiceTest, memory) {
+    brpc::MemoryService service;
+    brpc::MemoryRequest req;
+    brpc::MemoryResponse res;
+    brpc::Controller cntl;
+    ClosureChecker done;
+    service.default_method(&cntl, &req, &res, &done);
+    EXPECT_FALSE(cntl.Failed());
+    CheckContent(cntl, "generic.current_allocated_bytes");
+    CheckContent(cntl, "generic.heap_size");
+    CheckContent(cntl, "tcmalloc.current_total_thread_cache_bytes");
+    CheckContent(cntl, "tcmalloc.central_cache_free_bytes");
+    CheckContent(cntl, "tcmalloc.transfer_cache_free_bytes");
+    CheckContent(cntl, "tcmalloc.thread_cache_free_bytes");
+    CheckContent(cntl, "tcmalloc.pageheap_free_bytes");
+    CheckContent(cntl, "tcmalloc.pageheap_unmapped_bytes");
+}
+#endif // BRPC_ENABLE_CPU_PROFILER || BAIDU_RPC_ENABLE_CPU_PROFILER

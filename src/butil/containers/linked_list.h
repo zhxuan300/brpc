@@ -128,7 +128,7 @@ class LinkNode {
   void RemoveFromList() {
     this->previous_->next_ = this->next_;
     this->next_->previous_ = this->previous_;
-    // next() and previous() return non-NULL if and only this node is not in any
+    // next() and previous() return non-nullptr if and only this node is not in any
     // list.
     this->next_ = this;
     this->previous_ = this;
@@ -169,6 +169,11 @@ class LinkedList {
   // Appends |e| to the end of the linked list.
   void Append(LinkNode<T>* e) {
     e->InsertBefore(&root_);
+  }
+
+  // Prepend |e| to the head of the linked list.
+  void Prepend(LinkNode<T>* e) {
+    e->InsertAfter(&root_);
   }
 
   LinkNode<T>* head() const {

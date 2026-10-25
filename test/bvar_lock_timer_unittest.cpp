@@ -1,6 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2015/03/06 18:34:03
 
 #include <iostream>
@@ -8,7 +22,7 @@
 #include <condition_variable>
 #endif
 #include <gtest/gtest.h>
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "bvar/utils/lock_timer.h"
 
 namespace {
@@ -97,7 +111,7 @@ TEST_F(LockTimerTest, pthread_mutex_and_cond) {
         ASSERT_EQ(1u, recorder.count());
         timespec due_time = butil::milliseconds_from_now(10);
         pthread_cond_t cond;
-        ASSERT_EQ(0, pthread_cond_init(&cond, NULL));
+        ASSERT_EQ(0, pthread_cond_init(&cond, nullptr));
         pthread_cond_timedwait(&cond, &(pthread_mutex_t&)mutex, &due_time);
         pthread_cond_timedwait(&cond, &mutex.mutex(), &due_time);
         ASSERT_EQ(0, pthread_cond_destroy(&cond));
@@ -116,7 +130,7 @@ void *signal_lock_thread(void *arg) {
             usleep(10);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(LockTimerTest, signal_lock_time) {
@@ -124,22 +138,22 @@ TEST_F(LockTimerTest, signal_lock_time) {
     MutexWithRecorder<pthread_mutex_t> m0(r0);
     pthread_t threads[4];
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, 
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, 
             signal_lock_thread<MutexWithRecorder<pthread_mutex_t> >, &m0));
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
     }
     LOG(INFO) << r0;
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r0.get_value().num);
     LatencyRecorder r1;
     MutexWithLatencyRecorder<pthread_mutex_t> m1(r1);
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, 
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, 
             signal_lock_thread<MutexWithLatencyRecorder<pthread_mutex_t> >, &m1));
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
     }
     LOG(INFO) << r1._latency;
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r1.count());
@@ -160,7 +174,7 @@ void *double_lock_thread(void *arg) {
         butil::double_lock(lck0, lck1);
         usleep(10);
     }
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(LockTimerTest, double_lock_time) {
@@ -173,30 +187,39 @@ TEST_F(LockTimerTest, double_lock_time) {
     arg.m1.set_recorder(r1);
     pthread_t threads[4];
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, 
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, 
             double_lock_thread<M0, M1>, &arg));
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
     }
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r0.get_value().num);
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r1.count());
     LOG(INFO) << r0;
     LOG(INFO) << r1._latency;
+#if !WITH_BABYLON_COUNTER
+    // reset() of IntRecorder with babylon counter does not work,
+    // should never call reset().
     r0.reset();
     r1._latency.reset();
+#endif // !WITH_BABYLON_COUNTER
     DoubleLockArg<M1, M0> arg1;
     arg1.m0.set_recorder(r1);
     arg1.m1.set_recorder(r0);
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, 
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, 
             double_lock_thread<M1, M0>, &arg1));
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
     }
+#if !WITH_BABYLON_COUNTER
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r0.get_value().num);
     ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads), (size_t)r1.count());
+#else
+    ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads) * 2, (size_t)r0.get_value().num);
+    ASSERT_EQ(OPS_PER_THREAD * ARRAY_SIZE(threads) * 2, (size_t)r1.count());
+#endif // !WITH_BABYLON_COUNTER
     LOG(INFO) << r0;
     LOG(INFO) << r1._latency;
 }
@@ -206,7 +229,7 @@ TEST_F(LockTimerTest, overhead) {
     MutexWithLatencyRecorder<DummyMutex> m0(r0);
     butil::Timer timer;
     const size_t N = 1000 * 1000 * 10;
-    
+
     ProfilerStart("mutex_with_latency_recorder.prof");
     timer.start();
     for (size_t i = 0; i < N; ++i) {

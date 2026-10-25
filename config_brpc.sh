@@ -1,3 +1,36 @@
+#!/usr/bin/env sh
+
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+print_info() {
+    printf "${CYAN}[INFO]${NC} %s\n" "$1"
+}
+print_success() {
+    printf "${GREEN}[OK]${NC}   %s\n" "$1"
+}
+print_step() {
+    printf "${BOLD}==> %s${NC}\n" "$1"
+}
+
 SYSTEM=$(uname -s)
 if [ "$SYSTEM" = "Darwin" ]; then
     if [ -z "$BASH" ] || [ "$BASH" = "/bin/sh" ] ; then
@@ -21,10 +54,23 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,nodebugsymbols -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-flatbuffers,with-rdma,with-urma,with-urma-mock,without-urma-mock,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
 WITH_THRIFT=0
+WITH_FLATBUFFERS=0
+WITH_RDMA=0
+WITH_URMA=0
+URMA_MOCK_MODE=auto
+WITH_MESALINK=0
+WITH_BTHREAD_TRACER=0
+WITH_ASAN=0
+WITH_RISCV_ZVBC=0
+WITH_RISCV_ZBC=0
+BRPC_DEBUG_BTHREAD_SCHE_SAFETY=0
 DEBUGSYMBOLS=-g
+WERROR=
+BRPC_DEBUG_LOCK=0
+WITH_CPU_FREQUENCY=0
 
 if [ $? != 0 ] ; then >&2 $ECHO "Terminating..."; exit 1 ; fi
 
@@ -46,11 +92,29 @@ while true; do
         --cxx ) CXX=$2; shift 2 ;;
         --with-glog ) WITH_GLOG=1; shift 1 ;;
         --with-thrift) WITH_THRIFT=1; shift 1 ;;
+        --with-flatbuffers) WITH_FLATBUFFERS=1; shift 1 ;;
+        --with-rdma) WITH_RDMA=1; shift 1 ;;
+        --with-urma) WITH_URMA=1; shift 1 ;;
+        --with-urma-mock) URMA_MOCK_MODE=on; shift 1 ;;
+        --without-urma-mock) URMA_MOCK_MODE=off; shift 1 ;;
+        --with-mesalink) WITH_MESALINK=1; shift 1 ;;
+        --with-bthread-tracer) WITH_BTHREAD_TRACER=1; shift 1 ;;
+        --with-debug-bthread-sche-safety ) BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1; shift 1 ;;
+        --with-debug-lock ) BRPC_DEBUG_LOCK=1; shift 1 ;;
+        --with-cpu-frequency ) WITH_CPU_FREQUENCY=1; shift 1 ;;
+        --with-asan) WITH_ASAN=1; shift 1 ;;
+        --with-riscv-zvbc) WITH_RISCV_ZVBC=1; shift 1 ;;
+        --with-riscv-zbc) WITH_RISCV_ZBC=1; shift 1 ;;
         --nodebugsymbols ) DEBUGSYMBOLS=; shift 1 ;;
+        --werror ) WERROR=-Werror; shift 1 ;;
         -- ) shift; break ;;
         * ) break ;;
     esac
 done
+
+print_step "Configuring brpc (${SYSTEM})"
+print_info "Headers path: ${HDRS_IN}"
+print_info "Libs path:    ${LIBS_IN}"
 
 if [ -z "$CC" ]; then
     if [ ! -z "$CXX" ]; then
@@ -68,9 +132,11 @@ elif [ -z "$CXX" ]; then
     exit 1
 fi
 
-GCC_VERSION=$($CXX tools/print_gcc_version.cc -o print_gcc_version && ./print_gcc_version && rm ./print_gcc_version)
-if [ $GCC_VERSION -gt 0 ] && [ $GCC_VERSION -lt 40800 ]; then
-    >&2 $ECHO "GCC is too old, please install a newer version supporting C++11"
+print_info "CC=$CC, CXX=$CXX"
+
+GCC_VERSION=$(CXX=$CXX tools/print_gcc_version.sh)
+if [ $GCC_VERSION -eq 0 ] || [ $GCC_VERSION -lt 50000 ]; then
+    >&2 $ECHO "C++ compiler is too old, please install GCC 5.0+ or Clang 3.5+ with C++14 support"
     exit 1
 fi
 
@@ -96,20 +162,21 @@ find_dir_of_lib_or_die() {
 }
 
 find_bin() {
-    TARGET_BIN=$(which "$1" 2>/dev/null)
+    TARGET_BIN=$(find -L ${LIBS_IN} -type f -name "$1" 2>/dev/null | head -n1)
     if [ ! -z "$TARGET_BIN" ]; then
         $ECHO $TARGET_BIN
     else
-        find ${LIBS_IN} -name "$1" 2>/dev/null | head -n1
+        which "$1" 2>/dev/null
     fi
 }
 find_bin_or_die() {
     TARGET_BIN=$(find_bin "$1")
-    if [ -z "$TARGET_BIN" ]; then
-        >&2 $ECHO "Fail to find $1 from --libs"
+    if [ ! -z "$TARGET_BIN" ]; then
+        $ECHO $TARGET_BIN
+    else
+        >&2 $ECHO "Fail to find $1"
         exit 1
     fi
-    $ECHO $TARGET_BIN
 }
 
 find_dir_of_header() {
@@ -133,12 +200,37 @@ find_dir_of_header_or_die() {
     $ECHO $dir
 }
 
+if [ "$SYSTEM" = "Darwin" ]; then
+    if [ -d "/usr/local/opt/openssl" ]; then
+        LIBS_IN="/usr/local/opt/openssl/lib $LIBS_IN"
+        HDRS_IN="/usr/local/opt/openssl/include $HDRS_IN"
+    elif [ -d "/opt/homebrew/Cellar" ]; then
+        LIBS_IN="/opt/homebrew/Cellar $LIBS_IN"
+        HDRS_IN="/opt/homebrew/Cellar $HDRS_IN"
+    fi
+fi
+
+print_step "Checking dependencies"
+
+# User specified path of openssl, if not given it's empty
+OPENSSL_LIB=$(find_dir_of_lib ssl)
 # Inconvenient to check these headers in baidu-internal
 #PTHREAD_HDR=$(find_dir_of_header_or_die pthread.h)
-OPENSSL_HDR=$(find_dir_of_header_or_die openssl/ssl.h)
+OPENSSL_HDR=$(find_dir_of_header_or_die openssl/ssl.h mesalink/openssl/ssl.h)
+print_success "Found openssl: lib=${OPENSSL_LIB:-system}, hdr=${OPENSSL_HDR}"
+
+if [ $WITH_MESALINK != 0 ]; then
+    MESALINK_HDR=$(find_dir_of_header_or_die mesalink/openssl/ssl.h)
+    OPENSSL_HDR="$OPENSSL_HDR\n$MESALINK_HDR"
+fi
 
 STATIC_LINKINGS=
 DYNAMIC_LINKINGS="-lpthread -lssl -lcrypto -ldl -lz"
+
+if [ $WITH_MESALINK != 0 ]; then
+    DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -lmesalink"
+fi
+
 if [ "$SYSTEM" = "Linux" ]; then
     DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -lrt"
 fi
@@ -152,7 +244,10 @@ if [ "$SYSTEM" = "Darwin" ]; then
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_MallocExtension_ReleaseFreeMemory"
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_ProfilerStart"
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_ProfilerStop"
+	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,__Z13GetStackTracePPvii"
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_RegisterThriftProtocol"
+	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_mallctl"
+	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_malloc_stats_print"
 fi
 append_linking() {
     if [ -f $1/lib${2}.a ]; then
@@ -171,11 +266,14 @@ append_linking() {
 
 GFLAGS_LIB=$(find_dir_of_lib_or_die gflags)
 append_linking $GFLAGS_LIB gflags
+print_success "Found gflags: $GFLAGS_LIB"
 
 PROTOBUF_LIB=$(find_dir_of_lib_or_die protobuf)
 append_linking $PROTOBUF_LIB protobuf
+print_success "Found protobuf: $PROTOBUF_LIB"
 
 LEVELDB_LIB=$(find_dir_of_lib_or_die leveldb)
+print_success "Found leveldb: $LEVELDB_LIB"
 # required by leveldb
 if [ -f $LEVELDB_LIB/libleveldb.a ]; then
     if [ -f $LEVELDB_LIB/libleveldb.$SO ]; then
@@ -204,23 +302,135 @@ else
 fi
 
 PROTOC=$(find_bin_or_die protoc)
+print_success "Found protoc: $PROTOC"
 
 GFLAGS_HDR=$(find_dir_of_header_or_die gflags/gflags.h)
-# namespace of gflags may not be google, grep it from source.
-GFLAGS_NS=$(grep "namespace [_A-Za-z0-9]\+ {" $GFLAGS_HDR/gflags/gflags_declare.h | head -1 | awk '{print $2}')
-if [ "$GFLAGS_NS" = "GFLAGS_NAMESPACE" ]; then
-    GFLAGS_NS=$(grep "#define GFLAGS_NAMESPACE [_A-Za-z0-9]\+" $GFLAGS_HDR/gflags/gflags_declare.h | head -1 | awk '{print $3}')
-fi
-if [ -z "$GFLAGS_NS" ]; then
-    >&2 $ECHO "Fail to grep namespace of gflags source $GFLAGS_HDR/gflags/gflags_declare.h"
-    exit 1
-fi
 
 PROTOBUF_HDR=$(find_dir_of_header_or_die google/protobuf/message.h)
+PROTOBUF_VERSION=$(grep '#define GOOGLE_PROTOBUF_VERSION [0-9]\+' $PROTOBUF_HDR/google/protobuf/stubs/common.h | awk '{print $3}')
+if [ "$PROTOBUF_VERSION" -ge 4022000 ]; then
+    # from v22, utf8_validity should be explicitly linked
+    # https://github.com/protocolbuffers/protobuf/blob/a847a8dc4ba1d99e7ba917146c84438b4de7d085/cmake/libprotobuf.cmake#L47
+    UTF8_VALIDITY_LIB=$(find_dir_of_lib utf8_validity)
+    append_linking "$UTF8_VALIDITY_LIB" utf8_validity
+
+    ABSL_HDR=$(find_dir_of_header_or_die absl/base/config.h)
+    ABSL_LIB=$(find_dir_of_lib_or_die absl_strings)
+    ABSL_TARGET_NAMES="
+        absl_bad_optional_access
+        absl_bad_variant_access
+        absl_base
+        absl_city
+        absl_civil_time
+        absl_cord
+        absl_cord_internal
+        absl_cordz_functions
+        absl_cordz_handle
+        absl_cordz_info
+        absl_crc32c
+        absl_crc_cord_state
+        absl_crc_cpu_detect
+        absl_crc_internal
+        absl_debugging_internal
+        absl_demangle_internal
+        absl_die_if_null
+        absl_examine_stack
+        absl_exponential_biased
+        absl_flags
+        absl_flags_commandlineflag
+        absl_flags_commandlineflag_internal
+        absl_flags_config
+        absl_flags_internal
+        absl_flags_marshalling
+        absl_flags_private_handle_accessor
+        absl_flags_program_name
+        absl_flags_reflection
+        absl_graphcycles_internal
+        absl_hash
+        absl_hashtablez_sampler
+        absl_int128
+        absl_kernel_timeout_internal
+        absl_leak_check
+        absl_log_entry
+        absl_log_globals
+        absl_log_initialize
+        absl_log_internal_check_op
+        absl_log_internal_conditions
+        absl_log_internal_format
+        absl_log_internal_globals
+        absl_log_internal_log_sink_set
+        absl_log_internal_message
+        absl_log_internal_nullguard
+        absl_log_internal_proto
+        absl_log_severity
+        absl_log_sink
+        absl_low_level_hash
+        absl_malloc_internal
+        absl_raw_hash_set
+        absl_raw_logging_internal
+        absl_spinlock_wait
+        absl_stacktrace
+        absl_status
+        absl_statusor
+        absl_str_format_internal
+        absl_strerror
+        absl_string_view
+        absl_strings
+        absl_strings_internal
+        absl_symbolize
+        absl_synchronization
+        absl_throw_delegate
+        absl_time
+        absl_time_zone
+    "
+    for i in $ABSL_TARGET_NAMES; do
+        # ignore interface targets
+        if [ -n "$(find_dir_of_lib $i)" ]; then
+            append_linking "$ABSL_LIB" "$i"
+        fi
+    done
+    CXXFLAGS="-std=c++17"
+    print_success "Found protobuf version $PROTOBUF_VERSION (>= v22, using C++17 with abseil)"
+else
+    CXXFLAGS="-std=c++14"
+    print_success "Found protobuf version $PROTOBUF_VERSION"
+fi
+
+CPPFLAGS=
+
+if [ $WITH_ASAN != 0 ]; then
+  CPPFLAGS="${CPPFLAGS} -fsanitize=address"
+  DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -fsanitize=address"
+fi
+
 LEVELDB_HDR=$(find_dir_of_header_or_die leveldb/db.h)
 
-HDRS=$($ECHO "$GFLAGS_HDR\n$PROTOBUF_HDR\n$LEVELDB_HDR\n$OPENSSL_HDR" | sort | uniq)
-LIBS=$($ECHO "$GFLAGS_LIB\n$PROTOBUF_LIB\n$LEVELDB_LIB\n$SNAPPY_LIB" | sort | uniq)
+if [ $WITH_BTHREAD_TRACER != 0 ]; then
+    if [ "$SYSTEM" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+        >&2 $ECHO "bthread tracer is only supported on Linux x86_64 platform"
+        exit 1
+    fi
+    LIBUNWIND_HDR=$(find_dir_of_header_or_die libunwind.h)
+    LIBUNWIND_LIB=$(find_dir_of_lib_or_die unwind)
+    ABSL_HDR=$(find_dir_of_header_or_die absl/base/config.h)
+    ABSL_LIB=$(find_dir_of_lib_or_die absl_symbolize)
+
+    CPPFLAGS="${CPPFLAGS} -DBRPC_BTHREAD_TRACER"
+
+    if [ -f "$LIBUNWIND_LIB/libunwind.$SO" ]; then
+        DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -lunwind -lunwind-x86_64"
+    else
+        STATIC_LINKINGS="$STATIC_LINKINGS -lunwind -lunwind-x86_64"
+    fi
+    if [ -f "$ABSL_LIB/libabsl_base.$SO" ]; then
+        DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base"
+    else
+        STATIC_LINKINGS="$STATIC_LINKINGS -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base"
+    fi
+fi
+
+HDRS=$($ECHO "$LIBUNWIND_HDR\n$GFLAGS_HDR\n$PROTOBUF_HDR\n$ABSL_HDR\n$LEVELDB_HDR\n$OPENSSL_HDR" | sort | uniq)
+LIBS=$($ECHO "$LIBUNWIND_LIB\n$GFLAGS_LIB\n$PROTOBUF_LIB\n$ABSL_LIB\n$LEVELDB_LIB\n$OPENSSL_LIB\n$SNAPPY_LIB" | sort | uniq)
 
 absent_in_the_list() {
     TMP=`$ECHO "$1\n$2" | sort | uniq`
@@ -271,22 +481,38 @@ append_to_output "HDRS=$($ECHO $HDRS)"
 append_to_output "LIBS=$($ECHO $LIBS)"
 append_to_output "PROTOC=$PROTOC"
 append_to_output "PROTOBUF_HDR=$PROTOBUF_HDR"
+append_to_output "WITH_FLATBUFFERS=$WITH_FLATBUFFERS"
 append_to_output "CC=$CC"
 append_to_output "CXX=$CXX"
 append_to_output "GCC_VERSION=$GCC_VERSION"
 append_to_output "STATIC_LINKINGS=$STATIC_LINKINGS"
 append_to_output "DYNAMIC_LINKINGS=$DYNAMIC_LINKINGS"
-CPPFLAGS="-DBRPC_WITH_GLOG=$WITH_GLOG -DGFLAGS_NS=$GFLAGS_NS"
+
+# CPP means C PreProcessing, not C PlusPlus
+CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_GLOG=$WITH_GLOG -DBRPC_WITH_FLATBUFFERS=$WITH_FLATBUFFERS -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=$BRPC_DEBUG_BTHREAD_SCHE_SAFETY -DBRPC_DEBUG_LOCK=$BRPC_DEBUG_LOCK -DBUTIL_USE_CPU_FREQUENCY=$WITH_CPU_FREQUENCY"
+
+# Avoid over-optimizations of TLS variables by GCC>=4.8
+# See: https://github.com/apache/brpc/issues/1693
+CPPFLAGS="${CPPFLAGS} -D__const__=__unused__"
 
 if [ ! -z "$DEBUGSYMBOLS" ]; then
     CPPFLAGS="${CPPFLAGS} $DEBUGSYMBOLS"
 fi
+if [ ! -z "$WERROR" ]; then
+    CPPFLAGS="${CPPFLAGS} $WERROR"
+fi
 if [ "$SYSTEM" = "Darwin" ]; then
-    CPPFLAGS="${CPPFLAGS} -Wno-deprecated-declarations"
+    CPPFLAGS="${CPPFLAGS} -Wno-deprecated-declarations -Wno-inconsistent-missing-override"
     version=`sw_vers -productVersion | awk -F '.' '{print $1 "." $2}'`
     if [[ `echo "$version<10.12" | bc -l` == 1 ]]; then
         CPPFLAGS="${CPPFLAGS} -DNO_CLOCK_GETTIME_IN_MAC"
     fi
+fi
+
+if [ $WITH_FLATBUFFERS != 0 ]; then
+    FLATBUFFERS_HDR=$(find_dir_of_header_or_die flatbuffers/flatbuffers.h) || exit 1
+    append_to_output_headers "$FLATBUFFERS_HDR"
+    print_success "Found FlatBuffers headers: $FLATBUFFERS_HDR"
 fi
 
 if [ $WITH_THRIFT != 0 ]; then
@@ -302,9 +528,91 @@ if [ $WITH_THRIFT != 0 ]; then
     else
         append_to_output "STATIC_LINKINGS+=-lthriftnb"
     fi
+    # get thrift version
+    thrift_version=$(thrift --version | awk '{print $3}')
+    major=$(echo "$thrift_version" | awk -F '.' '{print $1}')
+    minor=$(echo "$thrift_version" | awk -F '.' '{print $2}')
+    if [ $((major)) -eq 0 -a $((minor)) -lt 11 ]; then
+        CPPFLAGS="${CPPFLAGS} -D_THRIFT_VERSION_LOWER_THAN_0_11_0_"
+        echo "less"
+    else
+        echo "greater"
+    fi
+fi
+
+if [ $WITH_RDMA != 0 ]; then
+    RDMA_LIB=$(find_dir_of_lib_or_die ibverbs)
+    RDMA_HDR=$(find_dir_of_header_or_die infiniband/verbs.h)
+    append_to_output_libs "$RDMA_LIB"
+    append_to_output_headers "$RDMA_HDR"
+
+    CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_RDMA"
+
+    append_to_output "DYNAMIC_LINKINGS+=-libverbs"
+    append_to_output "WITH_RDMA=1"
+fi
+
+if [ $WITH_URMA != 0 ]; then
+    URMA_LIB=$(find_dir_of_lib urma)
+    URMA_HDR=$(find_dir_of_header urma_api.h)
+    if [ -z "$URMA_HDR" ]; then
+        >&2 $ECHO "Fail to find urma_api.h from --headers"
+        exit 1
+    fi
+    URMA_BOND_HDR=$(find_dir_of_header urma_ubagg.h)
+    CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_URMA=1"
+    append_to_output "WITH_URMA=1"
+    append_to_output_headers "$URMA_HDR"
+    if [ -n "$URMA_BOND_HDR" ]; then
+        append_to_output_headers "$URMA_BOND_HDR"
+    fi
+    if [ "$URMA_MOCK_MODE" = "on" ]; then
+        append_to_output "URMA_USE_MOCK=1"
+        print_info "URMA mock forced by --with-urma-mock"
+    elif [ "$URMA_MOCK_MODE" = "off" ]; then
+        if [ -z "$URMA_LIB" ]; then
+            >&2 $ECHO "--without-urma-mock requires liburma"
+            exit 1
+        fi
+        append_to_output_libs "$URMA_LIB"
+        append_to_output "DYNAMIC_LINKINGS+=-lurma"
+        append_to_output "URMA_USE_MOCK=0"
+        print_info "URMA mock disabled by --without-urma-mock"
+    elif [ -n "$URMA_LIB" ]; then
+        append_to_output_libs "$URMA_LIB"
+        append_to_output "DYNAMIC_LINKINGS+=-lurma"
+        append_to_output "URMA_USE_MOCK=0"
+    else
+        append_to_output "URMA_USE_MOCK=1"
+        print_info "liburma not found; using URMA link-time mock"
+    fi
+fi
+
+if [ $WITH_MESALINK != 0 ]; then
+    CPPFLAGS="${CPPFLAGS} -DUSE_MESALINK"
 fi
 
 append_to_output "CPPFLAGS=${CPPFLAGS}"
+append_to_output "# without the flag, linux+arm64 may crash due to folding on TLS.
+ifeq (\$(CC),gcc)
+  ifeq (\$(shell uname -p),aarch64)
+    CPPFLAGS+=-fno-gcse
+  endif
+endif
+"
+
+# RISC-V Zvbc/Zbc support
+if [ "$(uname -m)" = "riscv64" ]; then
+    if [ $WITH_RISCV_ZVBC != 0 ]; then
+        CXXFLAGS="${CXXFLAGS} -march=rv64gcv_zbc_zvbc"
+        print_success "RISC-V Zvbc enabled: -march=rv64gcv_zbc_zvbc"
+    elif [ $WITH_RISCV_ZBC != 0 ]; then
+        CXXFLAGS="${CXXFLAGS} -march=rv64gc_zbc"
+        print_success "RISC-V Zbc enabled: -march=rv64gc_zbc"
+    fi
+fi
+
+append_to_output "CXXFLAGS=${CXXFLAGS}"
 
 append_to_output "ifeq (\$(NEED_LIBPROTOC), 1)"
 PROTOC_LIB=$(find $PROTOBUF_LIB -name "libprotoc.*" | head -n1)
@@ -332,7 +640,10 @@ append_to_output "ifeq (\$(NEED_GPERFTOOLS), 1)"
 TCMALLOC_LIB=$(find_dir_of_lib tcmalloc_and_profiler)
 if [ -z "$TCMALLOC_LIB" ]; then
     append_to_output "    \$(error \"Fail to find gperftools\")"
+elif [ $WITH_ASAN != 0 ]; then
+    append_to_output "    \$(error \"gperftools is not compatible with ASAN\")"
 else
+    append_to_output "    CPPFLAGS+=-DBRPC_ENABLE_CPU_PROFILER"
     append_to_output_libs "$TCMALLOC_LIB" "    "
     if [ -f $TCMALLOC_LIB/libtcmalloc.$SO ]; then
         append_to_output "    DYNAMIC_LINKINGS+=-ltcmalloc_and_profiler"
@@ -390,8 +701,37 @@ cat << EOF > src/butil/config.h
 #endif
 #define BRPC_WITH_GLOG $WITH_GLOG
 
+#ifdef BRPC_WITH_FLATBUFFERS
+#undef BRPC_WITH_FLATBUFFERS
+#endif
+#define BRPC_WITH_FLATBUFFERS $WITH_FLATBUFFERS
+
+#ifdef BUTIL_USE_CPU_FREQUENCY
+#undef BUTIL_USE_CPU_FREQUENCY
+#endif
+#define BUTIL_USE_CPU_FREQUENCY $WITH_CPU_FREQUENCY
+
 #endif  // BUTIL_CONFIG_H
 EOF
 
+print_step "Generating output files"
+
 # write to config.mk
 $ECHO "$OUTPUT_CONTENT" > config.mk
+print_success "Generated config.mk"
+print_success "Generated src/butil/config.h"
+
+printf "\n"
+print_step "Configuration complete"
+print_info "Compiler:  $CC / $CXX"
+print_info "C++ std:   $CXXFLAGS"
+print_info "System:    $SYSTEM"
+if [ $WITH_GLOG -ne 0 ]; then print_info "With glog: yes"; fi
+if [ $WITH_THRIFT -ne 0 ]; then print_info "With thrift: yes"; fi
+if [ $WITH_FLATBUFFERS -ne 0 ]; then print_info "With FlatBuffers: yes (headers only)"; fi
+if [ $WITH_RDMA -ne 0 ]; then print_info "With RDMA: yes"; fi
+if [ $WITH_URMA -ne 0 ]; then print_info "With URMA: yes"; fi
+if [ $WITH_MESALINK -ne 0 ]; then print_info "With MesaLink: yes"; fi
+if [ $WITH_BTHREAD_TRACER -ne 0 ]; then print_info "With bthread tracer: yes"; fi
+if [ $WITH_ASAN -ne 0 ]; then print_info "With ASAN: yes"; fi
+printf "\n${GREEN}brpc is now configured. You can build it with 'make'.${NC}\n"

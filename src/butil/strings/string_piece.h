@@ -32,6 +32,9 @@
 
 #include <iosfwd>
 #include <string>
+#if __cplusplus >= 201703L
+#include <string_view>
+#endif // __cplusplus >= 201703L
 
 #include "butil/base_export.h"
 #include "butil/basictypes.h"
@@ -39,6 +42,12 @@
 #include "butil/strings/string16.h"
 
 namespace butil {
+
+// RVV-accelerated byte comparison and search (implemented in string_compare_rvv.cc)
+#if defined(__riscv) && defined(__riscv_vector)
+BUTIL_EXPORT int rvv_memcmp(const void* p1, const void* p2, size_t n);
+BUTIL_EXPORT const void* rvv_memchr(const void* s, int c, size_t n);
+#endif
 
 template <typename STRING_TYPE> class BasicStringPiece;
 typedef BasicStringPiece<std::string> StringPiece;
@@ -155,7 +164,7 @@ BUTIL_EXPORT StringPiece16 substr(const StringPiece16& self,
 
 // Defines the types, methods, operators, and data members common to both
 // StringPiece and StringPiece16. Do not refer to this class directly, but
-// rather to BasicStringPiece, StringPiece, or StringPiece16.
+// rather to StringPiece, or StringPiece16.
 //
 // This is templatized by string class type rather than character type, so
 // BasicStringPiece<std::string> or BasicStringPiece<butil::string16>.
@@ -165,6 +174,7 @@ template <typename STRING_TYPE> class BasicStringPiece {
   typedef size_t size_type;
   typedef typename STRING_TYPE::value_type value_type;
   typedef const value_type* pointer;
+  typedef const value_type* const_pointer;
   typedef const value_type& reference;
   typedef const value_type& const_reference;
   typedef ptrdiff_t difference_type;
@@ -177,17 +187,24 @@ template <typename STRING_TYPE> class BasicStringPiece {
   // We provide non-explicit singleton constructors so users can pass
   // in a "const char*" or a "string" wherever a "StringPiece" is
   // expected (likewise for char16, string16, StringPiece16).
-  BasicStringPiece() : ptr_(NULL), length_(0) {}
+  BasicStringPiece() : ptr_(nullptr), length_(0) {}
   BasicStringPiece(const value_type* str)
       : ptr_(str),
-        length_((str == NULL) ? 0 : STRING_TYPE::traits_type::length(str)) {}
+        length_((str == nullptr) ? 0 : STRING_TYPE::traits_type::length(str)) {}
+#if __cplusplus >= 201703L
+  BasicStringPiece(
+    const std::basic_string_view<value_type, typename STRING_TYPE::traits_type>& str)
+      : ptr_(str.data()), length_(str.size()) {}
+#endif // __cplusplus >= 201703L
   BasicStringPiece(const STRING_TYPE& str)
       : ptr_(str.data()), length_(str.size()) {}
   BasicStringPiece(const value_type* offset, size_type len)
       : ptr_(offset), length_(len) {}
+  BasicStringPiece(const BasicStringPiece& str, size_type pos, size_type len = npos)
+      : ptr_(str.data() + pos), length_(std::min(len, str.length() - pos)) {}
   BasicStringPiece(const typename STRING_TYPE::const_iterator& begin,
                     const typename STRING_TYPE::const_iterator& end)
-      : ptr_((end > begin) ? &(*begin) : NULL),
+      : ptr_((end > begin) ? &(*begin) : nullptr),
         length_((end > begin) ? (size_type)(end - begin) : 0) {}
 
   // data() may return a pointer to a buffer with embedded NULs, and the
@@ -200,8 +217,13 @@ template <typename STRING_TYPE> class BasicStringPiece {
   bool empty() const { return length_ == 0; }
 
   void clear() {
-    ptr_ = NULL;
+    ptr_ = nullptr;
     length_ = 0;
+  }
+  BasicStringPiece& assign(const BasicStringPiece& str, size_type pos, size_type len = npos) {
+    ptr_ = str.data() + pos;
+    length_ = std::min(len, str.length() - pos);
+    return *this;
   }
   void set(const value_type* data, size_type len) {
     ptr_ = data;
@@ -244,7 +266,7 @@ template <typename STRING_TYPE> class BasicStringPiece {
   }
 
   STRING_TYPE as_string() const {
-    // std::string doesn't like to take a NULL pointer even with a 0 size.
+    // std::string doesn't like to take a nullptr pointer even with a 0 size.
     return empty() ? STRING_TYPE() : STRING_TYPE(data(), size());
   }
 
@@ -270,6 +292,11 @@ template <typename STRING_TYPE> class BasicStringPiece {
   static int wordmemcmp(const value_type* p,
                         const value_type* p2,
                         size_type N) {
+#if defined(__riscv) && defined(__riscv_vector)
+    if (sizeof(value_type) == 1 && N >= 16) {
+      return rvv_memcmp(p, p2, N);
+    }
+#endif
     return STRING_TYPE::traits_type::compare(p, p2, N);
   }
 
@@ -362,6 +389,14 @@ template <typename STRING_TYPE> class BasicStringPiece {
     return internal::substr(*this, pos, n);
   }
 
+  // Converts to `std::basic_string`.
+  explicit operator STRING_TYPE() const {
+    if (nullptr == data()) {
+      return {};
+    }
+    return STRING_TYPE(data(), size());
+  }
+
  protected:
   const value_type* ptr_;
   size_type     length_;
@@ -378,7 +413,7 @@ extern template class BUTIL_EXPORT BasicStringPiece<std::string>;
 extern template class BUTIL_EXPORT BasicStringPiece<string16>;
 #endif
 
-// StingPiece operators --------------------------------------------------------
+// StringPiece operators --------------------------------------------------------
 
 BUTIL_EXPORT bool operator==(const StringPiece& x, const StringPiece& y);
 

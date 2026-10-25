@@ -16,14 +16,13 @@ Streaming RPC保证：
 - 全双工。
 - 支持流控。
 - 提供超时提醒
+- 支持自动切割过大的消息，避免[Head-of-line blocking](https://en.wikipedia.org/wiki/Head-of-line_blocking)问题
 
-目前的实现还没有自动切割过大的消息，同一个tcp连接上的多个Stream之间可能有[Head-of-line blocking](https://en.wikipedia.org/wiki/Head-of-line_blocking)问题，请尽量避免过大的单个消息，实现自动切割后我们会告知并更新文档。
-
-例子见[example/streaming_echo_c++](https://github.com/brpc/brpc/tree/master/example/streaming_echo_c++/)。
+例子见[example/streaming_echo_c++](https://github.com/apache/brpc/tree/master/example/streaming_echo_c++/)。
 
 # 建立Stream
 
-目前Stream都由Client端建立。Client先在本地创建一个Stream，再通过一次RPC（必须使用baidu_std协议）与指定的Service建立一个Stream，如果Service在收到请求之后选择接受这个Stream， 那在response返回Client后Stream就会建立成功。过程中的任何错误都把RPC标记为失败，同时也意味着Stream创建失败。用linux下建立连接的过程打比方，Client先创建[socket](http://linux.die.net/man/7/socket)（创建Stream），再调用[connect](http://linux.die.net/man/2/connect)尝试与远端建立连接（通过RPC建立Stream），远端[accept](http://linux.die.net/man/2/accept)后连接就建立了（service接受后创建成功）。
+目前Stream都由Client端建立。Client先在本地创建一个或者多个Stream，再通过一次RPC（必须使用baidu_std协议）与指定的Service建立一个Stream，如果Service在收到请求之后选择接受这批Stream， 那在response返回Client后这批Stream就会建立成功。过程中的任何错误都把RPC标记为失败，同时也意味着Stream创建失败。用linux下建立连接的过程打比方，Client先创建[socket](http://linux.die.net/man/7/socket)（创建Stream），再调用[connect](http://linux.die.net/man/2/connect)尝试与远端建立连接（通过RPC建立Stream），远端[accept](http://linux.die.net/man/2/accept)后连接就建立了（service接受后创建成功）。
 
 > 如果Client尝试向不支持Streaming RPC的老Server建立Stream，将总是失败。
 
@@ -42,27 +41,34 @@ struct StreamOptions
     // default: -1
     long idle_timeout_ms;
      
-    // How many messages at most passed to handler->on_received_messages
-    // default: 1
-    size_t max_messages_size;
+    // Maximum messages in batch passed to handler->on_received_messages
+    // default: 128
+    size_t messages_in_batch;
  
-    // Handle input message, if handler is NULL, the remote side is not allowd to
-    // write any message, who will get EBADF on writting
-    // default: NULL
+    // Handle input message, if handler is nullptr, the remote side is not allowed to
+    // write any message, who will get EBADF on writing
+    // default: nullptr
     StreamInputHandler* handler;
 };
  
 // [Called at the client side]
 // Create a Stream at client-side along with the |cntl|, which will be connected
 // when receiving the response with a Stream from server-side. If |options| is
-// NULL, the Stream will be created with default options
+// nullptr, the Stream will be created with default options
 // Return 0 on success, -1 otherwise
 int StreamCreate(StreamId* request_stream, Controller &cntl, const StreamOptions* options);
+
+// [Called at the client side for creating multiple streams]
+// Create streams at client-side along with the |cntl|, which will be connected
+// when receiving the response with streams from server-side. If |options| is
+// nullptr, the stream will be created with default options
+// Return 0 on success, -1 otherwise
+int StreamCreate(StreamIds& request_streams, int request_stream_size, Controller& cntl, const StreamOptions* options);
 ```
 
 # 接受Stream
 
-如果client在RPC上附带了一个Stream， service在收到RPC后可以通过调用StreamAccept接受。接受后Server端对应产生的Stream存放在response_stream中，Server可通过这个Stream向Client发送数据。
+如果client在RPC上附带了一个或者多个Stream， service在收到RPC后可以通过调用StreamAccept接受。接受后Server端对应产生的Stream存放在response_stream中，Server可通过这个Stream向Client发送数据。
 
 ```c++
 // [Called at the server side]
@@ -70,6 +76,12 @@ int StreamCreate(StreamId* request_stream, Controller &cntl, const StreamOptions
 // (cntl.has_remote_stream() returns false), this method would fail.
 // Return 0 on success, -1 otherwise.
 int StreamAccept(StreamId* response_stream, Controller &cntl, const StreamOptions* options);
+
+// [Called at the server side for accepting multiple streams]
+// Accept the streams. If client didn't create streams with the request
+// (cntl.has_remote_stream() returns false), this method would fail.
+// Return 0 on success, -1 otherwise.
+int StreamAccept(StreamIds& response_stream, Controller& cntl, const StreamOptions* options);
 ```
 
 # 读取Stream
@@ -117,7 +129,7 @@ int StreamWrite(StreamId stream_id, const butil::IOBuf &message);
 // Wait util the pending buffer size is less than |max_buf_size| or error occurs
 // Returns 0 on success, errno otherwise
 // Errno:
-//  - ETIMEDOUT: when |due_time| is not NULL and time expired this
+//  - ETIMEDOUT: when |due_time| is not nullptr and time expired this
 //  - EINVAL: the Stream was close during waiting
 int StreamWait(StreamId stream_id, const timespec* due_time);
  

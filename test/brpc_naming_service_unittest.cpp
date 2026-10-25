@@ -1,12 +1,28 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Date 2014/10/20 13:50:10
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <stdio.h>
 #include <gtest/gtest.h>
 #include <vector>
 #include "butil/string_printf.h"
+#include "butil/strings/string_split.h"
 #include "butil/files/temp_file.h"
 #include "bthread/bthread.h"
+#include "brpc/http_status_code.h"
 #ifdef BAIDU_INTERNAL
 #include "brpc/policy/baidu_naming_service.h"
 #endif
@@ -16,6 +32,8 @@
 #include "brpc/policy/list_naming_service.h"
 #include "brpc/policy/remote_file_naming_service.h"
 #include "brpc/policy/discovery_naming_service.h"
+#include "brpc/policy/nacos_naming_service.h"
+#include "brpc/policy/naming_service_json.h"
 #include "echo.pb.h"
 #include "brpc/server.h"
 
@@ -27,14 +45,42 @@ namespace policy {
 
 DECLARE_bool(consul_enable_degrade_to_file_naming_service);
 DECLARE_string(consul_file_naming_service_dir);
+DECLARE_string(consul_agent_addr);
 DECLARE_string(consul_service_discovery_url);
 DECLARE_string(discovery_api_addr);
 DECLARE_string(discovery_env);
+DECLARE_int32(discovery_renew_interval_s);
+DECLARE_string(nacos_address);
+DECLARE_string(nacos_username);
+DECLARE_string(nacos_password);
 
 } // policy
 } // brpc
 
 namespace {
+
+bool IsIPListEqual(const std::set<butil::ip_t>& s1, const std::set<butil::ip_t>& s2) {
+    if (s1.size() != s2.size()) {
+        return false;
+    }
+    for (auto it1 = s1.begin(), it2 = s2.begin(); it1 != s1.end(); ++it1, ++it2) {
+        if (*it1 != *it2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+class ScopedDiscoveryChannelReset {
+public:
+    ScopedDiscoveryChannelReset() {
+        brpc::policy::ResetDiscoveryChannelForTesting();
+    }
+    ~ScopedDiscoveryChannelReset() {
+        brpc::policy::ResetDiscoveryChannelForTesting();
+    }
+};
+
 TEST(NamingServiceTest, sanity) {
     std::vector<brpc::ServerNode> servers;
 
@@ -43,33 +89,49 @@ TEST(NamingServiceTest, sanity) {
     ASSERT_EQ(0, bns.GetServers("qa-pbrpc.SAT.tjyx", &servers));
 #endif
 
+    auto collect_ips = [&servers]() {
+        std::set<butil::ip_t> ret;
+        for (auto& server : servers) {
+            ret.insert(server.addr.ip);
+        }
+        return ret;
+    };
     brpc::policy::DomainNamingService dns;
-    ASSERT_EQ(0, dns.GetServers("brpc.baidu.com:1234", &servers));
-    ASSERT_EQ(1u, servers.size());
-    ASSERT_EQ(1234, servers[0].addr.port);
-    const butil::ip_t expected_ip = servers[0].addr.ip;
+    ASSERT_EQ(0, dns.GetServers("baidu.com:1234", &servers));
+    size_t server_size = servers.size();
+    ASSERT_GE(server_size, 1);
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(1234, servers[i].addr.port);
+    }
+    const auto expected_ips = collect_ips();
 
-    ASSERT_EQ(0, dns.GetServers("brpc.baidu.com", &servers));
-    ASSERT_EQ(1u, servers.size());
-    ASSERT_EQ(expected_ip, servers[0].addr.ip);
-    ASSERT_EQ(80, servers[0].addr.port);
+    ASSERT_EQ(0, dns.GetServers("baidu.com", &servers));
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(80, servers[i].addr.port);
+    }
 
-    ASSERT_EQ(0, dns.GetServers("brpc.baidu.com:1234/useless1/useless2", &servers));
-    ASSERT_EQ(1u, servers.size());
-    ASSERT_EQ(expected_ip, servers[0].addr.ip);
-    ASSERT_EQ(1234, servers[0].addr.port);
+    ASSERT_EQ(0, dns.GetServers("baidu.com:1234/useless1/useless2", &servers));
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(1234, servers[i].addr.port);
+    }
 
-    ASSERT_EQ(0, dns.GetServers("brpc.baidu.com/useless1/useless2", &servers));
-    ASSERT_EQ(1u, servers.size());
-    ASSERT_EQ(expected_ip, servers[0].addr.ip);
-    ASSERT_EQ(80, servers[0].addr.port);
+    ASSERT_EQ(0, dns.GetServers("baidu.com/useless1/useless2", &servers));
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(80, servers[i].addr.port);
+    }
 
     const char *address_list[] =  {
         "10.127.0.1:1234",
         "10.128.0.1:1234",
         "10.129.0.1:1234",
         "localhost:1234",
-        "brpc.baidu.com:1234"
+        "baidu.com:1234"
     };
     butil::TempFile tmp_file;
     {
@@ -111,9 +173,9 @@ TEST(NamingServiceTest, invalid_port) {
 #endif
 
     brpc::policy::DomainNamingService dns;
-    ASSERT_EQ(-1, dns.GetServers("brpc.baidu.com:", &servers));
-    ASSERT_EQ(-1, dns.GetServers("brpc.baidu.com:123a", &servers));
-    ASSERT_EQ(-1, dns.GetServers("brpc.baidu.com:99999", &servers));
+    ASSERT_EQ(-1, dns.GetServers("baidu.com:", &servers));
+    ASSERT_EQ(-1, dns.GetServers("baidu.com:123a", &servers));
+    ASSERT_EQ(-1, dns.GetServers("baidu.com:99999", &servers));
 }
 
 TEST(NamingServiceTest, wrong_name) {
@@ -131,7 +193,7 @@ TEST(NamingServiceTest, wrong_name) {
         "10.128.0.1:",
         "10.128.0.1",
         "localhost:1234",
-        "brpc.baidu.com:1234",
+        "baidu.com:1234",
         "LOCAL:1234"
     };
     butil::TempFile tmp_file;
@@ -166,9 +228,7 @@ public:
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = (brpc::Controller*)cntl_base;
         cntl->http_response().set_content_type("text/plain");
-        cntl->response_attachment().append(
-            "0.0.0.0:8635 tag1\r\n0.0.0.0:8636 tag2\n"
-            "0.0.0.0:8635 tag3\r\n0.0.0.0:8636\r\n");
+        cntl->response_attachment().append(_list_names);
         list_names_count.fetch_add(1);
     }
     void Touch(google::protobuf::RpcController*,
@@ -179,6 +239,7 @@ public:
         touch_count.fetch_add(1);
     }
 
+    std::string _list_names;
     butil::atomic<int64_t> list_names_count;
     butil::atomic<int64_t> touch_count;
 };
@@ -187,16 +248,18 @@ TEST(NamingServiceTest, remotefile) {
     brpc::Server server1;
     UserNamingServiceImpl svc1;
     ASSERT_EQ(0, server1.AddService(&svc1, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server1.Start("localhost:8635", NULL));
+    ASSERT_EQ(0, server1.Start(0, nullptr));
     brpc::Server server2;
     UserNamingServiceImpl svc2;
     ASSERT_EQ(0, server2.AddService(&svc2, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server2.Start("localhost:8636", NULL));
+    ASSERT_EQ(0, server2.Start(0, nullptr));
 
-    butil::EndPoint n1;
-    ASSERT_EQ(0, butil::str2endpoint("0.0.0.0:8635", &n1));
-    butil::EndPoint n2;
-    ASSERT_EQ(0, butil::str2endpoint("0.0.0.0:8636", &n2));
+    const butil::EndPoint n1 = server1.listen_address();
+    const butil::EndPoint n2 = server2.listen_address();
+    svc1._list_names = butil::string_printf(
+        "%s tag1\r\n%s tag2\n%s tag3\r\n%s\r\n",
+        butil::endpoint2str(n1).c_str(), butil::endpoint2str(n2).c_str(),
+        butil::endpoint2str(n1).c_str(), butil::endpoint2str(n2).c_str());
     std::vector<brpc::ServerNode> expected_servers;
     expected_servers.push_back(brpc::ServerNode(n1, "tag1"));
     expected_servers.push_back(brpc::ServerNode(n2, "tag2"));
@@ -206,19 +269,75 @@ TEST(NamingServiceTest, remotefile) {
 
     std::vector<brpc::ServerNode> servers;
     brpc::policy::RemoteFileNamingService rfns;
-    ASSERT_EQ(0, rfns.GetServers("0.0.0.0:8635/UserNamingService/ListNames", &servers));
+    const std::string rpc_service_name = butil::string_printf(
+        "%s/UserNamingService/ListNames", butil::endpoint2str(n1).c_str());
+    ASSERT_EQ(0, rfns.GetServers(rpc_service_name.c_str(), &servers));
     ASSERT_EQ(expected_servers.size(), servers.size());
     std::sort(servers.begin(), servers.end());
     for (size_t i = 0; i < expected_servers.size(); ++i) {
         ASSERT_EQ(expected_servers[i], servers[i]);
     }
 
-    ASSERT_EQ(0, rfns.GetServers("http://0.0.0.0:8635/UserNamingService/ListNames", &servers));
+    const std::string http_service_name = butil::string_printf(
+        "http://%s/UserNamingService/ListNames",
+        butil::endpoint2str(n1).c_str());
+    ASSERT_EQ(0, rfns.GetServers(http_service_name.c_str(), &servers));
     ASSERT_EQ(expected_servers.size(), servers.size());
     std::sort(servers.begin(), servers.end());
     for (size_t i = 0; i < expected_servers.size(); ++i) {
         ASSERT_EQ(expected_servers[i], servers[i]);
     }
+}
+
+TEST(NamingServiceTest, remotefile_invalid_url) {
+    const char* service_names[] = {
+        "http://", "bns://", "http:////"
+    };
+    for (const char* service_name : service_names) {
+        brpc::policy::RemoteFileNamingService rfns;
+        std::vector<brpc::ServerNode> servers;
+        EXPECT_EQ(-1, rfns.GetServers(service_name, &servers));
+        EXPECT_TRUE(servers.empty());
+    }
+}
+
+// Build a JSON array nested `depth' levels deep, e.g. depth=2 -> "[[]]".
+static std::string MakeDeeplyNestedJson(int depth) {
+    return std::string(depth, '[') + std::string(depth, ']');
+}
+
+TEST(NamingServiceTest, naming_service_json_depth_limit) {
+    BUTIL_RAPIDJSON_NAMESPACE::Document doc;
+    // Well-formed replies are parsed.
+    EXPECT_TRUE(brpc::policy::ParseNamingServiceJson(
+        R"({"hosts":[{"ip":"127.0.0.1","port":8888}]})", &doc));
+    EXPECT_TRUE(doc.IsObject());
+    // Malformed replies are rejected.
+    EXPECT_FALSE(brpc::policy::ParseNamingServiceJson(
+        R"({"hosts":[)" + MakeDeeplyNestedJson(1), &doc));
+    // Brackets and braces inside strings don't count towards the depth.
+    EXPECT_TRUE(brpc::policy::ParseNamingServiceJson(
+        R"({"key":"a\\b\"c[[[{{"})", &doc));
+    // Replies at the depth limit are still accepted ...
+    EXPECT_TRUE(brpc::policy::ParseNamingServiceJson(
+        MakeDeeplyNestedJson(brpc::policy::kMaxNamingServiceJsonDepth), &doc));
+    // ... while deeper ones are rejected before parsing, so that neither the
+    // parser nor the DOM built/visited/destroyed recursively by rapidjson
+    // exhausts the stack.
+    EXPECT_FALSE(brpc::policy::ParseNamingServiceJson(
+        MakeDeeplyNestedJson(brpc::policy::kMaxNamingServiceJsonDepth + 1),
+        &doc));
+    // A deeply nested reply must be rejected without stack overflow.
+    EXPECT_FALSE(brpc::policy::ParseNamingServiceJson(
+        MakeDeeplyNestedJson(140000), &doc));
+    // A raw NUL is invalid JSON and must not let a suffix bypass parsing.
+    std::string with_nul(R"({"hosts":[{}]})");
+    with_nul += '\0';
+    with_nul += MakeDeeplyNestedJson(140000);
+    EXPECT_FALSE(brpc::policy::ParseNamingServiceJson(with_nul, &doc));
+    // Extra closing brackets must not underflow the depth counter.
+    EXPECT_FALSE(brpc::policy::ParseNamingServiceJson(
+        "]]]]]]" + MakeDeeplyNestedJson(1), &doc));
 }
 
 class ConsulNamingServiceImpl : public test::UserNamingService {
@@ -360,9 +479,95 @@ public:
     butil::atomic<int64_t> touch_count;
 };
 
+class ConsulResponseService : public test::UserNamingService {
+public:
+    explicit ConsulResponseService(const std::string& response)
+        : _response(response) {}
+
+    void ListNames(google::protobuf::RpcController* cntl_base,
+                   const test::HttpRequest*,
+                   test::HttpResponse*,
+                   google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        cntl->http_response().SetHeader("X-Consul-Index", "1");
+        cntl->response_attachment().append(_response);
+    }
+
+private:
+    const std::string _response;
+};
+
+TEST(NamingServiceTest, consul_response_object_types) {
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
+    brpc::policy::FLAGS_consul_enable_degrade_to_file_naming_service = false;
+    brpc::policy::FLAGS_consul_service_discovery_url = "/v1/health/service/";
+    const char* invalid_entries[] = {
+        R"(null, true, false, 1, 1.5, "node", [])",
+        R"({"Service":null}, {"Service":true}, {"Service":false},
+            {"Service":1}, {"Service":1.5}, {"Service":"service"},
+            {"Service":[]})"
+    };
+    butil::EndPoint endpoint;
+    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8003", &endpoint));
+    const brpc::ServerNode expected_node(endpoint, "tag");
+
+    for (const char* entries : invalid_entries) {
+        for (bool with_valid_service : {false, true}) {
+            SCOPED_TRACE(entries);
+            SCOPED_TRACE(with_valid_service);
+            std::string response = std::string("[") + entries;
+            if (with_valid_service) {
+                response += R"(,{"Service":{"Address":"127.0.0.1",
+                              "Port":8003,"Tags":["tag"]}})";
+            }
+            response += "]";
+            ConsulResponseService svc(response);
+            brpc::Server server;
+            ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
+                                          "/v1/health/service/test => ListNames"));
+            ASSERT_EQ(0, server.Start(0, nullptr));
+            brpc::policy::FLAGS_consul_agent_addr = butil::string_printf(
+                "http://%s", butil::endpoint2str(server.listen_address()).c_str());
+
+            brpc::policy::ConsulNamingService cns;
+            // GetServers must clear stale results, including on invalid input.
+            std::vector<brpc::ServerNode> servers(1, expected_node);
+            ASSERT_EQ(with_valid_service ? 0 : -1,
+                      cns.GetServers("test", &servers));
+            if (with_valid_service) {
+                ASSERT_EQ(1u, servers.size());
+                EXPECT_EQ(expected_node, servers[0]);
+            } else {
+                EXPECT_TRUE(servers.empty());
+            }
+        }
+    }
+}
+
+TEST(NamingServiceTest, consul_deeply_nested_reply) {
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
+    brpc::policy::FLAGS_consul_enable_degrade_to_file_naming_service = false;
+    brpc::policy::FLAGS_consul_service_discovery_url = "/v1/health/service/";
+    ConsulResponseService svc(MakeDeeplyNestedJson(140000));
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
+                                  "/v1/health/service/test => ListNames"));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    brpc::policy::FLAGS_consul_agent_addr = butil::string_printf(
+        "http://%s", butil::endpoint2str(server.listen_address()).c_str());
+
+    // The deeply nested reply must be rejected instead of crashing on
+    // unbounded recursion.
+    brpc::policy::ConsulNamingService cns;
+    std::vector<brpc::ServerNode> servers;
+    ASSERT_EQ(-1, cns.GetServers("test", &servers));
+    EXPECT_TRUE(servers.empty());
+}
+
 TEST(NamingServiceTest, consul_with_backup_file) {
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
     brpc::policy::FLAGS_consul_enable_degrade_to_file_naming_service = true;
-    const int saved_hc_interval = brpc::FLAGS_health_check_interval;
     brpc::FLAGS_health_check_interval = 1;
     const char *address_list[] =  {
         "10.127.0.1:1234",
@@ -392,15 +597,17 @@ TEST(NamingServiceTest, consul_with_backup_file) {
 
     brpc::Server server;
     ConsulNamingServiceImpl svc;
-    std::string restful_map(brpc::policy::FLAGS_consul_service_discovery_url);
-    restful_map.append("/");
+    std::string restful_map("/v1/health/service/");
     restful_map.append(service_name);
     restful_map.append("   => ListNames");
     ASSERT_EQ(0, server.AddService(&svc,
                                    brpc::SERVER_DOESNT_OWN_SERVICE,
                                    restful_map.c_str()));
-    ASSERT_EQ(0, server.Start("localhost:8500", NULL));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    brpc::policy::FLAGS_consul_agent_addr = butil::string_printf(
+        "http://%s", butil::endpoint2str(server.listen_address()).c_str());
 
+    brpc::policy::ConsulNamingService dynamic_cns;
     bthread_usleep(5000000);
 
     butil::EndPoint n1;
@@ -413,13 +620,12 @@ TEST(NamingServiceTest, consul_with_backup_file) {
     std::sort(expected_servers.begin(), expected_servers.end());
 
     servers.clear();
-    ASSERT_EQ(0, cns.GetServers(service_name, &servers));
+    ASSERT_EQ(0, dynamic_cns.GetServers(service_name, &servers));
     ASSERT_EQ(expected_servers.size(), servers.size());
     std::sort(servers.begin(), servers.end());
     for (size_t i = 0; i < expected_servers.size(); ++i) {
         ASSERT_EQ(expected_servers[i], servers[i]);
     }
-    brpc::FLAGS_health_check_interval = saved_hc_interval;
 }
 
 
@@ -441,11 +647,12 @@ static const std::string s_fetchs_result = R"({
                     "rpc":"",
                     "version":"123",
                     "metadata":{
-
+                        "weight": "10",
+                        "cluster": ""
                     },
                     "addrs":[
                         "http://127.0.0.1:8999",
-                        "gorpc://127.0.1.1:9000"
+                        "grpc://127.0.1.1:9000"
                     ],
                     "status":1,
                     "reg_timestamp":1539001034551496412,
@@ -468,11 +675,12 @@ static const std::string s_fetchs_result = R"({
                         "rpc":"",
                         "version":"123",
                         "metadata":{
-
+                            "weight": "10",
+                            "cluster": ""
                         },
                         "addrs":[
                             "http://127.0.0.1:8999",
-                            "gorpc://127.0.1.1:9000"
+                            "grpc://127.0.1.1:9000"
                         ],
                         "status":1,
                         "reg_timestamp":1539001034551496412,
@@ -489,11 +697,12 @@ static const std::string s_fetchs_result = R"({
     }
 })";
 
-static std::string s_nodes_result = R"({
+static const char s_nodes_result[] = R"({
     "code": 0,
     "message": "0",
     "ttl": 1,
     "data": [
+        42,
         {
             "addr": "127.0.0.1:8635",
             "status": 0,
@@ -510,24 +719,17 @@ static std::string s_nodes_result = R"({
     ]
 })";
 
-TEST(NamingServiceTest, discovery_parse_function) {
-    std::vector<brpc::ServerNode> servers;
-    brpc::policy::DiscoveryNamingService dcns;
-    butil::IOBuf buf;
-    buf.append(s_fetchs_result);
-    ASSERT_EQ(0, dcns.ParseFetchsResult(buf, "admin.test", &servers));
-    ASSERT_EQ((size_t)2, servers.size());
-    buf.clear();
-    buf.append(s_nodes_result);
-    std::string server;
-    ASSERT_EQ(0, dcns.ParseNodesResult(buf, &server));
-    ASSERT_EQ("127.0.0.1:8635", server);
-}
 
 class DiscoveryNamingServiceImpl : public test::DiscoveryNamingService {
 public:
-    DiscoveryNamingServiceImpl () {}
+    DiscoveryNamingServiceImpl()
+        : _renew_count(0)
+        , _cancel_count(0) {}
     virtual ~DiscoveryNamingServiceImpl() {}
+
+    void SetNodesResult(const std::string& nodes_result) {
+        _nodes_result = nodes_result;
+    }
 
     void Nodes(google::protobuf::RpcController* cntl_base,
                const test::HttpRequest*,
@@ -535,7 +737,7 @@ public:
                google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
-        cntl->response_attachment().append(s_nodes_result);
+        cntl->response_attachment().append(_nodes_result);
     }
 
     void Fetchs(google::protobuf::RpcController* cntl_base,
@@ -546,24 +748,358 @@ public:
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
         cntl->response_attachment().append(s_fetchs_result);
     }
+
+    void Register(google::protobuf::RpcController* cntl_base,
+                 const test::HttpRequest*,
+                 test::HttpResponse*,
+                 google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        auto body = cntl->request_attachment().to_string();
+        for (brpc::QuerySplitter sp(body); sp; ++sp) {
+            if (sp.key() == "addrs") {
+                _addrs.insert(sp.value().as_string());
+            }
+        }
+        cntl->response_attachment().append(R"({
+            "code": 0,
+            "message": "0"
+        })");
+        return;
+    }
+
+    void Renew(google::protobuf::RpcController* cntl_base,
+               const test::HttpRequest*,
+               test::HttpResponse*,
+               google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        cntl->response_attachment().append(R"({
+            "code": 0,
+            "message": "0"
+        })");
+        _renew_count++;
+        return;
+    }
+
+    void Cancel(google::protobuf::RpcController* cntl_base,
+                const test::HttpRequest*,
+                test::HttpResponse*,
+                google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        cntl->response_attachment().append(R"({
+            "code": 0,
+            "message": "0"
+        })");
+        _cancel_count++;
+        _addrs.clear();
+        return;
+    }
+
+    int RenewCount() const { return _renew_count; }
+    int CancelCount() const { return _cancel_count; }
+
+    bool HasAddr(const std::string& addr) const {
+        return _addrs.find(addr) != _addrs.end();
+    }
+    int AddrCount() const { return _addrs.size(); }
+
+private:
+    int _renew_count;
+    int _cancel_count;
+
+    std::set<std::string> _addrs;
+    std::string _nodes_result;
 };
 
 TEST(NamingServiceTest, discovery_sanity) {
-    brpc::policy::FLAGS_discovery_api_addr = "http://127.0.0.1:8635/discovery/nodes";
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
+    ScopedDiscoveryChannelReset reset_discovery_channel;
+    brpc::policy::FLAGS_discovery_renew_interval_s = 1;
     brpc::Server server;
     DiscoveryNamingServiceImpl svc;
+    std::string rest_mapping =
+        "/discovery/nodes => Nodes, "
+        "/discovery/fetchs => Fetchs, "
+        "/discovery/register => Register, "
+        "/discovery/renew => Renew, "
+        "/discovery/cancel => Cancel";
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
+                rest_mapping.c_str()));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    brpc::policy::FLAGS_discovery_api_addr = butil::string_printf(
+        "http://%s/discovery/nodes", butil::endpoint2str(
+            server.listen_address()).c_str());
+
+    const std::string server_address =
+        butil::endpoint2str(server.listen_address()).c_str();
+    std::string nodes_result(s_nodes_result);
+    const size_t server_address_pos = nodes_result.find("127.0.0.1:8635");
+    ASSERT_NE(std::string::npos, server_address_pos);
+    nodes_result.replace(server_address_pos, strlen("127.0.0.1:8635"),
+                         server_address);
+    svc.SetNodesResult(nodes_result);
+    brpc::policy::DiscoveryNamingService dcns;
+    std::vector<brpc::ServerNode> servers;
+    ASSERT_EQ(0, dcns.GetServers("admin.test", &servers));
+    ASSERT_EQ((size_t)1, servers.size());
+
+    brpc::policy::DiscoveryRegisterParam dparam;
+    dparam.appid = "main.test";
+    dparam.hostname = "hostname";
+    dparam.addrs = "grpc://10.0.0.1:8000";
+    dparam.env = "dev";
+    dparam.zone = "sh001";
+    dparam.status = 1;
+    dparam.version = "v1";
+    {
+        brpc::policy::DiscoveryClient dc;
+    }
+    // Cancel is called iff Register is called
+    ASSERT_EQ(svc.CancelCount(), 0);
+    {
+        brpc::policy::DiscoveryClient dc;
+        // Two Register should start one Renew task , and make
+        // svc.RenewCount() be one.
+        ASSERT_EQ(0, dc.Register(dparam));
+        ASSERT_EQ(0, dc.Register(dparam));
+        bthread_usleep(100000);
+        ASSERT_TRUE(svc.HasAddr("grpc://10.0.0.1:8000"));
+        ASSERT_FALSE(svc.HasAddr("http://10.0.0.1:8000"));
+    }
+    ASSERT_EQ(svc.RenewCount(), 1);
+    ASSERT_EQ(svc.CancelCount(), 1);
+
+    ASSERT_FALSE(svc.HasAddr("grpc://10.0.0.1:8000"));
+    ASSERT_FALSE(svc.HasAddr("http://10.0.0.1:8000"));
+
+    // addrs splitted by `,'
+    dparam.addrs = ",grpc://10.0.0.1:8000,,http://10.0.0.1:8000,";
+    {
+        brpc::policy::DiscoveryClient dc;
+        ASSERT_EQ(0, dc.Register(dparam));
+        ASSERT_TRUE(svc.HasAddr("grpc://10.0.0.1:8000"));
+        ASSERT_TRUE(svc.HasAddr("http://10.0.0.1:8000"));
+        ASSERT_FALSE(svc.HasAddr(std::string()));
+        ASSERT_EQ(2, svc.AddrCount());
+    }
+}
+
+class DeepReplyDiscoveryServiceImpl : public DiscoveryNamingServiceImpl {
+public:
+    void Fetchs(google::protobuf::RpcController* cntl_base,
+                const test::HttpRequest*,
+                test::HttpResponse*,
+                google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        cntl->response_attachment().append(MakeDeeplyNestedJson(140000));
+    }
+};
+
+TEST(NamingServiceTest, discovery_deeply_nested_reply) {
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
+    ScopedDiscoveryChannelReset reset_discovery_channel;
+    brpc::Server server;
+    DeepReplyDiscoveryServiceImpl svc;
     std::string rest_mapping =
         "/discovery/nodes => Nodes, "
         "/discovery/fetchs => Fetchs";
     ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
                 rest_mapping.c_str()));
-    ASSERT_EQ(0, server.Start("localhost:8635", NULL));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+    brpc::policy::FLAGS_discovery_api_addr = butil::string_printf(
+        "http://%s/discovery/nodes", butil::endpoint2str(
+            server.listen_address()).c_str());
 
+    const std::string server_address =
+        butil::endpoint2str(server.listen_address()).c_str();
+    std::string nodes_result(s_nodes_result);
+    const size_t server_address_pos = nodes_result.find("127.0.0.1:8635");
+    ASSERT_NE(std::string::npos, server_address_pos);
+    nodes_result.replace(server_address_pos, strlen("127.0.0.1:8635"),
+                         server_address);
+    svc.SetNodesResult(nodes_result);
+
+    // The deeply nested reply must be rejected instead of crashing on
+    // unbounded recursion.
     brpc::policy::DiscoveryNamingService dcns;
     std::vector<brpc::ServerNode> servers;
-    ASSERT_EQ(0, dcns.GetServers("admin.test", &servers));
-    ASSERT_EQ((size_t)2, servers.size());
+    ASSERT_EQ(-1, dcns.GetServers("admin.test", &servers));
+    EXPECT_TRUE(servers.empty());
 }
 
+class NacosNamingServiceImpl : public test::NacosNamingService {
+public:
+    void Login(google::protobuf::RpcController* cntl_base,
+               const test::HttpRequest*, test::HttpResponse*,
+               google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+
+        butil::StringPairs user;
+        butil::SplitStringIntoKeyValuePairs(
+            cntl->request_attachment().to_string(), '=', '&', &user);
+
+        const auto expected_user =
+            butil::StringPairs{{"username", "nacos"}, {"password", "nacos"}};
+
+        if (user == expected_user) {
+            cntl->http_response().set_content_type("application/json");
+            cntl->response_attachment().append(
+R"({
+     "accessToken": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJuYWNvcyIsImV4cCI6MTY2MzAwODMzNn0.YKJJwzHT4v9cpC7kVqWroeJK1WioOYe0JZy4KX8nExs",
+     "tokenTtl": 18000,
+     "globalAdmin": true,
+     "username": "nacos"
+   })");
+        } else {
+            cntl->http_response().set_status_code(brpc::HTTP_STATUS_FORBIDDEN);
+            cntl->response_attachment().append("unknow user!");
+        }
+    }
+
+    void List(google::protobuf::RpcController* cntl_base,
+              const test::HttpRequest*, test::HttpResponse*,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = (brpc::Controller*)cntl_base;
+
+        auto token = cntl->http_request().uri().GetQuery("accessToken");
+        if (token == nullptr ||
+            *token !=
+                "eyJhbGciOiJIUzI1NiJ9."
+                "eyJzdWIiOiJuYWNvcyIsImV4cCI6MTY2MzAwODMzNn0."
+                "YKJJwzHT4v9cpC7kVqWroeJK1WioOYe0JZy4KX8nExs") {
+            cntl->http_response().set_status_code(brpc::HTTP_STATUS_FORBIDDEN);
+            cntl->response_attachment().append(
+R"({
+     "timestamp": "2022-09-12T22:56:02.730+08:00",
+     "status": 403,
+     "error": "Forbidden",
+     "path": "/nacos/v1/ns/instance/list"
+   })");
+            return;
+        }
+
+        auto service_name = cntl->http_request().uri().GetQuery("serviceName");
+        auto group_name = cntl->http_request().uri().GetQuery("groupName");
+        auto namespace_id = cntl->http_request().uri().GetQuery("namespaceId");
+        auto clusters = cntl->http_request().uri().GetQuery("clusters");
+        if (service_name == nullptr || *service_name != "test" ||
+            group_name == nullptr || *group_name != "g1" ||
+            namespace_id == nullptr || *namespace_id != "n1" ||
+            clusters == nullptr || *clusters != "wx") {
+            cntl->http_response().set_status_code(brpc::HTTP_STATUS_NOT_FOUND);
+            return;
+        }
+
+        cntl->http_response().set_content_type("application/json");
+        cntl->response_attachment().append(
+R"({
+     "name": "g1@@test",
+     "groupName": "g1",
+     "clusters": "wx",
+     "cacheMillis": 10000,
+     "hosts":
+       [
+         {
+           "instanceId": "127.0.0.1#8888#wx#g1@@test",
+           "ip": "127.0.0.1",
+           "port": 8888,
+           "weight": 10.0,
+           "healthy": true,
+           "enabled": true,
+           "ephemeral": true,
+           "clusterName": "wx",
+           "serviceName": "g1@@test",
+           "metadata": {},
+           "instanceHeartBeatInterval": 5000,
+           "instanceHeartBeatTimeOut": 15000,
+           "ipDeleteTimeout": 30000,
+           "instanceIdGenerator": "simple"
+         }
+       ],
+     "lastRefTime": 1662990336712,
+     "checksum": "",
+     "allIPs": false,
+     "reachProtectionThreshold": false,
+     "valid": true
+   })");
+    }
+};
+
+TEST(NamingServiceTest, nacos) {
+    brpc::Server server;
+    NacosNamingServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
+                                   "/nacos/v1/auth/login => Login, "
+                                   "/nacos/v1/ns/instance/list => List"));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+
+    bthread_usleep(5000000);
+
+    butil::EndPoint ep;
+    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8888", &ep));
+    const auto expected_node = brpc::ServerNode(ep, "10");
+
+    const char* service_name =
+        "serviceName=test&groupName=g1&namespaceId=n1&clusters=wx";
+    brpc::policy::FLAGS_nacos_address = butil::string_printf(
+        "http://%s", butil::endpoint2str(server.listen_address()).c_str());
+    brpc::policy::FLAGS_nacos_username = "nacos";
+    brpc::policy::FLAGS_nacos_password = "nacos";
+
+    {
+        brpc::policy::NacosNamingService nns;
+        std::vector<brpc::ServerNode> nodes;
+        ASSERT_EQ(0, nns.GetServers(service_name, &nodes));
+        ASSERT_EQ(nodes.size(), 1);
+        ASSERT_EQ(expected_node, nodes[0]);
+    }
+    {
+        brpc::policy::FLAGS_nacos_password = "invalid_password";
+        brpc::policy::NacosNamingService nns;
+        std::vector<brpc::ServerNode> nodes;
+        ASSERT_NE(0, nns.GetServers(service_name, &nodes));
+    }
+}
+
+class DeepReplyNacosNamingServiceImpl : public NacosNamingServiceImpl {
+public:
+    void List(google::protobuf::RpcController* cntl_base,
+              const test::HttpRequest*,
+              test::HttpResponse*,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        cntl->response_attachment().append(MakeDeeplyNestedJson(140000));
+    }
+};
+
+TEST(NamingServiceTest, nacos_deeply_nested_reply) {
+    GFLAGS_NAMESPACE::FlagSaver flags_saver;
+    brpc::Server server;
+    DeepReplyNacosNamingServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
+                                   "/nacos/v1/auth/login => Login, "
+                                   "/nacos/v1/ns/instance/list => List"));
+    ASSERT_EQ(0, server.Start(0, nullptr));
+
+    brpc::policy::FLAGS_nacos_address = butil::string_printf(
+        "http://%s", butil::endpoint2str(server.listen_address()).c_str());
+    brpc::policy::FLAGS_nacos_username = "nacos";
+    brpc::policy::FLAGS_nacos_password = "nacos";
+
+    // The deeply nested reply must be rejected instead of crashing on
+    // unbounded recursion.
+    const char* service_name =
+        "serviceName=test&groupName=g1&namespaceId=n1&clusters=wx";
+    brpc::policy::NacosNamingService nns;
+    std::vector<brpc::ServerNode> nodes;
+    ASSERT_EQ(-1, nns.GetServers(service_name, &nodes));
+    EXPECT_TRUE(nodes.empty());
+}
 
 } //namespace

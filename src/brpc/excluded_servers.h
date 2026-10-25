@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_EXCLUDED_SERVERS_H
 #define BRPC_EXCLUDED_SERVERS_H
@@ -40,7 +42,7 @@ public:
     // True if the server shall be excluded.
     bool IsExcluded(SocketId id) const;
     static bool IsExcluded(const ExcludedServers* s, SocketId id) {
-        return s != NULL && s->IsExcluded(id);
+        return s != nullptr && s->IsExcluded(id);
     }
 
     // #servers inside.
@@ -63,8 +65,8 @@ private:
 inline ExcludedServers* ExcludedServers::Create(int cap) {
     void *space = malloc(
         offsetof(ExcludedServers, _space) + sizeof(SocketId) * cap);
-    if (NULL == space) {
-        return NULL;
+    if (nullptr == space) {
+        return nullptr;
     }
     return new (space) ExcludedServers(cap);
 }
@@ -79,7 +81,7 @@ inline void ExcludedServers::Destroy(ExcludedServers* ptr) {
 inline void ExcludedServers::Add(SocketId id) {
     BAIDU_SCOPED_LOCK(_mutex);
     const SocketId* last_id = _l.bottom();
-    if (last_id == NULL || *last_id != id) {
+    if (last_id == nullptr || *last_id != id) {
         _l.elim_push(id);
     }
 }

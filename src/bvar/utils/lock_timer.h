@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
 // Date: 2015/03/06 17:13:17
 
 #ifndef  BVAR_LOCK_TIMER_H
@@ -117,11 +119,11 @@ template <>
 struct MutexConstructor<pthread_mutex_t> {
     bool operator()(pthread_mutex_t* mutex) const { 
 #ifndef NDEBUG
-        const int rc = pthread_mutex_init(mutex, NULL);
+        const int rc = pthread_mutex_init(mutex, nullptr);
         CHECK_EQ(0, rc) << "Fail to init pthread_mutex, " << berror(rc);
         return rc == 0;
 #else
-        return pthread_mutex_init(mutex, NULL) == 0;
+        return pthread_mutex_init(mutex, nullptr) == 0;
 #endif
     }
 };
@@ -156,7 +158,7 @@ public:
         MCtor()(&_mutex);
     }
 
-    MutexWithRecorderBase() : _recorder(NULL) {
+    MutexWithRecorderBase() : _recorder(nullptr) {
         MCtor()(&_mutex);
     }
 
@@ -273,7 +275,7 @@ public:
             *_mutex << _timer.u_elapsed();
         }
         mutex_type* saved_mutex = _mutex;
-        _mutex = NULL;
+        _mutex = nullptr;
         _lock.release();
         return saved_mutex;
     }

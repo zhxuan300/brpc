@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 // A server to receive TrackMeRequest and send back TrackMeResponse.
 
@@ -58,7 +60,7 @@ class TrackMeServiceImpl : public brpc::TrackMeService {
 public:
     explicit TrackMeServiceImpl(BugsLoader* bugs) : _bugs(bugs) {
     }
-    ~TrackMeServiceImpl() {};
+    ~TrackMeServiceImpl() {}
     void TrackMe(google::protobuf::RpcController* cntl_base,
                  const brpc::TrackMeRequest* request,
                  brpc::TrackMeResponse* response,
@@ -86,7 +88,7 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     
     brpc::Server server;
     server.set_version("trackme_server");
@@ -122,7 +124,7 @@ BugsLoader::BugsLoader()
 
 bool BugsLoader::start(const std::string& bugs_file) {
     _bugs_file = bugs_file;
-    if (pthread_create(&_tid, NULL, run_this, this) != 0) {
+    if (pthread_create(&_tid, nullptr, run_this, this) != 0) {
         LOG(ERROR) << "Fail to create loading thread";
         return false;
     }
@@ -135,12 +137,12 @@ void BugsLoader::stop() {
         return;
     }
     _stop = true;
-    pthread_join(_tid, NULL);
+    pthread_join(_tid, nullptr);
 }
 
 void* BugsLoader::run_this(void* arg) {
     ((BugsLoader*)arg)->run();
-    return NULL;
+    return nullptr;
 }
 
 void BugsLoader::run() {
@@ -173,7 +175,7 @@ void BugsLoader::load_bugs() {
         return;
     }
 
-    char* line = NULL;
+    char* line = nullptr;
     size_t line_len = 0;
     ssize_t nr = 0;
     int nline = 0;
@@ -245,7 +247,7 @@ void BugsLoader::load_bugs() {
 bool BugsLoader::find(int64_t revision, brpc::TrackMeResponse* response) {
     // Add reference to make sure the bug list is not deleted.
     std::shared_ptr<BugList> local_list = _bug_list;
-    if (local_list.get() == NULL) {
+    if (local_list.get() == nullptr) {
         return false;
     }
     // Reading the list in this function is always safe because a BugList

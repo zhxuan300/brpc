@@ -1,23 +1,30 @@
-// Copyright (c) 2014 Baidu, Inc.G
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Authors: Lei He (helei@qiyi.com)
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <cmath>
 #include <gflags/gflags.h>
 #include "brpc/errno.pb.h"
 #include "brpc/policy/auto_concurrency_limiter.h"
+
+namespace bthread {
+
+DECLARE_int32(bthread_concurrency);
+
+}  // namespace bthread
 
 namespace brpc {
 namespace policy {
@@ -35,7 +42,7 @@ DEFINE_int32(auto_cl_max_sample_count, 200,
 DEFINE_double(auto_cl_sampling_interval_ms, 0.1, 
              "Interval for sampling request in auto concurrency limiter");
 DEFINE_int32(auto_cl_initial_max_concurrency, 40,
-             "Initial max concurrency for grandient concurrency limiter");
+             "Initial max concurrency for gradient concurrency limiter");
 DEFINE_int32(auto_cl_noload_latency_remeasure_interval_ms, 50000, 
              "Interval for remeasurement of noload_latency. In the period of "
              "remeasurement of noload_latency will halve max_concurrency.");
@@ -70,10 +77,17 @@ DEFINE_int32(auto_cl_latency_fluctuation_correction_factor, 1,
              "the value, the higher the tolerance for the fluctuation of the "
              "latency. If the value is too large, the latency will be higher "
              "when the server is overloaded.");
+DEFINE_double(auto_cl_error_rate_punish_threshold, 0,
+              "Threshold for error-rate-based punishment attenuation. "
+              "Valid range: [0, 1). 0 (default) disables the feature. "
+              "Values >= 1 are ignored and treated as 0. "
+              "e.g. 0.1: error rates below 10%% produce zero punishment; "
+              "above it the punishment scales linearly from 0 to full strength. "
+              "Only effective when auto_cl_enable_error_punish is true.");
 
 AutoConcurrencyLimiter::AutoConcurrencyLimiter()
     : _max_concurrency(FLAGS_auto_cl_initial_max_concurrency)
-    , _remeasure_start_us(NextResetTime(butil::gettimeofday_us()))
+    , _remeasure_start_us(NextResetTime(butil::cpuwide_time_us()))
     , _reset_latency_us(0)
     , _min_latency_us(-1)
     , _ema_max_qps(-1)
@@ -83,10 +97,10 @@ AutoConcurrencyLimiter::AutoConcurrencyLimiter()
 }
 
 AutoConcurrencyLimiter* AutoConcurrencyLimiter::New(const AdaptiveMaxConcurrency&) const {
-    return new (std::nothrow) AutoConcurrencyLimiter;
+    return new AutoConcurrencyLimiter;
 }
 
-bool AutoConcurrencyLimiter::OnRequested(int current_concurrency) {
+bool AutoConcurrencyLimiter::OnRequested(int current_concurrency, Controller*) {
     return current_concurrency <= _max_concurrency;
 }
 
@@ -97,7 +111,7 @@ void AutoConcurrencyLimiter::OnResponded(int error_code, int64_t latency_us) {
         return;
     }
 
-    const int64_t now_time_us = butil::gettimeofday_us();
+    const int64_t now_time_us = butil::cpuwide_time_us();
     int64_t last_sampling_time_us = 
         _last_sampling_time_us.load(butil::memory_order_relaxed);
 
@@ -125,6 +139,10 @@ void AutoConcurrencyLimiter::OnResponded(int error_code, int64_t latency_us) {
 
 int AutoConcurrencyLimiter::MaxConcurrency() {
     return _max_concurrency;
+}
+
+int AutoConcurrencyLimiter::ResetMaxConcurrency(const AdaptiveMaxConcurrency&) {
+    return -1;
 }
 
 int64_t AutoConcurrencyLimiter::NextResetTime(int64_t sampling_time_us) {
@@ -182,7 +200,7 @@ bool AutoConcurrencyLimiter::AddSample(int error_code,
         UpdateMaxConcurrency(sampling_time_us);
     } else {
         // All request failed
-        _max_concurrency /= 2;
+        AdjustMaxConcurrency(_max_concurrency / 2);
     }
     ResetSampleWindow(sampling_time_us);
     return true;
@@ -215,10 +233,39 @@ void AutoConcurrencyLimiter::UpdateQps(double qps) {
     }
 }
 
+void AutoConcurrencyLimiter::AdjustMaxConcurrency(int next_max_concurrency) {
+    next_max_concurrency = std::max(bthread::FLAGS_bthread_concurrency, next_max_concurrency);
+    if (next_max_concurrency != _max_concurrency) {
+        _max_concurrency = next_max_concurrency;
+    }
+}
+
 void AutoConcurrencyLimiter::UpdateMaxConcurrency(int64_t sampling_time_us) {
     int32_t total_succ_req = _total_succ_req.load(butil::memory_order_relaxed);
     double failed_punish = _sw.total_failed_us * FLAGS_auto_cl_fail_punish_ratio;
-    int64_t avg_latency = 
+
+    // Threshold-based attenuation: when 0 < threshold < 1, attenuate punishment
+    // based on error rate. Inspired by Sentinel's threshold-based circuit breaker:
+    // low error rates should not inflate avg_latency. Above threshold, punishment
+    // scales linearly from 0 to full strength.
+    // Invalid values (<=0 or >=1) skip this block entirely, preserving original behavior.
+    if (FLAGS_auto_cl_error_rate_punish_threshold > 0 &&
+        FLAGS_auto_cl_error_rate_punish_threshold < 1.0 &&
+        _sw.failed_count > 0) {
+        double threshold = FLAGS_auto_cl_error_rate_punish_threshold;
+        double error_rate = static_cast<double>(_sw.failed_count) /
+            (_sw.succ_count + _sw.failed_count);
+        if (error_rate <= threshold) {
+            // Error rate within dead zone, cancel punishment.
+            failed_punish = 0;
+        } else {
+            // Linear ramp: 0 at threshold, 1.0 at 100% error rate.
+            double punish_factor = (error_rate - threshold) / (1.0 - threshold);
+            failed_punish *= punish_factor;
+        }
+    }
+
+    int64_t avg_latency =
         std::ceil((failed_punish + _sw.total_succ_us) / _sw.succ_count);
     double qps = 1000000.0 * total_succ_req / (sampling_time_us - _sw.start_time_us);
     UpdateMinLatency(avg_latency);
@@ -246,9 +293,7 @@ void AutoConcurrencyLimiter::UpdateMaxConcurrency(int64_t sampling_time_us) {
             _min_latency_us * _ema_max_qps / 1000000 *  (1 + _explore_ratio);
     }
 
-    if (next_max_concurrency != _max_concurrency) {
-        _max_concurrency = next_max_concurrency;
-    }
+    AdjustMaxConcurrency(next_max_concurrency);
 }
 
 }  // namespace policy

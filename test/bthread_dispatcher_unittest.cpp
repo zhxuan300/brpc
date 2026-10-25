@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Ge,Jun (gejun@baidu.com)
-// Date: Sun Jul 13 15:04:18 CST 2014
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <sys/uio.h>               // writev
 #include "butil/compat.h"
@@ -12,7 +25,7 @@
 #include "butil/scoped_lock.h"
 #include "butil/fd_utility.h"
 #include "butil/logging.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "bthread/bthread.h"
 #include "bthread/task_control.h"
 #include "bthread/task_group.h"
@@ -73,11 +86,11 @@ void* process_thread(void* arg) {
                     continue;
                 } else {
                     PLOG(FATAL) << "Fail to read fd=" << m->fd;
-                    return NULL;
+                    return nullptr;
                 }
             } else {
                 LOG(FATAL) << "Another end closed fd=" << m->fd;
-                return NULL;
+                return nullptr;
             }
         } while (1);
         
@@ -90,7 +103,7 @@ void* process_thread(void* arg) {
             break;
         }
     } while (1);
-    return NULL;
+    return nullptr;
 }
 
 void* epoll_thread(void* arg) {    
@@ -105,9 +118,18 @@ void* epoll_thread(void* arg) {
 
     while (!server_stop) {
 #if defined(OS_LINUX)
-        const int n = epoll_wait(em->epfd, e, ARRAY_SIZE(e), -1);
+        // Use a finite timeout so the loop can observe server_stop without
+        // relying on an external fd to wake up epoll_wait.
+        const int n = epoll_wait(em->epfd, e, ARRAY_SIZE(e), 100);
+        if (n == 0) {
+            continue;
+        }
 #elif defined(OS_MACOSX)
-        const int n = kevent(em->epfd, NULL, 0, e, ARRAY_SIZE(e), NULL);
+        timespec ts = { 0, 100L * 1000L * 1000L };
+        const int n = kevent(em->epfd, nullptr, 0, e, ARRAY_SIZE(e), &ts);
+        if (n == 0) {
+            continue;
+        }
 #endif
         if (server_stop) {
             break;
@@ -140,7 +162,7 @@ void* epoll_thread(void* arg) {
             }
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void* client_thread(void* arg) {
@@ -168,7 +190,7 @@ void* client_thread(void* arg) {
         if (n < 0) {
             if (errno != EINTR) {
                 PLOG(FATAL) << "Fail to write fd=" << m->fd;
-                return NULL;
+                return nullptr;
             }
         } else {
             ++m->times;
@@ -179,7 +201,8 @@ void* client_thread(void* arg) {
             }
         }
     }
-    return NULL;
+    free(buf);
+    return nullptr;
 }
 
 inline uint32_t fmix32 ( uint32_t h ) {
@@ -234,16 +257,16 @@ TEST(DispatcherTest, dispatch_tasks) {
 #elif defined(OS_MACOSX)
         struct kevent kqueue_event;
         EV_SET(&kqueue_event, m->fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, m);
-        ASSERT_EQ(0, kevent(m->epfd, &kqueue_event, 1, NULL, 0, NULL));
+        ASSERT_EQ(0, kevent(m->epfd, &kqueue_event, 1, nullptr, 0, nullptr));
 #endif
 
         cm[i] = new ClientMeta;
         cm[i]->fd = fds[i * 2 + 1];
         cm[i]->times = 0;
         cm[i]->bytes = 0;
-        ASSERT_EQ(0, pthread_create(&cth[i], NULL, client_thread, cm[i]));
+        ASSERT_EQ(0, pthread_create(&cth[i], nullptr, client_thread, cm[i]));
     }
-    
+
     ProfilerStart("dispatcher.prof");
     butil::Timer tm;
     tm.start();
@@ -253,9 +276,9 @@ TEST(DispatcherTest, dispatch_tasks) {
         em[i] = m;
         m->epfd = epfd[i];
 #ifdef RUN_EPOLL_IN_BTHREAD
-        ASSERT_EQ(0, bthread_start_background(&eth[i], NULL, epoll_thread, m));
+        ASSERT_EQ(0, bthread_start_background(&eth[i], nullptr, epoll_thread, m));
 #else
-        ASSERT_EQ(0, pthread_create(&eth[i], NULL, epoll_thread, m));
+        ASSERT_EQ(0, pthread_create(&eth[i], nullptr, epoll_thread, m));
 #endif
     }
 
@@ -281,25 +304,32 @@ TEST(DispatcherTest, dispatch_tasks) {
 
     client_stop = true;
     for (size_t i = 0; i < NCLIENT; ++i) {
-        pthread_join(cth[i], NULL);
+        pthread_join(cth[i], nullptr);
     }
     server_stop = true;
+    // epoll_thread polls server_stop with a finite timeout, so it exits on its
+    // own without needing an external fd to wake up epoll_wait.
     for (size_t i = 0; i < NEPOLL; ++i) {
-#if defined(OS_LINUX)
-        epoll_event evt = { EPOLLOUT,  { NULL } };
-        ASSERT_EQ(0, epoll_ctl(epfd[i], EPOLL_CTL_ADD, 0, &evt));
-#elif defined(OS_MACOSX)
-        struct kevent kqueue_event;
-        EV_SET(&kqueue_event, 0, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
-        ASSERT_EQ(0, kevent(epfd[i], &kqueue_event, 1, NULL, 0, NULL));
-#endif
 #ifdef RUN_EPOLL_IN_BTHREAD
-        bthread_join(eth[i], NULL);
+        bthread_join(eth[i], nullptr);
 #else
-        pthread_join(eth[i], NULL);
+        pthread_join(eth[i], nullptr);
 #endif
     }
     bthread::stop_and_join_epoll_threads();
     bthread_usleep(100000);
+
+    for (size_t i = 0; i < NCLIENT; ++i) {
+        free(sm[i]->buf);
+        delete sm[i];
+        delete cm[i];
+    }
+    for (size_t i = 0; i < NEPOLL; ++i) {
+        delete em[i];
+        close(epfd[i]);
+    }
+    for (size_t i = 0; i < 2 * NCLIENT; ++i) {
+        close(fds[i]);
+    }
 }
 } // namespace

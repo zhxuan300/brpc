@@ -1,21 +1,27 @@
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2012-10-08 23:53:50
 
 #include "butil/logging.h"
+
+#include <gflags/gflags.h>
+DEFINE_bool(log_as_json, false, "Print log as a valid JSON");
+DEFINE_bool(escape_log, false, "Escape log content before printing");
 
 #if !BRPC_WITH_GLOG
 
@@ -63,12 +69,16 @@ typedef pthread_mutex_t* MutexHandle;
 #include "butil/debug/alias.h"
 #include "butil/debug/debugger.h"
 #include "butil/debug/stack_trace.h"
+#include "butil/debug/leak_annotations.h"
 #include "butil/posix/eintr_wrapper.h"
 #include "butil/strings/string_util.h"
 #include "butil/strings/stringprintf.h"
 #include "butil/strings/utf_string_conversions.h"
-#include "butil/synchronization/lock.h"
+#include "butil/synchronization/condition_variable.h"
 #include "butil/threading/platform_thread.h"
+#include "butil/threading/simple_thread.h"
+#include "butil/object_pool.h"
+
 #if defined(OS_POSIX)
 #include "butil/errno.h"
 #include "butil/fd_guard.h"
@@ -85,7 +95,6 @@ typedef pthread_mutex_t* MutexHandle;
 #include <vector>
 #include <deque>
 #include <limits>
-#include <gflags/gflags.h>
 #include "butil/atomicops.h"
 #include "butil/thread_local.h"
 #include "butil/scoped_lock.h"                        // BAIDU_SCOPED_LOCK
@@ -94,6 +103,7 @@ typedef pthread_mutex_t* MutexHandle;
 #include "butil/containers/doubly_buffered_data.h"
 #include "butil/memory/singleton.h"
 #include "butil/endpoint.h"
+#include "butil/reloadable_flags.h"
 #ifdef BAIDU_INTERNAL
 #include "butil/comlog_sink.h"
 #endif
@@ -114,8 +124,11 @@ namespace logging {
 
 DEFINE_bool(crash_on_fatal_log, false,
             "Crash process when a FATAL log is printed");
+BUTIL_VALIDATE_GFLAG(crash_on_fatal_log, butil::PassValidate);
+
 DEFINE_bool(print_stack_on_check, true,
             "Print the stack trace when a CHECK was failed");
+BUTIL_VALIDATE_GFLAG(print_stack_on_check, butil::PassValidate);
 
 DEFINE_int32(v, 0, "Show all VLOG(m) messages for m <= this."
              " Overridable by --vmodule.");
@@ -125,17 +138,36 @@ DEFINE_string(vmodule, "", "per-module verbose level."
               " (that is, name ignoring .cpp/.h)."
               " LOG_LEVEL overrides any value given by --v.");
 
-DEFINE_bool(log_process_id, false, "Log process id");
+DEFINE_bool(log_pid, false, "Log process id");
+
+DEFINE_bool(log_bid, true, "Log bthread id");
 
 DEFINE_int32(minloglevel, 0, "Any log at or above this level will be "
              "displayed. Anything below this level will be silently ignored. "
              "0=INFO 1=NOTICE 2=WARNING 3=ERROR 4=FATAL");
+BUTIL_VALIDATE_GFLAG(minloglevel, butil::NonNegativeInteger);
 
 DEFINE_bool(log_hostname, false, "Add host after pid in each log so"
             " that we know where logs came from when using aggregation tools"
             " like ELK.");
 
 DEFINE_bool(log_year, false, "Log year in datetime part in each log");
+
+DEFINE_bool(log_func_name, false, "[DEPRECATED]Log function name in each log. "
+                                  "Now DefaultLogSink logs function names by default. "
+                                  "Customized LogSink can also log function names through "
+                                  "corresponding OnLogMessage.");
+
+DEFINE_bool(async_log, false, "Use async log");
+
+DEFINE_bool(async_log_in_background_always, false, "Async log written in background always.");
+
+DEFINE_int32(max_async_log_queue_size, 100000, "Max async log size. "
+             "If current log count of async log > max_async_log_size, "
+             "Use sync log to protect process.");
+
+DEFINE_int32(sleep_to_flush_async_log_s, 0,
+             "If the value > 0, sleep before atexit to flush async log");
 
 namespace {
 
@@ -152,17 +184,20 @@ typedef std::wstring PathString;
 #else
 typedef std::string PathString;
 #endif
-PathString* log_file_name = NULL;
+PathString* log_file_name = nullptr;
 
-// this file is lazily opened and the handle may be NULL
-FileHandle log_file = NULL;
+// this file is lazily opened and the handle may be nullptr
+FileHandle log_file = nullptr;
 
 // Should we pop up fatal debug messages in a dialog?
 bool show_error_dialogs = false;
 
 // An assert handler override specified by the client to be called instead of
 // the debug message dialog and process termination.
-LogAssertHandler log_assert_handler = NULL;
+LogAssertHandler log_assert_handler = nullptr;
+
+BAIDU_VOLATILE_THREAD_LOCAL(int32_t, tls_log_pid, 0);
+BAIDU_VOLATILE_THREAD_LOCAL(butil::PlatformThreadId, tls_log_tid, 0);
 
 // Helper functions to wrap platform differences.
 
@@ -206,7 +241,7 @@ PathString GetDefaultLogFile() {
 #if defined(OS_WIN)
     // On Windows we use the same path as the exe.
     wchar_t module_name[MAX_PATH];
-    GetModuleFileName(NULL, module_name, MAX_PATH);
+    GetModuleFileName(nullptr, module_name, MAX_PATH);
 
     PathString log_file = module_name;
     PathString::size_type last_backslash =
@@ -239,7 +274,7 @@ public:
         UnlockLogging();
     }
 
-    static void Init(LogLockingState lock_log, const PathChar* new_log_file) {
+    static void Init(LogLockingState lock_log, const LogChar* new_log_file) {
         if (initialized)
             return;
         lock_log_file = lock_log;
@@ -255,9 +290,9 @@ public:
                 std::replace(safe_name.begin(), safe_name.end(), '\\', '/');
                 std::wstring t(L"Global\\");
                 t.append(safe_name);
-                log_mutex = ::CreateMutex(NULL, FALSE, t.c_str());
+                log_mutex = ::CreateMutex(nullptr, FALSE, t.c_str());
 
-                if (log_mutex == NULL) {
+                if (log_mutex == nullptr) {
 #if DEBUG
                     // Keep the error code for debugging
                     int error = GetLastError();  // NOLINT
@@ -324,20 +359,20 @@ private:
 // static
 bool LoggingLock::initialized = false;
 // static
-butil::Mutex* LoggingLock::log_lock = NULL;
+butil::Mutex* LoggingLock::log_lock = nullptr;
 // static
 LogLockingState LoggingLock::lock_log_file = LOCK_LOG_FILE;
 
 #if defined(OS_WIN)
 // static
-MutexHandle LoggingLock::log_mutex = NULL;
+MutexHandle LoggingLock::log_mutex = nullptr;
 #elif defined(OS_POSIX)
 pthread_mutex_t LoggingLock::log_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 // Called by logging functions to ensure that debug_file is initialized
 // and can be used for writing. Returns false if the file could not be
-// initialized. debug_file will be NULL in this case.
+// initialized. debug_file will be nullptr in this case.
 bool InitializeLogFileHandle() {
     if (log_file)
         return true;
@@ -351,23 +386,23 @@ bool InitializeLogFileHandle() {
     if ((logging_destination & LOG_TO_FILE) != 0) {
 #if defined(OS_WIN)
         log_file = CreateFile(log_file_name->c_str(), GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (log_file == INVALID_HANDLE_VALUE || log_file == NULL) {
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (log_file == INVALID_HANDLE_VALUE || log_file == nullptr) {
             // try the current directory
             log_file = CreateFile(L".\\debug.log", GENERIC_WRITE,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (log_file == INVALID_HANDLE_VALUE || log_file == NULL) {
-                log_file = NULL;
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (log_file == INVALID_HANDLE_VALUE || log_file == nullptr) {
+                log_file = nullptr;
                 return false;
             }
         }
         SetFilePointer(log_file, 0, 0, FILE_END);
 #elif defined(OS_POSIX)
         log_file = fopen(log_file_name->c_str(), "a");
-        if (log_file == NULL) {
-            fprintf(stderr, "Fail to fopen %s", log_file_name->c_str());
+        if (log_file == nullptr) {
+            fprintf(stderr, "Fail to fopen %s: %s", log_file_name->c_str(), berror());
             return false;
         }
 #endif
@@ -389,14 +424,363 @@ void CloseLogFileUnlocked() {
         return;
 
     CloseFile(log_file);
-    log_file = NULL;
+    log_file = nullptr;
+}
+
+void Log2File(const std::string& log) {
+    // We can have multiple threads and/or processes, so try to prevent them
+    // from clobbering each other's writes.
+    // If the client app did not call InitLogging, and the lock has not
+    // been created do it now. We do this on demand, but if two threads try
+    // to do this at the same time, there will be a race condition to create
+    // the lock. This is why InitLogging should be called from the main
+    // thread at the beginning of execution.
+    LoggingLock::Init(LOCK_LOG_FILE, nullptr);
+    LoggingLock logging_lock;
+    if (InitializeLogFileHandle()) {
+#if defined(OS_WIN)
+        SetFilePointer(log_file, 0, 0, SEEK_END);
+        DWORD num_written;
+        WriteFile(log_file, static_cast<const void*>(log.data()),
+                  static_cast<DWORD>(log.size()), &num_written, nullptr);
+#else
+        fwrite(log.data(), log.size(), 1, log_file);
+        fflush(log_file);
+#endif
+    }
 }
 
 }  // namespace
 
+#if defined(OS_LINUX) || defined(OS_MACOSX)
+typedef timeval TimeVal;
+#else
+struct TimeVal {
+    time_t tv_sec;
+};
+#endif
+
+TimeVal GetTimestamp() {
+#if defined(OS_LINUX) || defined(OS_MACOSX)
+    timeval tv;
+    gettimeofday(&tv, nullptr);
+    return tv;
+#else
+    return { time(nullptr) };
+#endif
+}
+
+struct BAIDU_CACHELINE_ALIGNMENT LogInfo {
+    ~LogInfo() = default;
+    void clear() {
+        file.clear();
+        func.clear();
+        content.clear();
+    }
+
+    std::string file;
+    std::string func;
+    std::string content;
+    TimeVal timestamp{};
+    int severity{0};
+    int line{0};
+    // If `raw' is false, content has been a complete log.
+    // If raw is true, a complete log consists of all properties of LogInfo.
+    bool raw{false};
+};
+
+struct BAIDU_CACHELINE_ALIGNMENT LogRequest {
+    static LogRequest* const UNCONNECTED;
+
+    LogRequest* next{nullptr};
+    LogInfo log_info;
+};
+
+LogRequest* const LogRequest::UNCONNECTED = (LogRequest*)(intptr_t)-1;
+
+class AsyncLogger : public butil::SimpleThread {
+public:
+    static AsyncLogger* GetInstance();
+
+    void Log(const LogInfo& log_info);
+    void Log(LogInfo&& log_info);
+    void StopAndJoin();
+
+private:
+friend struct DefaultSingletonTraits<AsyncLogger>;
+
+    static LogRequest _stop_req;
+
+    AsyncLogger();
+    ~AsyncLogger() override;
+
+    static void AtExit() {
+        GetInstance()->StopAndJoin();
+        if (FLAGS_sleep_to_flush_async_log_s > 0) {
+            ::sleep(FLAGS_sleep_to_flush_async_log_s);
+        }
+    }
+
+    void LogImpl(LogRequest* log_req);
+
+    void Run() override;
+
+    void LogTask(LogRequest* req);
+
+    bool IsLogComplete(LogRequest* old_head);
+
+    void DoLog(LogRequest* req);
+    void DoLog(const LogInfo& log_info);
+
+    butil::atomic<LogRequest*> _log_head;
+    butil::Mutex _mutex;
+    butil::ConditionVariable _cond;
+    LogRequest* _current_log_request;
+    butil::atomic<int32_t> _log_request_count;
+    butil::atomic<bool> _stop;
+};
+
+AsyncLogger* AsyncLogger::GetInstance() {
+    return Singleton<AsyncLogger,
+                     LeakySingletonTraits<AsyncLogger>>::get();
+}
+
+AsyncLogger::AsyncLogger()
+    : butil::SimpleThread("async_log_thread")
+    , _log_head(nullptr)
+    , _cond(&_mutex)
+    , _current_log_request(nullptr)
+    , _stop(false) {
+    Start();
+    // We need to stop async logger and
+    // flush all async log before exit.
+    atexit(AtExit);
+}
+
+AsyncLogger::~AsyncLogger() {
+    StopAndJoin();
+}
+
+std::string LogInfoToLogStr(int severity, butil::StringPiece file,
+                            int line, butil::StringPiece func,
+                            butil::StringPiece content) {
+    // There's a copy here to concatenate prefix and content. Since
+    // DefaultLogSink is hardly used right now, the copy is irrelevant.
+    // A LogSink focused on performance should also be able to handle
+    // non-continuous inputs which is a must to maximize performance.
+    std::ostringstream os;
+    PrintLog(os, severity, file.data(), line, func.data(), content);
+    os << '\n';
+    return os.str();
+}
+
+std::string LogInfo2LogStr(const LogInfo& log_info) {
+    return LogInfoToLogStr(log_info.severity, log_info.file, log_info.line,
+                           log_info.func, log_info.content);
+}
+
+void AsyncLogger::Log(const LogInfo& log_info) {
+    if (log_info.content.empty()) {
+        return;
+    }
+
+    bool is_full = FLAGS_max_async_log_queue_size > 0 &&
+        _log_request_count.fetch_add(1, butil::memory_order_relaxed) >
+        FLAGS_max_async_log_queue_size;
+    if (is_full || _stop.load(butil::memory_order_relaxed)) {
+        // Async logger is full or stopped, fallback to sync log.
+        DoLog(log_info);
+        return;
+    }
+
+    auto log_req = butil::get_object<LogRequest>();
+    if (!log_req) {
+        // Async log failed, fallback to sync log.
+        DoLog(log_info);
+        return;
+    }
+    log_req->log_info = log_info;
+    LogImpl(log_req);
+}
+
+void AsyncLogger::Log(LogInfo&& log_info) {
+    if (log_info.content.empty()) {
+        return;
+    }
+
+    bool is_full = FLAGS_max_async_log_queue_size > 0 &&
+        _log_request_count.fetch_add(1, butil::memory_order_relaxed) >
+        FLAGS_max_async_log_queue_size;
+    if (is_full || _stop.load(butil::memory_order_relaxed)) {
+        // Async logger is full or stopped, fallback to sync log.
+        DoLog(log_info);
+        return;
+    }
+
+    auto log_req = butil::get_object<LogRequest>();
+    if (!log_req) {
+        // Async log failed, fallback to sync log.
+        DoLog(log_info);
+        return;
+    }
+    ANNOTATE_SCOPED_MEMORY_LEAK;
+    log_req->log_info = std::move(log_info);
+    LogImpl(log_req);
+}
+
+void AsyncLogger::LogImpl(LogRequest* log_req) {
+    log_req->next = LogRequest::UNCONNECTED;
+    // Release fence makes sure the thread getting request sees *req
+    LogRequest* const prev_head =
+        _log_head.exchange(log_req, butil::memory_order_release);
+    if (prev_head != nullptr) {
+        // Someone is logging. The async_log_thread thread may spin
+        // until req->next to be non-UNCONNECTED. This process is not
+        // lock-free, but the duration is so short(1~2 instructions,
+        // depending on compiler) that the spin rarely occurs in practice
+        // (I've not seen any spin in highly contended tests).
+        log_req->next = prev_head;
+        return;
+    }
+    // We've got the right to write.
+    log_req->next = nullptr;
+
+    if (!FLAGS_async_log_in_background_always) {
+        // Use sync log for the LogRequest
+        // which has got the right to write.
+        DoLog(log_req);
+        // Return when there's no more LogRequests.
+        if (IsLogComplete(log_req)) {
+            butil::return_object(log_req);
+            return;
+        }
+    }
+
+    BAIDU_SCOPED_LOCK(_mutex);
+    if (_stop.load(butil::memory_order_relaxed)) {
+        // Async logger is stopped, fallback to sync log.
+        LogTask(log_req);
+    } else {
+        // Wake up async logger.
+        _current_log_request = log_req;
+        _cond.Signal();
+    }
+}
+
+void AsyncLogger::StopAndJoin() {
+    if (!_stop.exchange(true, butil::memory_order_relaxed)) {
+        BAIDU_SCOPED_LOCK(_mutex);
+        _cond.Signal();
+    }
+    if (!HasBeenJoined()) {
+        Join();
+    }
+}
+
+void AsyncLogger::Run() {
+    while (true) {
+        BAIDU_SCOPED_LOCK(_mutex);
+        while (!_stop.load(butil::memory_order_relaxed) &&
+               !_current_log_request) {
+            _cond.Wait();
+        }
+        if (_stop.load(butil::memory_order_relaxed) &&
+            !_current_log_request) {
+            break;
+        }
+
+        LogTask(_current_log_request);
+        _current_log_request = nullptr;
+    }
+}
+
+void AsyncLogger::LogTask(LogRequest* req) {
+    do {
+        // req was logged, skip it.
+        if (req->next != nullptr && req->log_info.content.empty()) {
+            LogRequest* const saved_req = req;
+            req = req->next;
+            butil::return_object(saved_req);
+        }
+
+        // Log all requests to file.
+        while (req->next != nullptr) {
+            LogRequest* const saved_req = req;
+            req = req->next;
+            if (!saved_req->log_info.content.empty()) {
+                DoLog(saved_req);
+            }
+            // Release LogRequests until last request.
+            butil::return_object(saved_req);
+        }
+        if (!req->log_info.content.empty()) {
+            DoLog(req);
+        }
+
+        // Return when there's no more LogRequests.
+        if (IsLogComplete(req)) {
+            butil::return_object(req);
+            return;
+        }
+    } while (true);
+}
+
+bool AsyncLogger::IsLogComplete(LogRequest* old_head) {
+    if (old_head->next) {
+        fprintf(stderr, "old_head->next should be NULL\n");
+    }
+    LogRequest* new_head = old_head;
+    LogRequest* desired = nullptr;
+    if (_log_head.compare_exchange_strong(
+        new_head, desired, butil::memory_order_acquire)) {
+        // No one added new requests.
+        return true;
+    }
+    if (new_head == old_head) {
+        fprintf(stderr, "new_head should not be equal to old_head\n");
+    }
+    // Above acquire fence pairs release fence of exchange in Log() to make
+    // sure that we see all fields of requests set.
+
+    // Someone added new requests.
+    // Reverse the list until old_head.
+    LogRequest* tail = nullptr;
+    LogRequest* p = new_head;
+    do {
+        while (p->next == LogRequest::UNCONNECTED) {
+            sched_yield();
+        }
+        LogRequest* const saved_next = p->next;
+        p->next = tail;
+        tail = p;
+        p = saved_next;
+        if (!p) {
+            fprintf(stderr, "p should not be NULL\n");
+        }
+    } while (p != old_head);
+
+    // Link old list with new list.
+    old_head->next = tail;
+    return false;
+}
+
+void AsyncLogger::DoLog(LogRequest* req) {
+    DoLog(req->log_info);
+    req->log_info.clear();
+}
+
+void AsyncLogger::DoLog(const LogInfo& log_info) {
+    if (log_info.raw) {
+        Log2File(LogInfo2LogStr(log_info));
+    } else {
+        Log2File(log_info.content);
+    }
+    _log_request_count.fetch_sub(1, butil::memory_order_relaxed);
+}
+
 LoggingSettings::LoggingSettings()
     : logging_dest(LOG_DEFAULT),
-      log_file(NULL),
+      log_file(nullptr),
       lock_log(LOCK_LOG_FILE),
       delete_old(APPEND_TO_OLD_LOG_FILE) {}
 
@@ -451,7 +835,7 @@ void SetLogAssertHandler(LogAssertHandler handler) {
 const char* const log_severity_names[LOG_NUM_SEVERITIES] = {
     "INFO", "NOTICE", "WARNING", "ERROR", "FATAL" };
 
-inline void log_severity_name(std::ostream& os, int severity) {
+static void PrintLogSeverity(std::ostream& os, int severity) {
     if (severity < 0) {
         // Add extra space to separate from following datetime.
         os << 'V' << -severity << ' ';
@@ -462,17 +846,12 @@ inline void log_severity_name(std::ostream& os, int severity) {
     }
 }
 
-void print_log_prefix(std::ostream& os,
-                      int severity, const char* file, int line) {
-    log_severity_name(os, severity);
-#if defined(OS_LINUX)
-    timeval tv;
-    gettimeofday(&tv, NULL);
+void PrintLogPrefix(std::ostream& os, int severity,
+                    butil::StringPiece file, int line,
+                    butil::StringPiece func, TimeVal tv) {
+    PrintLogSeverity(os, severity);
     time_t t = tv.tv_sec;
-#else
-    time_t t = time(NULL);
-#endif
-    struct tm local_tm = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL};
+    struct tm local_tm = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, nullptr};
 #if _MSC_VER >= 1400
     localtime_s(&local_tm, &t);
 #else
@@ -487,14 +866,26 @@ void print_log_prefix(std::ostream& os,
        << std::setw(2) << local_tm.tm_hour << ':'
        << std::setw(2) << local_tm.tm_min << ':'
        << std::setw(2) << local_tm.tm_sec;
-#if defined(OS_LINUX)
+#if defined(OS_LINUX) || defined(OS_MACOSX)
     os << '.' << std::setw(6) << tv.tv_usec;
 #endif
-    if (FLAGS_log_process_id) {
-        os << ' ' << std::setfill(' ') << std::setw(5) << CurrentProcessId();
+    if (FLAGS_log_pid) {
+        int32_t pid = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_log_pid);
+        if (pid == 0) {
+            pid = CurrentProcessId();
+            BAIDU_SET_VOLATILE_THREAD_LOCAL(tls_log_pid, pid);
+        }
+        os << ' ' << std::setfill(' ') << std::setw(5) << pid;
     }
-    os << ' ' << std::setfill(' ') << std::setw(5)
-       << butil::PlatformThread::CurrentId() << std::setfill('0');
+    butil::PlatformThreadId tid = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_log_tid);
+    if (tid == 0) {
+        tid = butil::PlatformThread::CurrentId();
+        BAIDU_SET_VOLATILE_THREAD_LOCAL(tls_log_tid, tid);
+    }
+    os << ' ' << std::setfill(' ') << std::setw(5) << tid << std::setfill('0');
+    if (FLAGS_log_bid && bthread_self) {
+        os << ' ' << std::setfill(' ') << std::setw(5) << bthread_self();
+    }
     if (FLAGS_log_hostname) {
         butil::StringPiece hostname(butil::my_hostname());
         if (hostname.ends_with(".baidu.com")) { // make it shorter
@@ -502,8 +893,130 @@ void print_log_prefix(std::ostream& os,
         }
         os << ' ' << hostname;
     }
-    os << ' ' << file << ':' << line << "] ";
+    os << ' ' << file << ':' << line;
+    if (!func.empty()) {
+        os << " " << func;
+    }
+    os << "] ";
+
     os.fill(prev_fill);
+}
+
+void PrintLogPrefix(std::ostream& os, int severity,
+                    const char* file, int line) {
+    PrintLogPrefix(os, severity, file, line, "", GetTimestamp());
+}
+
+static void PrintLogPrefixAsJSON(std::ostream& os, int severity,
+                                 butil::StringPiece file,
+                                 butil::StringPiece func,
+                                 int line, TimeVal tv) {
+    // severity
+    os << "\"L\":\"";
+    if (severity < 0) {
+        os << 'V' << -severity;
+    } else if (severity < LOG_NUM_SEVERITIES) {
+        os << log_severity_names[severity][0];
+    } else {
+        os << 'U';
+    }
+    // time
+    os << "\",\"T\":\"";
+    time_t t = tv.tv_sec;
+    struct tm local_tm = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, nullptr};
+#if _MSC_VER >= 1400
+    localtime_s(&local_tm, &t);
+#else
+    localtime_r(&t, &local_tm);
+#endif
+    const char prev_fill = os.fill('0');
+    if (FLAGS_log_year) {
+        os << std::setw(4) << local_tm.tm_year + 1900;
+    }
+    os << std::setw(2) << local_tm.tm_mon + 1
+       << std::setw(2) << local_tm.tm_mday << ' '
+       << std::setw(2) << local_tm.tm_hour << ':'
+       << std::setw(2) << local_tm.tm_min << ':'
+       << std::setw(2) << local_tm.tm_sec;
+#if defined(OS_LINUX) || defined(OS_MACOSX)
+    os << '.' << std::setw(6) << tv.tv_usec;
+#endif
+    os << "\",";
+    os.fill(prev_fill);
+
+    if (FLAGS_log_pid) {
+        os << "\"pid\":\"" << CurrentProcessId() << "\",";
+    }
+    os << "\"tid\":\"" << butil::PlatformThread::CurrentId() << "\",";
+    if (FLAGS_log_hostname) {
+        butil::StringPiece hostname(butil::my_hostname());
+        if (hostname.ends_with(".baidu.com")) { // make it shorter
+            hostname.remove_suffix(10);
+        }
+        os << "\"host\":\"" << hostname << "\",";
+    }
+    os << "\"C\":\"" << file << ':' << line;
+    if (!func.empty()) {
+        os << " " << func;
+    }
+    os << "\"";
+}
+
+void EscapeJson(std::ostream& os, const butil::StringPiece& s) {
+    for (auto it = s.begin(); it != s.end(); it++) {
+        auto c = *it;
+        switch (c) {
+        case '"': os << "\\\""; break;
+        case '\\': os << "\\\\"; break;
+        case '\b': os << "\\b"; break;
+        case '\f': os << "\\f"; break;
+        case '\n': os << "\\n"; break;
+        case '\r': os << "\\r"; break;
+        case '\t': os << "\\t"; break;
+        default: os << c;
+        }
+    }
+}
+
+inline void OutputLog(std::ostream& os, const butil::StringPiece& s) {
+    if (FLAGS_escape_log) {
+        EscapeJson(os, s);
+    } else {
+        os.write(s.data(), s.length());
+    }
+}
+
+void PrintLog(std::ostream& os, int severity, const char* file, int line,
+              const char* func, const butil::StringPiece& content) {
+    if (!FLAGS_log_as_json) {
+        PrintLogPrefix(os, severity, file, line, func, GetTimestamp());
+        OutputLog(os, content);
+    } else {
+        os << '{';
+        PrintLogPrefixAsJSON(os, severity, file, func, line, GetTimestamp());
+        bool pair_quote = false;
+        if (content.empty() || content[0] != '"') {
+            // not a json, add a 'M' field
+            os << ",\"M\":\"";
+            pair_quote = true;
+        } else {
+            os << ',';
+        }
+        OutputLog(os, content);
+        if (pair_quote) {
+            os << '"';
+        } else if (!content.empty() && content[content.size() -1 ] != '"') {
+            // Controller may write `"M":"...` which misses the last quote
+            os << '"';
+        }
+        os << '}';
+    }
+}
+
+void PrintLog(std::ostream& os,
+              int severity, const char* file, int line,
+              const butil::StringPiece& content) {
+    PrintLog(os, severity, file, line, "", content);
 }
 
 // A log message handler that gets notified of every log message we process.
@@ -533,7 +1046,7 @@ struct SetLogSinkFn {
 };
 
 LogSink* SetLogSink(LogSink* sink) {
-    SetLogSinkFn fn = { sink, NULL };
+    SetLogSinkFn fn = { sink, nullptr };
     CHECK(DoublyBufferedLogSink::GetInstance()->Modify(fn));
     return fn.old_sink;
 }
@@ -574,7 +1087,7 @@ void DisplayDebugMessageInDialog(const std::string& str) {
     // Message.exe" in the same directory as the application. If it
     // exists, we use it, otherwise, we use a regular message box.
     wchar_t prog_name[MAX_PATH];
-    GetModuleFileNameW(NULL, prog_name, MAX_PATH);
+    GetModuleFileNameW(nullptr, prog_name, MAX_PATH);
     wchar_t* backslash = wcsrchr(prog_name, '\\');
     if (backslash)
         backslash[1] = 0;
@@ -589,14 +1102,14 @@ void DisplayDebugMessageInDialog(const std::string& str) {
     startup_info.cb = sizeof(startup_info);
 
     PROCESS_INFORMATION process_info;
-    if (CreateProcessW(prog_name, &cmdline[0], NULL, NULL, false, 0, NULL,
-                       NULL, &startup_info, &process_info)) {
+    if (CreateProcessW(prog_name, &cmdline[0], nullptr, nullptr, false, 0, nullptr,
+                       nullptr, &startup_info, &process_info)) {
         WaitForSingleObject(process_info.hProcess, INFINITE);
         CloseHandle(process_info.hThread);
         CloseHandle(process_info.hProcess);
     } else {
         // debug process broken, let's just do a message box
-        MessageBoxW(NULL, &cmdline[0], L"Fatal error",
+        MessageBoxW(nullptr, &cmdline[0], L"Fatal error",
                     MB_OK | MB_ICONHAND | MB_TOPMOST);
     }
 #else
@@ -607,16 +1120,20 @@ void DisplayDebugMessageInDialog(const std::string& str) {
 #endif  // !defined(NDEBUG)
 
 
-bool StringSink::OnLogMessage(int severity, const char* file, int line, 
+bool StringSink::OnLogMessage(int severity, const char* file, int line,
                               const butil::StringPiece& content) {
-    std::ostringstream prefix_os;
-    print_log_prefix(prefix_os, severity, file, line);
-    const std::string prefix = prefix_os.str();
+    return OnLogMessage(severity, file, line, "", content);
+}
+
+bool StringSink::OnLogMessage(int severity, const char* file,
+                              int line, const char* func,
+                              const butil::StringPiece& content) {
+    std::ostringstream os;
+    PrintLog(os, severity, file, line, func, content);
+    const std::string msg = os.str();
     {
         butil::AutoLock lock_guard(_lock);
-        reserve(size() + prefix.size() + content.size());
-        append(prefix);
-        append(content.data(), content.size());
+        append(msg);
     }
     return true;
 }
@@ -631,8 +1148,8 @@ int CharArrayStreamBuf::overflow(int ch) {
     }
     size_t new_size = std::max(_size * 3 / 2, (size_t)64);
     char* new_data = (char*)malloc(new_size);
-    if (BAIDU_UNLIKELY(new_data == NULL)) {
-        setp(NULL, NULL);
+    if (BAIDU_UNLIKELY(new_data == nullptr)) {
+        setp(nullptr, nullptr);
         return std::streambuf::traits_type::eof();
     }
     memcpy(new_data, _data, _size);
@@ -655,10 +1172,20 @@ void CharArrayStreamBuf::reset() {
     setp(_data, _data + _size);
 }
 
-LogStream& LogStream::SetPosition(const PathChar* file, int line,
+LogStream& LogStream::SetPosition(const LogChar* file, int line,
                                   LogSeverity severity) {
     _file = file;
     _line = line;
+    _severity = severity;
+    return *this;
+}
+
+LogStream& LogStream::SetPosition(const LogChar* file, int line,
+                                  const LogChar* func,
+                                  LogSeverity severity) {
+    _file = file;
+    _line = line;
+    _func = func;
     _severity = severity;
     return *this;
 }
@@ -667,9 +1194,9 @@ LogStream& LogStream::SetPosition(const PathChar* file, int line,
 static bthread_key_t stream_bkey;
 static pthread_key_t stream_pkey;
 static pthread_once_t create_stream_key_once = PTHREAD_ONCE_INIT;
-inline bool is_bthread_linked() { return bthread_key_create != NULL; }
+inline bool is_bthread_linked() { return bthread_key_create != nullptr; }
 static void destroy_tls_streams(void* data) {
-    if (data == NULL) {
+    if (data == nullptr) {
         return;
     }
     LogStream** a = (LogStream**)data;
@@ -704,7 +1231,7 @@ static LogStream** get_tls_stream_array() {
 
 static LogStream** get_or_new_tls_stream_array() {
     LogStream** a = get_tls_stream_array();
-    if (a == NULL) {
+    if (a == nullptr) {
         a = new LogStream*[LOG_NUM_SEVERITIES + 1];
         memset(a, 0, sizeof(LogStream*) * (LOG_NUM_SEVERITIES + 1));
         if (is_bthread_linked()) {
@@ -716,7 +1243,9 @@ static LogStream** get_or_new_tls_stream_array() {
     return a;
 }
 
-inline LogStream* CreateLogStream(const PathChar* file, int line,
+inline LogStream* CreateLogStream(const LogChar* file,
+                                  int line,
+                                  const LogChar* func,
                                   LogSeverity severity) {
     int slot = 0;
     if (severity >= 0) {
@@ -725,28 +1254,41 @@ inline LogStream* CreateLogStream(const PathChar* file, int line,
     } // else vlog
     LogStream** stream_array = get_or_new_tls_stream_array();
     LogStream* stream = stream_array[slot];
-    if (stream == NULL) {
+    if (stream == nullptr) {
         stream = new LogStream;
         stream_array[slot] = stream;
     }
     if (stream->empty()) {
-        stream->SetPosition(file, line, severity);
+        stream->SetPosition(file, line, func, severity);
     }
     return stream;
 }
 
+inline LogStream* CreateLogStream(const LogChar* file,
+                                  int line,
+                                  LogSeverity severity) {
+    return CreateLogStream(file, line, "", severity);
+}
+
 inline void DestroyLogStream(LogStream* stream) {
-    if (stream != NULL) {
+    if (stream != nullptr) {
         stream->Flush();
     }
 }
 
 #else
 
-inline LogStream* CreateLogStream(const PathChar* file, int line,
+inline LogStream* CreateLogStream(const LogChar* file, int line,
+                                  LogSeverity severity) {
+    return CreateLogStream(file, line, "", severity);
+}
+
+
+inline LogStream* CreateLogStream(const LogChar* file, int line,
+                                  const LogChar* func,
                                   LogSeverity severity) {
     LogStream* stream = new LogStream;
-    stream->SetPosition(file, line, severity);
+    stream->SetPosition(file, line, func, severity);
     return stream;
 }
 
@@ -764,59 +1306,53 @@ public:
     }
 
     bool OnLogMessage(int severity, const char* file, int line,
-                      const butil::StringPiece& content) {
-        // There's a copy here to concatenate prefix and content. Since
-        // DefaultLogSink is hardly used right now, the copy is irrelevant.
-        // A LogSink focused on performance should also be able to handle
-        // non-continuous inputs which is a must to maximize performance.
-        std::ostringstream os;
-        print_log_prefix(os, severity, file, line);
-        os.write(content.data(), content.size());
-        os << '\n';
-        std::string log = os.str();
-        
-        if ((logging_destination & LOG_TO_SYSTEM_DEBUG_LOG) != 0) {
-            fwrite(log.data(), log.size(), 1, stderr);
-            fflush(stderr);
-        } else if (severity >= kAlwaysPrintErrorLevel) {
+                      const butil::StringPiece& content) override {
+        return OnLogMessage(severity, file, line, "", content);
+    }
+
+    bool OnLogMessage(int severity, const char* file,
+                      int line, const char* func,
+                      const butil::StringPiece& content) override {
+        std::string log;
+        if ((logging_destination & LOG_TO_SYSTEM_DEBUG_LOG) != 0 ||
+            severity >= kAlwaysPrintErrorLevel) {
+            log = LogInfoToLogStr(severity, file, line, func, content);
             // When we're only outputting to a log file, above a certain log level, we
             // should still output to stderr so that we can better detect and diagnose
             // problems with unit tests, especially on the buildbots.
             fwrite(log.data(), log.size(), 1, stderr);
             fflush(stderr);
         }
-
         // write to log file
         if ((logging_destination & LOG_TO_FILE) != 0) {
-            // We can have multiple threads and/or processes, so try to prevent them
-            // from clobbering each other's writes.
-            // If the client app did not call InitLogging, and the lock has not
-            // been created do it now. We do this on demand, but if two threads try
-            // to do this at the same time, there will be a race condition to create
-            // the lock. This is why InitLogging should be called from the main
-            // thread at the beginning of execution.
-            LoggingLock::Init(LOCK_LOG_FILE, NULL);
-            LoggingLock logging_lock;
-            if (InitializeLogFileHandle()) {
-#if defined(OS_WIN)
-                SetFilePointer(log_file, 0, 0, SEEK_END);
-                DWORD num_written;
-                WriteFile(log_file,
-                          static_cast<const void*>(log.data()),
-                          static_cast<DWORD>(log.size()),
-                          &num_written,
-                          NULL);
-#else
-                fwrite(log.data(), log.size(), 1, log_file);
-                fflush(log_file);
-#endif
+            if ((FLAGS_crash_on_fatal_log && severity == BLOG_FATAL) ||
+                !FLAGS_async_log) {
+                if (log.empty()) {
+                    log = LogInfoToLogStr(severity, file, line, func, content);
+                }
+                Log2File(log);
+            } else {
+                LogInfo info;
+                if (log.empty()) {
+                    info.severity = severity;
+                    info.timestamp = GetTimestamp();
+                    info.file = file;
+                    info.func = func;
+                    info.line = line;
+                    info.content = content.as_string();
+                    info.raw = true;
+                } else {
+                    info.content = std::move(log);
+                    info.raw = false;
+                }
+                AsyncLogger::GetInstance()->Log(std::move(info));
             }
         }
         return true;
     }
 private:
-    DefaultLogSink() {}
-    ~DefaultLogSink() {}
+    DefaultLogSink() = default;
+    ~DefaultLogSink() override = default;
 friend struct DefaultSingletonTraits<DefaultLogSink>;
 };
 
@@ -827,7 +1363,7 @@ void LogStream::FlushWithoutReset() {
     }
 
 #if !defined(OS_NACL) && !defined(__UCLIBC__)
-    if (FLAGS_print_stack_on_check && _is_check && _severity == BLOG_FATAL) {
+    if ((FLAGS_print_stack_on_check && _is_check && _severity == BLOG_FATAL) || _backtrace) {
         // Include a stack trace on a fatal.
         butil::debug::StackTrace trace;
         size_t count = 0;
@@ -861,8 +1397,10 @@ void LogStream::FlushWithoutReset() {
     {
         DoublyBufferedLogSink::ScopedPtr ptr;
         if (DoublyBufferedLogSink::GetInstance()->Read(&ptr) == 0 &&
-            (*ptr) != NULL) {
-            if ((*ptr)->OnLogMessage(_severity, _file, _line, content())) {
+            (*ptr) != nullptr) {
+            bool result = (*ptr)->OnLogMessage(
+                _severity, _file, _line, _func, content());
+            if (result) {
                 goto FINISH_LOGGING;
             }
 #ifdef BAIDU_INTERNAL
@@ -875,14 +1413,14 @@ void LogStream::FlushWithoutReset() {
 #ifdef BAIDU_INTERNAL
     if (!tried_comlog) {
         if (ComlogSink::GetInstance()->OnLogMessage(
-                _severity, _file, _line, content())) {
+                _severity, _file, _line, _func, content())) {
             goto FINISH_LOGGING;
         }
     }
 #endif
     if (!tried_default) {
         DefaultLogSink::GetInstance()->OnLogMessage(
-            _severity, _file, _line, content());
+            _severity, _file, _line, _func, content());
     }
 
 FINISH_LOGGING:
@@ -912,19 +1450,31 @@ FINISH_LOGGING:
     }
 }
 
-LogMessage::LogMessage(const char* file, int line, LogSeverity severity) {
-    _stream = CreateLogStream(file, line, severity);
+LogMessage::LogMessage(const char* file, int line, LogSeverity severity)
+    : LogMessage(file, line, "", severity) {}
+
+LogMessage::LogMessage(const char* file, int line,
+                       const char* func, LogSeverity severity) {
+    _stream = CreateLogStream(file, line, func, severity);
 }
 
-LogMessage::LogMessage(const char* file, int line, std::string* result) {
-    _stream = CreateLogStream(file, line, BLOG_FATAL);
+LogMessage::LogMessage(const char* file, int line, std::string* result)
+    : LogMessage(file, line, "", result) {}
+
+LogMessage::LogMessage(const char* file, int line,
+                       const char* func, std::string* result) {
+    _stream = CreateLogStream(file, line, func, BLOG_FATAL);
     *_stream << "Check failed: " << *result;
     delete result;
 }
 
 LogMessage::LogMessage(const char* file, int line, LogSeverity severity,
-                       std::string* result) {
-    _stream = CreateLogStream(file, line, severity);
+                       std::string* result)
+   : LogMessage(file, line, "", severity, result) {}
+
+LogMessage::LogMessage(const char* file, int line, const char* func,
+                       LogSeverity severity, std::string* result) {
+    _stream = CreateLogStream(file, line, func, severity);
     *_stream << "Check failed: " << *result;
     delete result;
 }
@@ -965,8 +1515,8 @@ BUTIL_EXPORT std::string SystemErrorCodeToString(SystemErrorCode error_code) {
     const int error_message_buffer_size = 256;
     char msgbuf[error_message_buffer_size];
     DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-    DWORD len = FormatMessageA(flags, NULL, error_code, 0, msgbuf,
-                               arraysize(msgbuf), NULL);
+    DWORD len = FormatMessageA(flags, nullptr, error_code, 0, msgbuf,
+                               arraysize(msgbuf), nullptr);
     if (len) {
         // Messages returned by system end with line breaks.
         return butil::CollapseWhitespaceASCII(msgbuf, true) +
@@ -989,8 +1539,16 @@ Win32ErrorLogMessage::Win32ErrorLogMessage(const char* file,
                                            int line,
                                            LogSeverity severity,
                                            SystemErrorCode err)
-    : err_(err),
-      log_message_(file, line, severity) {
+   : Win32ErrorLogMessage(file, line, "", severity, err) {
+}
+
+Win32ErrorLogMessage::Win32ErrorLogMessage(const char* file,
+                                           int line,
+                                           const char* func,
+                                           LogSeverity severity,
+                                           SystemErrorCode err)
+    : err_(err)
+    , log_message_(file, line, func, severity) {
 }
 
 Win32ErrorLogMessage::~Win32ErrorLogMessage() {
@@ -1005,9 +1563,15 @@ ErrnoLogMessage::ErrnoLogMessage(const char* file,
                                  int line,
                                  LogSeverity severity,
                                  SystemErrorCode err)
-    : err_(err),
-      log_message_(file, line, severity) {
-}
+    : ErrnoLogMessage(file, line, "", severity, err) {}
+
+ErrnoLogMessage::ErrnoLogMessage(const char* file,
+                                 int line,
+                                 const char* func,
+                                 LogSeverity severity,
+                                 SystemErrorCode err)
+    : err_(err)
+    , log_message_(file, line, func, severity) {}
 
 ErrnoLogMessage::~ErrnoLogMessage() {
     stream() << ": " << SystemErrorCodeToString(err_);
@@ -1069,14 +1633,14 @@ struct VModuleList;
 extern const int VLOG_UNINITIALIZED = std::numeric_limits<int>::max();
 
 static pthread_mutex_t vlog_site_list_mutex = PTHREAD_MUTEX_INITIALIZER;
-static VLogSite* vlog_site_list = NULL;
-static VModuleList* vmodule_list = NULL;
+static VLogSite* vlog_site_list = nullptr;
+static VModuleList* vmodule_list = nullptr;
 
 static pthread_mutex_t reset_vmodule_and_v_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const int64_t DELAY_DELETION_SEC = 10;
 static std::deque<std::pair<VModuleList*, int64_t> >*
-deleting_vmodule_list = NULL;
+deleting_vmodule_list = nullptr;
 
 struct VLogSite {
     VLogSite(const char* filename, int required_v, int line_no)
@@ -1124,7 +1688,7 @@ struct VLogSite {
     const std::string& full_module() const { return _full_module; }
     
 private:
-    // Next site in the list. NULL means no next.
+    // Next site in the list. nullptr means no next.
     butil::subtle::AtomicWord _next;
 
     // --vmodule > --v
@@ -1145,8 +1709,8 @@ private:
 // Written by Jack Handy
 // <A href="mailto:jakkhandy@hotmail.com">jakkhandy@hotmail.com</A>
 bool wildcmp(const char* wild, const char* str) {
-    const char* cp = NULL;
-    const char* mp = NULL;
+    const char* cp = nullptr;
+    const char* mp = nullptr;
 
     while (*str && *wild != '*') {
         if (*wild != *str && *wild != '?') {
@@ -1190,7 +1754,7 @@ struct VModuleList {
             size_t off = 0;
             for (; off < sp.length() && sp.field()[off] != '='; ++off) {}
             if (off + 1 < sp.length()) {
-                verbose_level = strtol(sp.field() + off + 1, NULL, 10);
+                verbose_level = strtol(sp.field() + off + 1, nullptr, 10);
                 
             }
             const char* name_begin = sp.field();
@@ -1207,7 +1771,7 @@ struct VModuleList {
             if (name.find_first_of("*?") == std::string::npos) {
                 _exact_names[name] = verbose_level;
             } else {
-                _wild_names.push_back(std::make_pair(name, verbose_level));
+                _wild_names.emplace_back(name, verbose_level);
             }
         }
         // Reverse _wild_names so that latter wild cards override former ones.
@@ -1298,7 +1862,7 @@ static int vlog_site_list_add(VLogSite* site,
 bool add_vlog_site(const int** v, const char* filename, int line_no,
                    int required_v) {
     VLogSite* site = new (std::nothrow) VLogSite(filename, required_v, line_no);
-    if (site == NULL) {
+    if (site == nullptr) {
         return false;
     }
     VModuleList* module_list = vmodule_list;
@@ -1315,7 +1879,7 @@ bool add_vlog_site(const int** v, const char* filename, int line_no,
 }
 
 void print_vlog_sites(VLogSitePrinter* printer) {
-    VLogSite* head = NULL;
+    VLogSite* head = nullptr;
     {
         BAIDU_SCOPED_LOCK(vlog_site_list_mutex);
         head = vlog_site_list;
@@ -1336,7 +1900,7 @@ static int on_reset_vmodule(const char* vmodule) {
     BAIDU_SCOPED_LOCK(reset_vmodule_and_v_mutex);
     
     VModuleList* module_list = new (std::nothrow) VModuleList;
-    if (NULL == module_list) {
+    if (nullptr == module_list) {
         LOG(FATAL) << "Fail to new VModuleList";
         return -1;
     }
@@ -1346,8 +1910,8 @@ static int on_reset_vmodule(const char* vmodule) {
         return -1;
     }
     
-    VModuleList* old_module_list = NULL;
-    VLogSite* old_vlog_site_list = NULL;
+    VModuleList* old_module_list = nullptr;
+    VLogSite* old_vlog_site_list = nullptr;
     {
         {
             BAIDU_SCOPED_LOCK(vlog_site_list_mutex);
@@ -1364,7 +1928,7 @@ static int on_reset_vmodule(const char* vmodule) {
     
     if (old_module_list) {
         //delay the deletion.
-        if (NULL == deleting_vmodule_list) {
+        if (nullptr == deleting_vmodule_list) {
             deleting_vmodule_list =
                 new std::deque<std::pair<VModuleList*, int64_t> >;
         }
@@ -1384,13 +1948,13 @@ static bool validate_vmodule(const char*, const std::string& vmodule) {
     return on_reset_vmodule(vmodule.c_str()) == 0;
 }
 
-const bool ALLOW_UNUSED validate_vmodule_dummy = GFLAGS_NS::RegisterFlagValidator(
+const bool ALLOW_UNUSED validate_vmodule_dummy = GFLAGS_NAMESPACE::RegisterFlagValidator(
     &FLAGS_vmodule, &validate_vmodule);
 
 // [Thread-safe] Reset FLAGS_v.
 static void on_reset_verbose(int default_v) {
-    VModuleList* cur_module_list = NULL;
-    VLogSite* cur_vlog_site_list = NULL;
+    VModuleList* cur_module_list = nullptr;
+    VLogSite* cur_vlog_site_list = nullptr;
     {
         // resetting must be serialized.
         BAIDU_SCOPED_LOCK(reset_vmodule_and_v_mutex);
@@ -1413,26 +1977,7 @@ static bool validate_v(const char*, int32_t v) {
     on_reset_verbose(v);
     return true;
 }
-
-const bool ALLOW_UNUSED validate_v_dummy = GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_v, &validate_v);
-
-static bool PassValidate(const char*, bool) {
-    return true;
-}
-
-const bool ALLOW_UNUSED validate_crash_on_fatal_log =
-    GFLAGS_NS::RegisterFlagValidator(&FLAGS_crash_on_fatal_log, PassValidate);
-
-const bool ALLOW_UNUSED validate_print_stack_on_check =
-    GFLAGS_NS::RegisterFlagValidator(&FLAGS_print_stack_on_check, PassValidate);
-
-static bool NonNegativeInteger(const char*, int32_t v) {
-    return v >= 0;
-}
-
-const bool ALLOW_UNUSED validate_min_log_level = GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_minloglevel, NonNegativeInteger);
+BUTIL_VALIDATE_GFLAG(v, validate_v);
 
 }  // namespace logging
 

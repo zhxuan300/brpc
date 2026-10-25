@@ -421,7 +421,385 @@ uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
   return static_cast<uint32_t>(l ^ 0xffffffffu);
 }
 
-// Detect if SS42 or not.
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#include <stdio.h>
+#if defined(__riscv_zvbc)
+#include <riscv_vector.h>
+#endif
+
+// RISC-V Zbc carry-less multiplication inline helpers
+static inline uint64_t rv_clmul(uint64_t a, uint64_t b) {
+  uint64_t result;
+  __asm__ volatile ("clmul %0, %1, %2" : "=r"(result) : "r"(a), "r"(b));
+  return result;
+}
+
+static inline uint64_t rv_clmulh(uint64_t a, uint64_t b) {
+  uint64_t result;
+  __asm__ volatile ("clmulh %0, %1, %2" : "=r"(result) : "r"(a), "r"(b));
+  return result;
+}
+
+// Bitwise CRC32C fallback for small chunks
+static inline uint32_t rv_crc32c_bitwise(uint32_t crc, const uint8_t* buf,
+                                         size_t len) {
+  uint32_t c = crc;
+  for (size_t i = 0; i < len; ++i) {
+    c ^= buf[i];
+    for (int k = 0; k < 8; ++k) {
+      c = (c >> 1) ^ ((c & 1) ? 0x82F63B78U : 0);
+    }
+  }
+  return c;
+}
+
+// Fold a 128-bit CRC state (lo:hi) with fold constants and XOR in new data
+static inline void rv_fold_pair_xor_data(uint64_t* lo, uint64_t* hi,
+                                         uint64_t k0, uint64_t k1,
+                                         uint64_t d0, uint64_t d1) {
+  uint64_t l = rv_clmul(*lo, k0) ^ rv_clmul(*hi, k1);
+  uint64_t h = rv_clmulh(*lo, k0) ^ rv_clmulh(*hi, k1);
+  *lo = l ^ d0;
+  *hi = h ^ d1;
+}
+
+// Fold a 128-bit CRC state with fold constants and XOR in another state
+static inline void rv_fold_pair_xor_state(uint64_t* lo, uint64_t* hi,
+                                          uint64_t k0, uint64_t k1,
+                                          uint64_t s0, uint64_t s1) {
+  uint64_t l = rv_clmul(*lo, k0) ^ rv_clmul(*hi, k1);
+  uint64_t h = rv_clmulh(*lo, k0) ^ rv_clmulh(*hi, k1);
+  *lo = l ^ s0;
+  *hi = h ^ s1;
+}
+
+// Folding constants for CRC32C (Castagnoli polynomial 0x1EDC6F41)
+// x^(64*i+64) mod P(x) for i=1..4, in bit-reflected form
+static const uint64_t crc32c_fold_const[4] __attribute__((aligned(16))) = {
+  0x00000000740eef02ULL,  // k1: fold 512->256
+  0x000000009e4addf8ULL,  // k2: fold 512->256
+  0x00000000f20c0dfeULL,  // k3: fold 256->128
+  0x00000000493c7d27ULL   // k4: fold 256->128
+};
+
+// Barrett reduction constants for CRC32C finalization
+#define RV_CRC32C_CONST_0    0x00000000dd45aab8ULL  // x^64 mod P
+#define RV_CRC32C_CONST_1    0x00000000493c7d27ULL  // x^96 mod P
+#define RV_CRC32C_CONST_QUO  0x0000000dea713f1ULL   // floor(x^64 / P)
+#define RV_CRC32C_CONST_POLY 0x0000000105ec76f1ULL  // P(x) true LE full
+#define RV_CRC32_MASK32      0x00000000FFFFFFFFULL
+
+// Hardware-accelerated CRC32C using RISC-V Zbc carry-less multiplication.
+// Processes data in 64-byte chunks with 128-bit folding, then Barrett reduces.
+#if defined(__riscv_zbc)
+static uint32_t rv_crc32c_clmul(uint32_t crc, const char* buf, size_t len) {
+  // Convert external CRC to internal register state
+  crc ^= 0xFFFFFFFF;
+
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  size_t n = len;
+
+  // Small data: use bitwise fallback
+  if (n < 64) {
+    return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+  }
+
+  // Align to 16-byte boundary
+  uintptr_t mis = (uintptr_t)p & 0xF;
+  if (mis) {
+    size_t pre = 16 - mis;
+    if (pre > n) pre = n;
+    crc = rv_crc32c_bitwise(crc, p, pre);
+    p += pre;
+    n -= pre;
+    if (n < 64) {
+      return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+    }
+  }
+
+  // Load first 64 bytes and XOR CRC into the first 8 bytes
+  uint64_t x0, x1, y0, y1, z0, z1, w0, w1;
+  memcpy(&x0, p + 0, 8);
+  memcpy(&x1, p + 8, 8);
+  memcpy(&y0, p + 16, 8);
+  memcpy(&y1, p + 24, 8);
+  memcpy(&z0, p + 32, 8);
+  memcpy(&z1, p + 40, 8);
+  memcpy(&w0, p + 48, 8);
+  memcpy(&w1, p + 56, 8);
+
+  x0 ^= (uint64_t)crc;
+  p += 64;
+  n -= 64;
+
+  const uint64_t k1 = crc32c_fold_const[0];
+  const uint64_t k2 = crc32c_fold_const[1];
+  const uint64_t k3 = crc32c_fold_const[2];
+  const uint64_t k4 = crc32c_fold_const[3];
+
+  // Main loop: fold 64 bytes per iteration using 128-bit folding
+  while (n >= 64) {
+    uint64_t d0, d1;
+    memcpy(&d0, p + 0, 8);
+    memcpy(&d1, p + 8, 8);
+    rv_fold_pair_xor_data(&x0, &x1, k1, k2, d0, d1);
+    memcpy(&d0, p + 16, 8);
+    memcpy(&d1, p + 24, 8);
+    rv_fold_pair_xor_data(&y0, &y1, k1, k2, d0, d1);
+    memcpy(&d0, p + 32, 8);
+    memcpy(&d1, p + 40, 8);
+    rv_fold_pair_xor_data(&z0, &z1, k1, k2, d0, d1);
+    memcpy(&d0, p + 48, 8);
+    memcpy(&d1, p + 56, 8);
+    rv_fold_pair_xor_data(&w0, &w1, k1, k2, d0, d1);
+    p += 64;
+    n -= 64;
+  }
+
+  // Reduce 4x128-bit to 1x128-bit
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, y0, y1);
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, z0, z1);
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, w0, w1);
+
+  // Barrett reduction: 128-bit -> 32-bit CRC
+  uint64_t t4 = rv_clmul(x0, RV_CRC32C_CONST_1);
+  uint64_t t3 = rv_clmulh(x0, RV_CRC32C_CONST_1);
+  uint64_t t1 = x1 ^ t4;
+  t4 = t1 & RV_CRC32_MASK32;
+  t1 >>= 32;
+  uint64_t t0 = rv_clmul(t4, RV_CRC32C_CONST_0);
+  t3 = (t3 << 32) ^ t1 ^ t0;
+
+  t4 = t3 & RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_QUO);
+  t4 &= RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_POLY);
+  t4 ^= t3;
+
+  uint32_t c = (uint32_t)((t4 >> 32) & RV_CRC32_MASK32);
+  // Handle remaining bytes
+  if (n) {
+    c = rv_crc32c_bitwise(c, p, n);
+  }
+  // Convert internal register state to external CRC
+  return c ^ 0xFFFFFFFF;
+}
+#endif  // __riscv_zbc
+
+// Runtime detection: check if RISC-V CPU supports Zbc extension
+static bool is_zbc() {
+  static const bool zbc_supported = []() {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return false;
+    bool supported = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+      if (strstr(line, "isa") || strstr(line, "hart isa")) {
+        char* colon = strchr(line, ':');
+        if (colon) {
+          if (strstr(colon, "_zbc")) {
+            supported = true;
+            break;
+          }
+        }
+      }
+    }
+    fclose(f);
+    return supported;
+  }();
+  return zbc_supported;
+}
+
+#if defined(__riscv_zvbc)
+// Hardware-accelerated CRC32C using RISC-V Zvbc vector carry-less multiplication.
+// Adaptive VLEN: the fold keeps the exact 4-lane / 64-byte span of the scalar
+// clmul core (same constants) and carries the four lanes on `segs` e64m1
+// vector pairs (vl=4 on VLEN>=256, two vl=2 pairs on VLEN=128), so 128-bit
+// cores run the vector path at full width.  Every carry-less multiply goes
+// through the vector vclmul path: cores with Zvbc but without scalar Zbc
+// (e.g. SG2044) must never execute a scalar `clmul`.  Bit-exact with the
+// table/bitwise fallback.
+static inline uint64_t rv_vclmul1(uint64_t a, uint64_t b, bool hi) {
+  const size_t vl1 = 1;
+  vuint64m1_t va = __riscv_vmv_v_x_u64m1(a, vl1);
+  vuint64m1_t vb = __riscv_vmv_v_x_u64m1(b, vl1);
+  return __riscv_vmv_x_s_u64m1_u64(hi ? __riscv_vclmulh_vv_u64m1(va, vb, vl1)
+                                      : __riscv_vclmul_vv_u64m1(va, vb, vl1));
+}
+static uint32_t rv_crc32c_vclmul(uint32_t crc, const char* buf, size_t len) {
+  crc ^= 0xFFFFFFFF;
+
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  size_t n = len;
+
+  size_t max_vl = __riscv_vsetvlmax_e64m1();
+  const size_t vl = max_vl >= 4 ? 4 : (max_vl >= 2 ? 2 : 0);
+  const uint64_t chunk = 64;
+
+  if (n < chunk || vl == 0) {
+    return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+  }
+
+  // Align to 16-byte boundary (same bitwise walk as the scalar core).
+  uintptr_t mis = reinterpret_cast<uintptr_t>(p) & 0xF;
+  if (mis) {
+    size_t pre = 16 - mis;
+    if (pre > n) pre = n;
+    crc = rv_crc32c_bitwise(crc, p, pre);
+    p += pre;
+    n -= pre;
+    if (n < chunk) {
+      return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+    }
+  }
+
+  // Four lanes, carried by `segs` e64m1 vector pairs: 1 pair (vl=4) or 2
+  // pairs (vl=2).  RVV types cannot live in arrays, so named variables.
+  const uint32_t segs = vl == 2 ? 2 : 1;
+  const size_t seg_bytes = vl * 16;
+
+  vuint64m1_t lo_a, hi_a, lo_b, hi_b;
+  {
+    vuint64m1x2_t sg = __riscv_vlseg2e64_v_u64m1x2(
+        reinterpret_cast<const uint64_t*>(p), vl);
+    lo_a = __riscv_vget_v_u64m1x2_u64m1(sg, 0);
+    hi_a = __riscv_vget_v_u64m1x2_u64m1(sg, 1);
+  }
+  if (segs == 2) {
+    vuint64m1x2_t sg = __riscv_vlseg2e64_v_u64m1x2(
+        reinterpret_cast<const uint64_t*>(p + seg_bytes), vl);
+    lo_b = __riscv_vget_v_u64m1x2_u64m1(sg, 0);
+    hi_b = __riscv_vget_v_u64m1x2_u64m1(sg, 1);
+  }
+  if (vl == 2) {
+    uint64_t l0[2], h0[2];
+    __riscv_vse64_v_u64m1(l0, lo_a, vl);
+    __riscv_vse64_v_u64m1(h0, hi_a, vl);
+    l0[0] ^= (uint64_t)crc;
+    lo_a = __riscv_vle64_v_u64m1(l0, vl);
+    hi_a = __riscv_vle64_v_u64m1(h0, vl);
+  } else {
+    uint64_t l0[4];
+    __riscv_vse64_v_u64m1(l0, lo_a, vl);
+    l0[0] ^= (uint64_t)crc;
+    lo_a = __riscv_vle64_v_u64m1(l0, vl);
+  }
+  p += chunk;
+  n -= chunk;
+
+  const uint64_t k1 = crc32c_fold_const[0];
+  const uint64_t k2 = crc32c_fold_const[1];
+
+  while (n >= chunk) {
+    vuint64m1x2_t sg = __riscv_vlseg2e64_v_u64m1x2(
+        reinterpret_cast<const uint64_t*>(p), vl);
+    vuint64m1_t dl = __riscv_vget_v_u64m1x2_u64m1(sg, 0);
+    vuint64m1_t dh = __riscv_vget_v_u64m1x2_u64m1(sg, 1);
+    vuint64m1_t lv = __riscv_vxor_vv_u64m1(
+        __riscv_vclmul_vx_u64m1(lo_a, k1, vl),
+        __riscv_vclmul_vx_u64m1(hi_a, k2, vl), vl);
+    vuint64m1_t hv = __riscv_vxor_vv_u64m1(
+        __riscv_vclmulh_vx_u64m1(lo_a, k1, vl),
+        __riscv_vclmulh_vx_u64m1(hi_a, k2, vl), vl);
+    lo_a = __riscv_vxor_vv_u64m1(lv, dl, vl);
+    hi_a = __riscv_vxor_vv_u64m1(hv, dh, vl);
+    if (segs == 2) {
+      vuint64m1x2_t sg2 = __riscv_vlseg2e64_v_u64m1x2(
+          reinterpret_cast<const uint64_t*>(p + seg_bytes), vl);
+      vuint64m1_t dl2 = __riscv_vget_v_u64m1x2_u64m1(sg2, 0);
+      vuint64m1_t dh2 = __riscv_vget_v_u64m1x2_u64m1(sg2, 1);
+      vuint64m1_t lv2 = __riscv_vxor_vv_u64m1(
+          __riscv_vclmul_vx_u64m1(lo_b, k1, vl),
+          __riscv_vclmul_vx_u64m1(hi_b, k2, vl), vl);
+      vuint64m1_t hv2 = __riscv_vxor_vv_u64m1(
+          __riscv_vclmulh_vx_u64m1(lo_b, k1, vl),
+          __riscv_vclmulh_vx_u64m1(hi_b, k2, vl), vl);
+      lo_b = __riscv_vxor_vv_u64m1(lv2, dl2, vl);
+      hi_b = __riscv_vxor_vv_u64m1(hv2, dh2, vl);
+    }
+    p += chunk;
+    n -= chunk;
+  }
+
+  uint64_t loa[4], hia[4];
+  __riscv_vse64_v_u64m1(loa, lo_a, vl);
+  __riscv_vse64_v_u64m1(hia, hi_a, vl);
+  if (segs == 2) {
+    __riscv_vse64_v_u64m1(loa + 2, lo_b, vl);
+    __riscv_vse64_v_u64m1(hia + 2, hi_b, vl);
+  }
+
+  // Merge the four lanes with k3/k4 via single-element vector CLMUL.
+  const uint64_t k3 = crc32c_fold_const[2];
+  const uint64_t k4 = crc32c_fold_const[3];
+  uint64_t x0 = loa[0], x1 = hia[0];
+  for (uint32_t j = 1; j < 4; ++j) {
+    const size_t vl1 = 1;
+    vuint64m1_t vlo = __riscv_vmv_v_x_u64m1(x0, vl1);
+    vuint64m1_t vhi = __riscv_vmv_v_x_u64m1(x1, vl1);
+    vuint64m1_t vk0 = __riscv_vmv_v_x_u64m1(k3, vl1);
+    vuint64m1_t vk1 = __riscv_vmv_v_x_u64m1(k4, vl1);
+    vuint64m1_t l = __riscv_vxor_vv_u64m1(
+        __riscv_vclmul_vv_u64m1(vlo, vk0, vl1),
+        __riscv_vclmul_vv_u64m1(vhi, vk1, vl1), vl1);
+    vuint64m1_t h = __riscv_vxor_vv_u64m1(
+        __riscv_vclmulh_vv_u64m1(vlo, vk0, vl1),
+        __riscv_vclmulh_vv_u64m1(vhi, vk1, vl1), vl1);
+    x0 = __riscv_vmv_x_s_u64m1_u64(l) ^ loa[j];
+    x1 = __riscv_vmv_x_s_u64m1_u64(h) ^ hia[j];
+  }
+
+  // Barrett reduction with single-element vector vclmul (no scalar Zbc).
+  uint64_t t4 = rv_vclmul1(x0, RV_CRC32C_CONST_1, false);
+  uint64_t t3 = rv_vclmul1(x0, RV_CRC32C_CONST_1, true);
+  uint64_t t1 = x1 ^ t4;
+  t4 = t1 & RV_CRC32_MASK32;
+  t1 >>= 32;
+  uint64_t t0 = rv_vclmul1(t4, RV_CRC32C_CONST_0, false);
+  t3 = (t3 << 32) ^ t1 ^ t0;
+
+  t4 = t3 & RV_CRC32_MASK32;
+  t4 = rv_vclmul1(t4, RV_CRC32C_CONST_QUO, false);
+  t4 &= RV_CRC32_MASK32;
+  t4 = rv_vclmul1(t4, RV_CRC32C_CONST_POLY, false);
+  t4 ^= t3;
+
+  uint32_t c = static_cast<uint32_t>((t4 >> 32) & RV_CRC32_MASK32);
+  if (n) {
+    c = rv_crc32c_bitwise(c, p, n);
+  }
+  return c ^ 0xFFFFFFFF;
+}
+
+// Runtime detection: check if RISC-V CPU supports Zvbc extension
+static bool is_zvbc() {
+  static const bool zvbc_supported = []() {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return false;
+    bool supported = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+      if (strstr(line, "isa") || strstr(line, "hart isa")) {
+        char* colon = strchr(line, ':');
+        if (colon) {
+          if (strstr(colon, "_zvbc")) {
+            supported = true;
+            break;
+          }
+        }
+      }
+    }
+    fclose(f);
+    return supported;
+  }();
+  return zvbc_supported;
+}
+#endif  // __riscv_zvbc
+
+#endif  // __riscv && __riscv_xlen == 64 && (__riscv_zbc || __riscv_zvbc)
+
+// Detect if SSE4.2 or not.
+#ifdef __SSE4_2__
 static bool isSSE42() {
 #if defined(__GNUC__) && defined(__x86_64__) && !defined(IOS_CROSS_COMPILE)
   uint32_t c_;
@@ -432,20 +810,66 @@ static bool isSSE42() {
   return false;
 #endif
 }
+#endif
 
 typedef uint32_t (*Function)(uint32_t, const char*, size_t);
 
+#if defined(__riscv) && (__riscv_xlen == 64) && defined(__riscv_zbc) && defined(__riscv_zvbc)
+// Both Zbc and Zvbc: scalar is cheaper for small inputs, the vector fold
+// wins from ~256 B on.
+static constexpr size_t kRiscvVclmulThresholdBytes = 256;
+static uint32_t RiscvExtend(uint32_t crc, const char* buf, size_t size) {
+  return (size >= kRiscvVclmulThresholdBytes ? rv_crc32c_vclmul : rv_crc32c_clmul)(crc, buf, size);
+}
+#endif
+
 static inline Function Choose_Extend() {
-  return isSSE42() ? (Function)ExtendImpl<FastCRC32Functor> : 
-                    (Function)ExtendImpl<SlowCRC32Functor>;
+#ifdef __SSE4_2__
+  if (isSSE42()) {
+    return (Function)ExtendImpl<FastCRC32Functor>;
+  }
+#endif
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#if defined(__riscv_zbc) && defined(__riscv_zvbc)
+  {
+    static const bool has_zbc = is_zbc();
+    static const bool has_zvbc = is_zvbc();
+    if (has_zbc && has_zvbc) {
+      return (Function)RiscvExtend;
+    }
+    if (has_zvbc) {
+      return (Function)rv_crc32c_vclmul;
+    }
+    if (has_zbc) {
+      return (Function)rv_crc32c_clmul;
+    }
+  }
+#elif defined(__riscv_zvbc)
+  if (is_zvbc()) {
+    return (Function)rv_crc32c_vclmul;
+  }
+#elif defined(__riscv_zbc)
+  if (is_zbc()) {
+    return (Function)rv_crc32c_clmul;
+  }
+#endif
+#endif
+  return (Function)ExtendImpl<SlowCRC32Functor>;
 }
 
 bool IsFastCrc32Supported() {
 #ifdef __SSE4_2__
-  return isSSE42();
-#else
-  return false;
+  if (isSSE42()) return true;
 #endif
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#if defined(__riscv_zvbc)
+  if (is_zvbc()) return true;
+#endif
+#if defined(__riscv_zbc)
+  if (is_zbc()) return true;
+#endif
+#endif
+  return false;
 }
 
 uint32_t Extend(uint32_t crc, const char* buf, size_t size) {

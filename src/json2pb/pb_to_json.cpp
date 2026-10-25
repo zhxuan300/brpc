@@ -1,4 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <iostream>
 #include <vector>
@@ -7,14 +22,71 @@
 #include <sys/time.h>
 #include <time.h>
 #include <google/protobuf/descriptor.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <gflags/gflags.h>
+#include "json2pb/zero_copy_stream_writer.h"
+#include "json2pb/encode_decode.h"
+#include "json2pb/protobuf_map.h"
+#include "json2pb/rapidjson.h"
+#include "json2pb/pb_to_json.h"
+#include "json2pb/protobuf_type_resolver.h"
+
 #include "butil/base64.h"
-#include "zero_copy_stream_writer.h"
-#include "encode_decode.h"
-#include "protobuf_map.h"
-#include "rapidjson.h"
-#include "pb_to_json.h"
+#include "butil/iobuf.h"
+#include "butil/strings/string_util.h"
 
 namespace json2pb {
+
+DECLARE_int32(json2pb_max_recursion_depth);
+
+// Helper function to check if the maximum depth of a message is exceeded.
+bool ExceedMaxDepth(const google::protobuf::Message& message, int current_depth) {
+    if (current_depth > FLAGS_json2pb_max_recursion_depth) {
+        return true;
+    }
+
+    const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
+    const google::protobuf::Reflection* reflection = message.GetReflection();
+
+    std::vector<const google::protobuf::FieldDescriptor*> fields;
+    // Collect declared fields.
+    for (int i = 0; i < descriptor->field_count(); ++i) {
+        fields.push_back(descriptor->field(i));
+    }
+    // Collect extension fields (if any).
+    {
+        std::vector<const google::protobuf::FieldDescriptor*> ext_fields;
+        descriptor->file()->pool()->FindAllExtensions(descriptor, &ext_fields);
+        fields.insert(fields.end(), ext_fields.begin(), ext_fields.end());
+    }
+
+    for (const auto* field : fields) {
+        if (field->cpp_type() != google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
+            continue;
+        }
+
+        if (field->is_repeated()) {
+            const int count = reflection->FieldSize(message, field);
+            for (int j = 0; j < count; ++j) {
+                const google::protobuf::Message& sub_message =
+                    reflection->GetRepeatedMessage(message, field, j);
+                if (ExceedMaxDepth(sub_message, current_depth + 1)) {
+                    return true;
+                }
+            }
+        } else {
+            if (reflection->HasField(message, field)) {
+                const google::protobuf::Message& sub_message =
+                    reflection->GetMessage(message, field);
+                if (ExceedMaxDepth(sub_message, current_depth + 1)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 Pb2JsonOptions::Pb2JsonOptions()
     : enum_option(OUTPUT_ENUM_BY_NAME)
     , pretty_json(false)
@@ -25,7 +97,8 @@ Pb2JsonOptions::Pb2JsonOptions()
     , bytes_to_base64(true)
 #endif
     , jsonify_empty_array(false)
-    , always_print_primitive_fields(false) {
+    , always_print_primitive_fields(false)
+    , single_repeated_to_array(false) {
 }
 
 class PbToJsonConverter {
@@ -33,26 +106,29 @@ public:
     explicit PbToJsonConverter(const Pb2JsonOptions& opt) : _option(opt) {}
 
     template <typename Handler>
-    bool Convert(const google::protobuf::Message& message, Handler& handler);
+    bool Convert(const google::protobuf::Message& message, Handler& handler, int depth = 0);
 
     const std::string& ErrorText() const { return _error; }
-    
+
 private:
     template <typename Handler>
     bool _PbFieldToJson(const google::protobuf::Message& message,
                         const google::protobuf::FieldDescriptor* field,
-                        Handler& handler);
+                        Handler& handler, int depth);
 
     std::string _error;
     Pb2JsonOptions _option;
 };
 
 template <typename Handler>
-bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handler& handler) {
-    handler.StartObject();
+bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handler& handler, int depth) {
+    if (depth > FLAGS_json2pb_max_recursion_depth) {
+        _error = "Exceeded maximum recursion depth";
+        return false;
+    }
     const google::protobuf::Reflection* reflection = message.GetReflection();
     const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
-    
+
     int ext_range_count = descriptor->extension_range_count();
     int field_count = descriptor->field_count();
     std::vector<const google::protobuf::FieldDescriptor*> fields;
@@ -60,8 +136,12 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
     for (int i = 0; i < ext_range_count; ++i) {
         const google::protobuf::Descriptor::ExtensionRange*
             ext_range = descriptor->extension_range(i);
-        for (int tag_number = ext_range->start;
-             tag_number < ext_range->end; ++tag_number) {
+#if GOOGLE_PROTOBUF_VERSION < 4024000
+        for (int tag_number = ext_range->start; tag_number < ext_range->end; ++tag_number)
+#else
+        for (int tag_number = ext_range->start_number(); tag_number < ext_range->end_number(); ++tag_number)
+#endif
+        {
             const google::protobuf::FieldDescriptor* field =
                     reflection->FindKnownExtensionByNumber(tag_number);
             if (field) {
@@ -79,6 +159,14 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
         }
     }
 
+    if (depth == 0 && _option.single_repeated_to_array) {
+        if (map_fields.empty() && fields.size() == 1 && fields.front()->is_repeated()) {
+            return _PbFieldToJson(message, fields.front(), handler, depth);
+        }
+    }
+
+    handler.StartObject();
+
     // Fill in non-map fields
     std::string field_name_str;
     for (size_t i = 0; i < fields.size(); ++i) {
@@ -86,7 +174,7 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
         if (!field->is_repeated() && !reflection->HasField(message, field)) {
             // Field that has not been set
             if (field->is_required()) {
-                _error = "Missing required field: " + field->full_name();
+                _error = "Missing required field: " + butil::EnsureString(field->full_name());
                 return false;
             }
             // Whether dumps default fields
@@ -100,11 +188,11 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
             continue;
         }
 
-        const std::string& orig_name = field->name();
+        const std::string orig_name = butil::EnsureString(field->name());
         bool decoded = decode_name(orig_name, field_name_str); 
         const std::string& name = decoded ? field_name_str : orig_name;
         handler.Key(name.data(), name.size(), false);
-        if (!_PbFieldToJson(message, field, handler)) {
+        if (!_PbFieldToJson(message, field, handler, depth)) {
             return false;
         }
     }
@@ -119,7 +207,7 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
 
         // Write a json object corresponding to hold protobuf map
         // such as {"key": value, ...}
-        const std::string& orig_name = map_desc->name();
+        const std::string orig_name = butil::EnsureString(map_desc->name());
         bool decoded = decode_name(orig_name, field_name_str);
         const std::string& name = decoded ? field_name_str : orig_name;
         handler.Key(name.data(), name.size(), false);
@@ -134,7 +222,7 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
             handler.Key(entry_name.data(), entry_name.size(), false);
 
             // Fill in entries into this json object
-            if (!_PbFieldToJson(entry, value_desc, handler)) {
+            if (!_PbFieldToJson(entry, value_desc, handler, depth)) {
                 return false;
             }
         }
@@ -150,7 +238,7 @@ template <typename Handler>
 bool PbToJsonConverter::_PbFieldToJson(
     const google::protobuf::Message& message,
     const google::protobuf::FieldDescriptor* field,
-    Handler& handler) {
+    Handler& handler, int depth) {
     const google::protobuf::Reflection* reflection = message.GetReflection();
     switch (field->cpp_type()) {
 #define CASE_FIELD_TYPE(cpptype, method, valuetype, handle)             \
@@ -220,8 +308,8 @@ bool PbToJsonConverter::_PbFieldToJson(
             handler.StartArray();
             if (_option.enum_option == OUTPUT_ENUM_BY_NAME) {
                 for (int index = 0; index < field_size; ++index) { 
-                    const std::string& enum_name = reflection->GetRepeatedEnum(
-                        message, field, index)->name();
+                    const std::string enum_name = butil::EnsureString(reflection->GetRepeatedEnum(
+                        message, field, index)->name());
                     handler.String(enum_name.data(), enum_name.size(), false);
                 }
             } else {
@@ -235,7 +323,7 @@ bool PbToJsonConverter::_PbFieldToJson(
         } else {
             if (_option.enum_option == OUTPUT_ENUM_BY_NAME) {
                 const std::string& enum_name =
-                        reflection->GetEnum(message, field)->name();
+                        butil::EnsureString(reflection->GetEnum(message, field)->name());
                 handler.String(enum_name.data(), enum_name.size(), false);
             } else {
                 handler.AddInt(reflection->GetEnum(message, field)->number());
@@ -250,14 +338,14 @@ bool PbToJsonConverter::_PbFieldToJson(
             handler.StartArray();
             for (int index = 0; index < field_size; ++index) {
                 if (!Convert(reflection->GetRepeatedMessage(
-                        message, field, index), handler)) {
+                        message, field, index), handler, depth + 1)) {
                     return false;
                 }
             }
             handler.EndArray(field_size);
             
         } else {
-            if (!Convert(reflection->GetMessage(message, field), handler)) {
+            if (!Convert(reflection->GetMessage(message, field), handler, depth + 1)) {
                 return false;
             }
         }
@@ -273,12 +361,12 @@ bool ProtoMessageToJsonStream(const google::protobuf::Message& message,
                               OutputStream& os, std::string* error) {
     PbToJsonConverter converter(options);
     bool succ = false;
-    if (options.pretty_json) {    
+    if (options.pretty_json) {
         BUTIL_RAPIDJSON_NAMESPACE::PrettyWriter<OutputStream> writer(os);
-        succ = converter.Convert(message, writer); 
+        succ = converter.Convert(message, writer);
     } else {
         BUTIL_RAPIDJSON_NAMESPACE::OptimizedWriter<OutputStream> writer(os);
-        succ = converter.Convert(message, writer); 
+        succ = converter.Convert(message, writer);
     }
     if (!succ && error) {
         error->clear();
@@ -307,15 +395,58 @@ bool ProtoMessageToJson(const google::protobuf::Message& message,
 }
 
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *stream,
+                        google::protobuf::io::ZeroCopyOutputStream* stream,
                         const Pb2JsonOptions& options, std::string* error) {
     json2pb::ZeroCopyStreamWriter wrapper(stream);
     return json2pb::ProtoMessageToJsonStream(message, options, wrapper, error);
 }
 
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *stream,
+                        google::protobuf::io::ZeroCopyOutputStream* stream,
                         std::string* error) {
     return ProtoMessageToJson(message, stream, Pb2JsonOptions(), error);
 }
+
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message,
+                             google::protobuf::io::ZeroCopyOutputStream* json,
+                             const Pb2ProtoJsonOptions& options, std::string* error) {
+    if (ExceedMaxDepth(message, 0)) {
+        if (error) {
+            *error = "Exceeded maximum recursion depth";
+        }
+        return false;
+    }
+#if GOOGLE_PROTOBUF_VERSION >= 6031000
+    auto st = google::protobuf::json::MessageToJsonStream(message, json, options);
+    bool ok = st.ok();
+    if (!ok && nullptr != error) {
+        *error = st.ToString();
+    }
+    return ok;
+#else
+    butil::IOBuf buf;
+    butil::IOBufAsZeroCopyOutputStream output_stream(&buf);
+    if (!message.SerializeToZeroCopyStream(&output_stream)) {
+        return false;
+    }
+
+    TypeResolverUniqueptr type_resolver = GetTypeResolver(message);
+    butil::IOBufAsZeroCopyInputStream input_stream(buf);
+    auto st = google::protobuf::util::BinaryToJsonStream(
+            type_resolver.get(), GetTypeUrl(message), &input_stream, json, options);
+
+    bool ok = st.ok();
+    if (!ok && nullptr != error) {
+        *error = st.ToString();
+    }
+    return ok;
+#endif // GOOGLE_PROTOBUF_VERSION >= 6031000
+}
+
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message, std::string* json,
+                             const Pb2ProtoJsonOptions& options, std::string* error) {
+    google::protobuf::io::StringOutputStream output_stream(json);
+    return ProtoMessageToProtoJson(message, &output_stream, options, error);
+}
+
 } // namespace json2pb

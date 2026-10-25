@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <ostream>
 #include <iomanip>
@@ -63,7 +65,7 @@ void RpczService::enable(::google::protobuf::RpcController* cntl_base,
     const bool use_html = UseHTML(cntl->http_request());
     cntl->http_response().set_content_type(
         use_html ? "text/html" : "text/plain");
-    if (!GFLAGS_NS::SetCommandLineOption("enable_rpcz", "true").empty()) {
+    if (!GFLAGS_NAMESPACE::SetCommandLineOption("enable_rpcz", "true").empty()) {
         if (use_html) {
             // Redirect to /rpcz
             cntl->response_attachment().append(
@@ -92,7 +94,7 @@ void RpczService::disable(::google::protobuf::RpcController* cntl_base,
     const bool use_html = UseHTML(cntl->http_request());
     cntl->http_response().set_content_type(
         use_html ? "text/html" : "text/plain");
-    if (!GFLAGS_NS::SetCommandLineOption("enable_rpcz", "false").empty()) {
+    if (!GFLAGS_NAMESPACE::SetCommandLineOption("enable_rpcz", "false").empty()) {
         if (use_html) {
             // Redirect to /rpcz
             cntl->response_attachment().append(
@@ -183,7 +185,7 @@ static void PrintElapse(std::ostream& os, int64_t cur_time,
 
 static void PrintAnnotations(
     std::ostream& os, int64_t cur_time, int64_t* last_time,
-    SpanInfoExtractor** extractors, int num_extr) {
+    SpanInfoExtractor** extractors, int num_extr, const RpczSpan* span) {
     int64_t anno_time;
     std::string a;
     // TODO: Going through all extractors is not strictly correct because 
@@ -192,7 +194,19 @@ static void PrintAnnotations(
         while (extractors[i]->PopAnnotation(cur_time, &anno_time, &a)) {
             PrintRealTime(os, anno_time);
             PrintElapse(os, anno_time, last_time);
-            os << ' ' << a;
+            os << ' ';
+            if (span) {
+                const char* short_type = "SPAN";
+                if (span->type() == SPAN_TYPE_SERVER) {
+                    short_type = "Server";
+                } else if (span->type() == SPAN_TYPE_CLIENT) {
+                    short_type = "Client";
+                } else if (span->type() == SPAN_TYPE_BTHREAD) {
+                    short_type = "Bthread";
+                }
+                os << '[' << short_type << " SPAN#" << Hex(span->span_id()) << "] ";
+            }
+            os << WebEscape(a);
             if (a.empty() || butil::back_char(a) != '\n') {
                 os << '\n';
             }
@@ -202,12 +216,12 @@ static void PrintAnnotations(
 
 static bool PrintAnnotationsAndRealTimeSpan(
     std::ostream& os, int64_t cur_time, int64_t* last_time,
-    SpanInfoExtractor** extr, int num_extr) {
+    SpanInfoExtractor** extr, int num_extr, const RpczSpan* span) {
     if (cur_time == 0) {
         // the field was not set.
         return false;
     }
-    PrintAnnotations(os, cur_time, last_time, extr, num_extr);
+    PrintAnnotations(os, cur_time, last_time, extr, num_extr, span);
     PrintRealTime(os, cur_time);
     PrintElapse(os, cur_time, last_time);
     return true;
@@ -237,9 +251,10 @@ static void PrintClientSpan(
         extr[num_extr++] = server_extr;
     }
     extr[num_extr++] = &client_extr;
-    // start_send_us is always set for client spans.
-    CHECK(PrintAnnotationsAndRealTimeSpan(os, span.start_send_real_us(),
-                                          last_time, extr, num_extr));
+    if (!PrintAnnotationsAndRealTimeSpan(os, span.start_send_real_us(),
+                                           last_time, extr, num_extr, &span)) {
+        os << " start_send_real_us:not-set";
+    }
     const Protocol* protocol = FindProtocol(span.protocol());
     const char* protocol_name = (protocol ? protocol->name : "Unknown");
     const butil::EndPoint remote_side(butil::int2ip(span.remote_ip()), span.remote_port());
@@ -247,7 +262,7 @@ static void PrintClientSpan(
     if (abs_remote_side.ip == loopback_ip) {
         abs_remote_side.ip = butil::my_ip();
     }
-    os << " Requesting " << span.full_method_name() << '@' << remote_side
+    os << " Requesting " << WebEscape(span.full_method_name()) << '@' << remote_side
        << ' ' << protocol_name << ' ' << LOG_ID_STR << '=';
     if (FLAGS_rpcz_hex_log_id) {
         os << Hex(span.log_id());
@@ -269,12 +284,12 @@ static void PrintClientSpan(
     os << std::endl;
 
     if (PrintAnnotationsAndRealTimeSpan(os, span.sent_real_us(),
-                                        last_time, extr, num_extr)) {
-        os << " Requested(" << span.request_size() << ") [1]" << std::endl;
+                                        last_time, extr, num_extr, &span)) {
+        os << " [Client SPAN#" << Hex(span.span_id()) << "] Requested(" << span.request_size() << ") [1]" << std::endl;
     }
     if (PrintAnnotationsAndRealTimeSpan(os, span.received_real_us(),
-                                        last_time, extr, num_extr)) {
-        os << " Received response(" << span.response_size() << ")";
+                                        last_time, extr, num_extr, &span)) {
+        os << " [Client SPAN#" << Hex(span.span_id()) << "] Received response(" << span.response_size() << ")";
         if (span.base_cid() != 0 && span.ending_cid() != 0) {
             int64_t ver = span.ending_cid() - span.base_cid();
             if (ver >= 1) {
@@ -287,26 +302,45 @@ static void PrintClientSpan(
     }
 
     if (PrintAnnotationsAndRealTimeSpan(os, span.start_parse_real_us(),
-                                        last_time, extr, num_extr)) {
-        os << " Processing the response in a new bthread" << std::endl;
+                                        last_time, extr, num_extr, &span)) {
+        os << " [Client SPAN#" << Hex(span.span_id()) << "] Processing the response in a new bthread" << std::endl;
     }
 
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.start_callback_real_us(),
-            last_time, extr, num_extr)) {
-        os << (span.async() ? " Enter user's done" : " Back to user's callsite") << std::endl;
+            last_time, extr, num_extr, &span)) {
+        os << " [Client SPAN#" << Hex(span.span_id()) << "] " << (span.async() ? " Enter user's done" : " Back to user's callsite") << std::endl;
     }
 
     PrintAnnotations(os, std::numeric_limits<int64_t>::max(),
-                     last_time, extr, num_extr);
+                     last_time, extr, num_extr, &span);
 }
 
 static void PrintClientSpan(std::ostream& os,const RpczSpan& span,
                             bool use_html) {
     int64_t last_time = span.start_send_real_us();
-    PrintClientSpan(os, span, &last_time, NULL, use_html);
+    PrintClientSpan(os, span, &last_time, nullptr, use_html);
 }
 
+static void PrintBthreadSpan(std::ostream& os, const RpczSpan& span, int64_t* last_time,
+                             SpanInfoExtractor* server_extr, bool use_html) {
+    SpanInfoExtractor client_extr(span.info().c_str());
+    int num_extr = 0;
+    SpanInfoExtractor* extr[2];
+    if (server_extr) {
+        extr[num_extr++] = server_extr;
+    }
+    extr[num_extr++] = &client_extr;
+
+    // Print span id for bthread span context identification
+    os << " [Bthread SPAN#" << Hex(span.span_id());
+    if (span.parent_span_id() != 0) {
+        os << " parent#" << Hex(span.parent_span_id());
+    }
+    os << "] ";
+
+    PrintAnnotations(os, std::numeric_limits<int64_t>::max(), last_time, extr, num_extr, &span);
+}
 
 static void PrintServerSpan(std::ostream& os, const RpczSpan& span,
                             bool use_html) {
@@ -335,42 +369,46 @@ static void PrintServerSpan(std::ostream& os, const RpczSpan& span,
     os << std::endl;
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.start_parse_real_us(),
-            &last_time, extr, ARRAY_SIZE(extr))) {
-        os << " Processing the request in a new bthread" << std::endl;
+            &last_time, extr, ARRAY_SIZE(extr), &span)) {
+        os << " [Server SPAN#" << Hex(span.span_id()) << "] Processing the request in a new bthread" << std::endl;
     }
 
     bool entered_user_method = false;
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.start_callback_real_us(),
-            &last_time, extr, ARRAY_SIZE(extr))) {
+            &last_time, extr, ARRAY_SIZE(extr), &span)) {
         entered_user_method = true;
-        os << " Enter " << span.full_method_name() << std::endl;
+        os << " [Server SPAN#" << Hex(span.span_id()) << "] Enter " << WebEscape(span.full_method_name()) << std::endl;
     }
 
     const int nclient = span.client_spans_size();
     for (int i = 0; i < nclient; ++i) {
-        PrintClientSpan(os, span.client_spans(i), &last_time,
-                        &server_extr, use_html);
+        auto& client_span = span.client_spans(i);
+        if (client_span.type() == SPAN_TYPE_CLIENT) {
+            PrintClientSpan(os, client_span, &last_time, &server_extr, use_html);
+        } else {
+            PrintBthreadSpan(os, client_span, &last_time, &server_extr, use_html);
+        }
     }
 
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.start_send_real_us(),
-            &last_time, extr, ARRAY_SIZE(extr))) {
+            &last_time, extr, ARRAY_SIZE(extr), &span)) {
         if (entered_user_method) {
-            os << " Leave " << span.full_method_name() << std::endl;
+            os << " [Server SPAN#" << Hex(span.span_id()) << "] Leave " << WebEscape(span.full_method_name()) << std::endl;
         } else {
-            os << " Responding" << std::endl;
+            os << " [Server SPAN#" << Hex(span.span_id()) << "] Responding" << std::endl;
         }
     }
     
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.sent_real_us(),
-            &last_time, extr, ARRAY_SIZE(extr))) {
-        os << " Responded(" << span.response_size() << ')' << std::endl;
+            &last_time, extr, ARRAY_SIZE(extr), &span)) {
+        os << " [Server SPAN#" << Hex(span.span_id()) << "] Responded(" << span.response_size() << ')' << std::endl;
     }
 
     PrintAnnotations(os, std::numeric_limits<int64_t>::max(),
-                     &last_time, extr, ARRAY_SIZE(extr));
+                      &last_time, extr, ARRAY_SIZE(extr), &span);
 }
 
 class RpczSpanFilter : public SpanFilter {
@@ -427,14 +465,14 @@ static int64_t ParseDateTime(const std::string& time_str) {
     struct tm timeinfo;
     int64_t microseconds = 999999;
     char* endptr = strptime(time_str.c_str(), "%Y/%m/%d-%H:%M:%S", &timeinfo);
-    if (endptr == NULL) {
+    if (endptr == nullptr) {
         time_t now;
         time(&now);
-        if (localtime_r(&now, &timeinfo) == NULL) {
+        if (localtime_r(&now, &timeinfo) == nullptr) {
             return -1;
         }
         endptr = strptime(time_str.c_str(), "%H:%M:%S", &timeinfo);
-        if (endptr == NULL) {
+        if (endptr == nullptr) {
             return -1;
         }
     } 
@@ -449,11 +487,11 @@ static int64_t ParseDateTime(const std::string& time_str) {
 }
 
 static bool ParseUint64(const std::string* str, uint64_t* val) {
-    if (NULL == str) {
+    if (nullptr == str) {
         return false;
     }
     const char* p = str->c_str();
-    char* endptr = NULL;
+    char* endptr = nullptr;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
         *val = strtoull(p + 2, &endptr, 16);
         return (*endptr == '\0');
@@ -563,12 +601,13 @@ void RpczService::default_method(::google::protobuf::RpcController* cntl_base,
         const std::string* time_str =
             cntl->http_request().uri().GetQuery(TIME_STR);
         int64_t start_tm;
-        if (time_str == NULL) {
+        if (time_str == nullptr) {
             start_tm = butil::gettimeofday_us();
         } else {
             start_tm = ParseDateTime(*time_str);
             if (start_tm < 0) {
-                os << "Invalid " << TIME_STR << "=`" << time_str << '\''
+                os << "Invalid " << TIME_STR << "=`"
+                   << (use_html ? WebEscape(*time_str) : *time_str) << '\''
                    << (use_html ? "</body></html>" : "");
                 os.move_to(cntl->response_attachment());
                 return;
@@ -663,7 +702,7 @@ void RpczService::default_method(::google::protobuf::RpcController* cntl_base,
             } else {
                 os << span.log_id();
             }
-            os << ' ' << span.full_method_name() << '(' << span.request_size()
+            os << ' ' << WebEscape(span.full_method_name()) << '(' << span.request_size()
                << ")=" << span.response_size();
             
             if (span.error_code() == 0) {

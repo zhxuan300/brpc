@@ -1,9 +1,25 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // Date: 2015/03/31 14:50:20
 
 
 #include <gtest/gtest.h>
+#include <memory>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
@@ -20,11 +36,11 @@ void BuildDependency(const FileDescriptor *file_desc, DescriptorPool *pool) {
         BuildDependency(fd, pool);
         FileDescriptorProto proto;
         fd->CopyTo(&proto);
-        ASSERT_TRUE(pool->BuildFile(proto) != NULL);
+        ASSERT_TRUE(pool->BuildFile(proto) != nullptr);
     }
     FileDescriptorProto proto;
     file_desc->CopyTo(&proto);
-    ASSERT_TRUE(pool->BuildFile(proto) != NULL);
+    ASSERT_TRUE(pool->BuildFile(proto) != nullptr);
 }
 
 TEST(ProtoTest, proto) {
@@ -37,14 +53,14 @@ TEST(ProtoTest, proto) {
     FileDescriptorProto file_desc_proto;
     file_desc->CopyTo(&file_desc_proto);
     const FileDescriptor *new_file_desc = pool.BuildFile(file_desc_proto);
-    ASSERT_TRUE(new_file_desc != NULL);
+    ASSERT_TRUE(new_file_desc != nullptr);
     const Descriptor *new_desc = new_file_desc->FindMessageTypeByName(desc->name());
-    ASSERT_TRUE(new_desc != NULL);
+    ASSERT_TRUE(new_desc != nullptr);
     meta.set_correlation_id(123);
     std::string data;
     ASSERT_TRUE(meta.SerializeToString(&data));
-    Message *msg = factory.GetPrototype(new_desc)->New();
-    ASSERT_TRUE(msg != NULL);
+    std::unique_ptr<Message> msg(factory.GetPrototype(new_desc)->New());
+    ASSERT_TRUE(msg != nullptr);
     ASSERT_TRUE(msg->ParseFromString(data));
     ASSERT_TRUE(msg->SerializeToString(&data));
     policy::RpcMeta new_meta;

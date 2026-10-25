@@ -1,74 +1,120 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2014/09/22 19:04:47
 
 #include <pthread.h>
-#include <set>                                  // std::set
-#include <fstream>                              // std::ifstream
-#include <sstream>                              // std::ostringstream
+#include <set>                                   // std::set
+#include <fstream>                               // std::ifstream
+#include <sstream>                               // std::ostringstream
 #include <gflags/gflags.h>
 #include "butil/macros.h"                        // BAIDU_CASSERT
 #include "butil/containers/flat_map.h"           // butil::FlatMap
+#include "butil/memory/scope_guard.h"
 #include "butil/scoped_lock.h"                   // BAIDU_SCOPE_LOCK
 #include "butil/string_splitter.h"               // butil::StringSplitter
-#include "butil/strings/string_split.h"          // butil::SplitStringIntoKeyValuePairs
 #include "butil/errno.h"                         // berror
+#include "butil/float_util.h"                    // butil::IsFinite
 #include "butil/time.h"                          // milliseconds_from_now
 #include "butil/file_util.h"                     // butil::FilePath
+#include "butil/threading/platform_thread.h"
+#include "butil/reloadable_flags.h"
+#include "butil/strings/string_number_conversions.h" // butil::DoubleToString
 #include "bvar/gflag.h"
 #include "bvar/variable.h"
+#include "bvar/mvariable.h"
 
 namespace bvar {
 
+namespace detail {
+
+std::string prometheus_double_to_string(double value) {
+    if (BAIDU_UNLIKELY(!butil::IsFinite(value))) {
+        if (butil::IsNaN(value)) {
+            return "NaN";
+        }
+        return value > 0 ? "+Inf" : "-Inf";
+    }
+    std::string result = butil::DoubleToString(value);
+    size_t decimal = !result.empty() && result[0] == '-' ? 1 : 0;
+    if (decimal < result.size() && result[decimal] == '.') {
+        result.insert(decimal, 1, '0');
+    }
+    return result;
+}
+
+}  // namespace detail
+
 DEFINE_bool(save_series, true,
-            "Save values of last 60 seconds, last 60 minutes,"
-            " last 24 hours and last 30 days for ploting");
+            "Save values of last 60 seconds, last 60 minutes, "
+            "last 24 hours and last 30 days for plotting");
 
 DEFINE_bool(quote_vector, true,
             "Quote description of Vector<> to make it valid to noah");
 
-DEFINE_bool(bvar_abort_on_same_name, false,
-            "Abort when names of bvar are same");
 // Remember abort request before bvar_abort_on_same_name is initialized.
-static bool s_bvar_may_abort = false;
+bool s_bvar_may_abort = false;
 static bool validate_bvar_abort_on_same_name(const char*, bool v) {
-    if (v && s_bvar_may_abort) {
-        // Name conflict happens before handling args of main(), this is
-        // generally caused by global bvar.
-        LOG(FATAL) << "Abort due to name conflict";
-        abort();
-    }
+    RELEASE_ASSERT_VERBOSE(!v || !s_bvar_may_abort, "Abort due to name conflict");
     return true;
 }
-const bool ALLOW_UNUSED dummy_bvar_abort_on_same_name = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_abort_on_same_name, validate_bvar_abort_on_same_name);
+DEFINE_bool(bvar_abort_on_same_name, false, "Abort when names of bvar are same");
+BUTIL_VALIDATE_GFLAG(bvar_abort_on_same_name, validate_bvar_abort_on_same_name);
 
 
-DEFINE_bool(bvar_log_dumpped,  false,
-            "[For debugging] print dumpped info"
-            " into logstream before call Dumpper");
+DEFINE_bool(bvar_log_dumpped,  false, "[For debugging] print dumpped info "
+                                      "into logstream before call Dumpper");
+BUTIL_VALIDATE_GFLAG(bvar_log_dumpped, butil::PassValidate);
+
+DEFINE_bool(bvar_dump, false, "Create a background thread dumping all bvar periodically, "
+                              "all bvar_dump_* flags are not effective when this flag is off");
+DEFINE_int32(bvar_dump_interval, 10, "Seconds between consecutive dump");
+DEFINE_string(bvar_dump_file, "monitor/bvar.<app>.data",
+              "Dump bvar into this file, not settable at runtime");
+DEFINE_string(bvar_dump_include, "", "Dump bvar matching these wildcards, separated "
+                                     "by semicolon(;), empty means including all");
+DEFINE_string(bvar_dump_exclude, "", "Dump bvar excluded from these wildcards, "
+                                     "separated by semicolon(;), empty means no exclusion");
+DEFINE_string(bvar_dump_prefix, "<app>", "Every dumped name starts with this prefix");
+DEFINE_string(bvar_dump_tabs, "latency=*_latency*"
+                              ";qps=*_qps*"
+                              ";error=*_error*"
+                              ";system=*process_*,*malloc_*,*kernel_*",
+              "Dump bvar into different tabs according to the filters (separated by semicolon), "
+              "format: *(tab_name=wildcards;), not settable at runtime");
+
+DEFINE_bool(mbvar_dump, false, "Create a background thread dumping(shares the same thread as "
+                               "bvar_dump) all mbvar periodically, all mbvar_dump_* flags are "
+                               "not effective when this flag is off");
+DEFINE_string(mbvar_dump_file, "monitor/mbvar.<app>.data",
+              "Dump mbvar into this file, not settable at runtime");
+DEFINE_string(mbvar_dump_prefix, "<app>", "Every dumped name starts with this prefix");
+DEFINE_string(mbvar_dump_format, "common", "Dump mbvar write format");
 
 const size_t SUB_MAP_COUNT = 32;  // must be power of 2
 BAIDU_CASSERT(!(SUB_MAP_COUNT & (SUB_MAP_COUNT - 1)), must_be_power_of_2);
 
 class VarEntry {
 public:
-    VarEntry() : var(NULL), display_filter(DISPLAY_ON_ALL) {}
+    VarEntry() : display_filter(DISPLAY_ON_ALL) {}
 
-    Variable* var;
+    // Indirection handle shared with the Variable. describe_exposed() acquires
+    // it under the VarMap lock and calls describe() outside the lock.
+    Variable::SharedExposedRef ref;
     DisplayFilter display_filter;
 };
 
@@ -78,19 +124,17 @@ struct VarMapWithLock : public VarMap {
     pthread_mutex_t mutex;
 
     VarMapWithLock() {
-        CHECK_EQ(0, init(1024, 80));
-        pthread_mutexattr_t attr;
-        pthread_mutexattr_init(&attr);
-        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&mutex, &attr);
-        pthread_mutexattr_destroy(&attr);
+        if (init(1024) != 0) {
+            LOG(WARNING) << "Fail to init VarMap";
+        }
+        pthread_mutex_init(&mutex, nullptr);
     }
 };
 
 // We have to initialize global map on need because bvar is possibly used
 // before main().
 static pthread_once_t s_var_maps_once = PTHREAD_ONCE_INIT;
-static VarMapWithLock* s_var_maps = NULL;
+static VarMapWithLock* s_var_maps = nullptr;
 
 static void init_var_maps() {
     // It's probably slow to initialize all sub maps, but rpc often expose 
@@ -103,7 +147,8 @@ inline size_t sub_map_index(const std::string& str) {
         return 0;
     }
     size_t h = 0;
-    // we're assume that str is ended with '\0', which may not be in general
+    // We assume that str is ended with '\0', which may not be in general;
+    // otherwise the hash stops early.
     for (const char* p  = str.c_str(); *p; ++p) {
         h = h * 5 + *p;
     }
@@ -121,8 +166,8 @@ inline VarMapWithLock& get_var_map(const std::string& name) {
 }
 
 Variable::~Variable() {
-    CHECK(!hide()) << "Subclass of Variable MUST call hide() manually in their"
-        " dtors to avoid displaying a variable that is just destructing";
+    CHECK(!hide()) << "Subclass of Variable MUST call hide() manually in their "
+                      "dtors to avoid displaying a variable that is just destructing";
 }
 
 int Variable::expose_impl(const butil::StringPiece& prefix,
@@ -139,8 +184,12 @@ int Variable::expose_impl(const butil::StringPiece& prefix,
     // expose a variable more than once and calls to expose() are unlikely
     // to contend heavily.
 
-    // remove previous pointer from the map if needed.
+    // Remove previous exposure if needed (hide() waits for in-flight readers
+    // and invalidates `_ref`).
+    // Always start the new exposure with a fresh `_ref`,  because a previous
+    // hide() may have permanently hidden the old `_ref`.
     hide();
+    _ref = detail::make_exposed_ref(this);
 
     // Build the name.
     _name.clear();
@@ -152,22 +201,29 @@ int Variable::expose_impl(const butil::StringPiece& prefix,
         }
     }
     to_underscored_name(&_name, name);
-    
+
+    bool expose_succeeded = false;
+    BUTIL_SCOPE_EXIT {
+        if (!expose_succeeded) {
+            _name.clear();
+        }
+    };
+
     VarMapWithLock& m = get_var_map(_name);
     {
         BAIDU_SCOPED_LOCK(m.mutex);
         VarEntry* entry = m.seek(_name);
-        if (entry == NULL) {
+        if (entry == nullptr) {
             entry = &m[_name];
-            entry->var = this;
+            entry->ref = _ref;
             entry->display_filter = display_filter;
+            expose_succeeded = true;
             return 0;
         }
     }
-    if (FLAGS_bvar_abort_on_same_name) {
-        LOG(FATAL) << "Abort due to name conflict";
-        abort();
-    } else if (!s_bvar_may_abort) {
+    RELEASE_ASSERT_VERBOSE(!FLAGS_bvar_abort_on_same_name,
+                           "Abort due to name conflict");
+    if (!s_bvar_may_abort) {
         // Mark name conflict occurs, If this conflict happens before
         // initialization of bvar_abort_on_same_name, the validator will
         // abort the program if needed.
@@ -176,8 +232,11 @@ int Variable::expose_impl(const butil::StringPiece& prefix,
         
     LOG(ERROR) << "Already exposed `" << _name << "' whose value is `"
                << describe_exposed(_name) << '\'';
-    _name.clear();
     return -1;
+}
+
+bool Variable::is_hidden() const {
+    return _name.empty();
 }
 
 bool Variable::hide() {
@@ -185,12 +244,21 @@ bool Variable::hide() {
         return false;
     }
     VarMapWithLock& m = get_var_map(_name);
-    BAIDU_SCOPED_LOCK(m.mutex);
-    VarEntry* entry = m.seek(_name);
-    if (entry) {
-        CHECK_EQ(1UL, m.erase(_name));
-    } else {
-        CHECK(false) << "`" << _name << "' must exist";
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        VarEntry* entry = m.seek(_name);
+        if (entry) {
+            CHECK_EQ(1UL, m.erase(_name));
+        } else {
+            CHECK(false) << "`" << _name << "' must exist";
+        }
+    }
+    // Remove previous exposure if needed (hide() waits for in-flight readers
+    // and invalidates `_ref`).
+    // Always start the new exposure with a fresh `_ref`,  because a previous
+    // hide() may have permanently hidden the old `_ref`.
+    if (_ref != nullptr) {
+        _ref->hide_and_wait();
     }
     _name.clear();
     return true;
@@ -198,11 +266,11 @@ bool Variable::hide() {
 
 void Variable::list_exposed(std::vector<std::string>* names,
                             DisplayFilter display_filter) {
-    if (names == NULL) {
+    if (names == nullptr) {
         return;
     }
     names->clear();
-    if (names->size() < 32) {
+    if (names->capacity() < 32) {
         names->reserve(count_exposed());
     }
     VarMapWithLock* var_maps = get_var_maps();
@@ -245,15 +313,28 @@ int Variable::describe_exposed(const std::string& name, std::ostream& os,
                                bool quote_string,
                                DisplayFilter display_filter) {
     VarMapWithLock& m = get_var_map(name);
-    BAIDU_SCOPED_LOCK(m.mutex);
-    VarEntry* p = m.seek(name);
-    if (p == NULL) {
+    Variable* var = nullptr;
+    SharedExposedRef ref;
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        VarEntry* p = m.seek(name);
+        if (p == nullptr) {
+            return -1;
+        }
+        if (!(display_filter & p->display_filter)) {
+            return -1;
+        }
+        ref = p->ref;
+        var = ref->acquire();
+    }
+    if (var == nullptr) {
+        // The variable is being destructed.
         return -1;
     }
-    if (!(display_filter & p->display_filter)) {
-        return -1;
-    }
-    p->var->describe(os, quote_string);
+    // Call describe() outside the VarMap lock to avoid deadlock when the user
+    // callback (e.g. PassiveStatus) yields the bthread.
+    var->describe(os, quote_string);
+    ref->release();
     return 0;
 }
 
@@ -285,23 +366,44 @@ int Variable::describe_series_exposed(const std::string& name,
                                       std::ostream& os,
                                       const SeriesOptions& options) {
     VarMapWithLock& m = get_var_map(name);
-    BAIDU_SCOPED_LOCK(m.mutex);
-    VarEntry* p = m.seek(name);
-    if (p == NULL) {
+    Variable* var = nullptr;
+    SharedExposedRef ref;
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        VarEntry* p = m.seek(name);
+        if (p == nullptr) {
+            return -1;
+        }
+        ref = p->ref;
+        var = ref->acquire();
+    }
+    if (var == nullptr) {
         return -1;
     }
-    return p->var->describe_series(os, options);
+    const int rc = var->describe_series(os, options);
+    ref->release();
+    return rc;
 }
 
 #ifdef BAIDU_INTERNAL
 int Variable::get_exposed(const std::string& name, boost::any* value) {
     VarMapWithLock& m = get_var_map(name);
-    BAIDU_SCOPED_LOCK(m.mutex);
-    VarEntry* p = m.seek(name);
-    if (p == NULL) {
+    Variable* var = nullptr;
+    SharedExposedRef ref;
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        VarEntry* p = m.seek(name);
+        if (p == nullptr) {
+            return -1;
+        }
+        ref = p->ref;
+        var = ref->acquire();
+    }
+    if (var == nullptr) {
         return -1;
     }
-    p->var->get_value(value);
+    var->get_value(value);
+    ref->release();
     return 0;
 }
 #endif
@@ -313,11 +415,11 @@ int Variable::get_exposed(const std::string& name, boost::any* value) {
 // creation of std::string which allocates memory internally.
 class CharArrayStreamBuf : public std::streambuf {
 public:
-    explicit CharArrayStreamBuf() : _data(NULL), _size(0) {}
+    explicit CharArrayStreamBuf() : _data(nullptr), _size(0) {}
     ~CharArrayStreamBuf();
 
-    virtual int overflow(int ch);
-    virtual int sync();
+    int overflow(int ch) override;
+    int sync() override;
     void reset();
     butil::StringPiece data() {
         return butil::StringPiece(pbase(), pptr() - pbase());
@@ -338,8 +440,8 @@ int CharArrayStreamBuf::overflow(int ch) {
     }
     size_t new_size = std::max(_size * 3 / 2, (size_t)64);
     char* new_data = (char*)malloc(new_size);
-    if (BAIDU_UNLIKELY(new_data == NULL)) {
-        setp(NULL, NULL);
+    if (BAIDU_UNLIKELY(new_data == nullptr)) {
+        setp(nullptr, nullptr);
         return std::streambuf::traits_type::eof();
     }
     memcpy(new_data, _data, _size);
@@ -366,8 +468,8 @@ void CharArrayStreamBuf::reset() {
 // Written by Jack Handy
 // <A href="mailto:jakkhandy@hotmail.com">jakkhandy@hotmail.com</A>
 inline bool wildcmp(const char* wild, const char* str, char question_mark) {
-    const char* cp = NULL;
-    const char* mp = NULL;
+    const char* cp = nullptr;
+    const char* mp = nullptr;
 
     while (*str && *wild != '*') {
         if (*wild != *str && *wild != question_mark) {
@@ -412,7 +514,7 @@ public:
         std::string name;
         const char wc_pattern[3] = { '*', question_mark, '\0' };
         for (butil::StringMultiSplitter sp(wildcards.c_str(), ",;");
-             sp != NULL; ++sp) {
+             sp != nullptr; ++sp) {
             name.assign(sp.field(), sp.length());
             if (name.find_first_of(wc_pattern) != std::string::npos) {
                 if (_wcs.empty()) {
@@ -457,17 +559,82 @@ DumpOptions::DumpOptions()
     , display_filter(DISPLAY_ON_PLAIN_TEXT)
 {}
 
+bool Variable::dump(Dumper* dumper, const DumpOptions& options,
+                    const std::string& name) const {
+    CharArrayStreamBuf streambuf;
+    std::ostream os(&streambuf);
+    describe(os, options.quote_string);
+    return dumper->dump(name, streambuf.data());
+}
+
+// Dump the variable exposed as `name` into `dumper`.
+// Returns 1 if it was dumped, 0 if there's no such variable or
+// it's filtered out, -1 if `dumper` asked to stop.
+static int dump_exposed_one(Dumper* dumper,
+                            const DumpOptions& options,
+                            const std::string& name) {
+    VarMapWithLock& m = get_var_map(name);
+    Variable* var = nullptr;
+    Variable::SharedExposedRef ref;
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        VarEntry* p = m.seek(name);
+        if (p == nullptr) {
+            return 0;
+        }
+        if (!(options.display_filter & p->display_filter)) {
+            return 0;
+        }
+        ref = p->ref;
+        var = ref->acquire();
+    }
+    if (var == nullptr) {
+        // The variable is being destructed.
+        return 0;
+    }
+    // Dump outside the VarMap lock to avoid deadlock when the user callback
+    // (e.g. PassiveStatus) yields the bthread, same as describe_exposed().
+    bool ok = var->dump(dumper, options, name);
+    ref->release();
+    return ok ? 1 : -1;
+}
+
+// Tees everything going through the wrapped dumper into `info`, implementing
+// FLAGS_bvar_log_dumpped without duplicating the describe() of every variable.
+class LoggingDumper : public Dumper {
+public:
+    LoggingDumper(Dumper* dumper, std::ostringstream* info)
+        : _dumper(dumper), _info(info) {}
+
+    bool dump(const std::string& name,
+              const butil::StringPiece& desc) override {
+        (*_info) << '\n' << name << ": " << desc;
+        return _dumper->dump(name, desc);
+    }
+    bool dump_mvar(const std::string& name,
+                   const butil::StringPiece& desc) override {
+        (*_info) << '\n' << name << ": " << desc;
+        return _dumper->dump_mvar(name, desc);
+    }
+    bool dump_comment(const std::string& name,
+                      const std::string& type) override {
+        return _dumper->dump_comment(name, type);
+    }
+
+private:
+    Dumper* _dumper;
+    std::ostringstream* _info;
+};
+
 int Variable::dump_exposed(Dumper* dumper, const DumpOptions* poptions) {
-    if (NULL == dumper) {
-        LOG(ERROR) << "Parameter[dumper] is NULL";
+    if (nullptr == dumper) {
+        LOG(ERROR) << "Parameter[dumper] is nullptr";
         return -1;
     }
     DumpOptions opt;
     if (poptions) {
         opt = *poptions;
     }
-    CharArrayStreamBuf streambuf;
-    std::ostream os(&streambuf);
     int count = 0;
     WildcardMatcher black_matcher(opt.black_wildcards,
                                   opt.question_mark,
@@ -478,6 +645,8 @@ int Variable::dump_exposed(Dumper* dumper, const DumpOptions* poptions) {
 
     std::ostringstream dumpped_info;
     const bool log_dummped = FLAGS_bvar_log_dumpped;
+    LoggingDumper logging_dumper(dumper, &dumpped_info);
+    Dumper* d = log_dummped ? &logging_dumper : dumper;
 
     if (white_matcher.wildcards().empty() &&
         !white_matcher.exact_names().empty()) {
@@ -486,18 +655,11 @@ int Variable::dump_exposed(Dumper* dumper, const DumpOptions* poptions) {
              it != white_matcher.exact_names().end(); ++it) {
             const std::string& name = *it;
             if (!black_matcher.match(name)) {
-                if (bvar::Variable::describe_exposed(
-                        name, os, opt.quote_string, opt.display_filter) != 0) {
-                    continue;
-                }
-                if (log_dummped) {
-                    dumpped_info << '\n' << name << ": " << streambuf.data();
-                }
-                if (!dumper->dump(name, streambuf.data())) {
+                int rc = dump_exposed_one(d, opt, name);
+                if (rc < 0) {
                     return -1;
                 }
-                streambuf.reset();
-                ++count;
+                count += rc;
             }
         }
     } else {
@@ -506,22 +668,14 @@ int Variable::dump_exposed(Dumper* dumper, const DumpOptions* poptions) {
         bvar::Variable::list_exposed(&varnames, opt.display_filter);
         // Sort the names to make them more readable.
         std::sort(varnames.begin(), varnames.end());
-        for (std::vector<std::string>::const_iterator
-                 it = varnames.begin(); it != varnames.end(); ++it) {
+        for (auto it = varnames.begin(); it != varnames.end(); ++it) {
             const std::string& name = *it;
             if (white_matcher.match(name) && !black_matcher.match(name)) {
-                if (bvar::Variable::describe_exposed(
-                        name, os, opt.quote_string, opt.display_filter) != 0) {
-                    continue;
-                }
-                if (log_dummped) {
-                    dumpped_info << '\n' << name << ": " << streambuf.data();
-                }
-                if (!dumper->dump(name, streambuf.data())) {
+                int rc = dump_exposed_one(d, opt, name);
+                if (rc < 0) {
                     return -1;
                 }
-                streambuf.reset();
-                ++count;
+                count += rc;
             }
         }
     }
@@ -563,7 +717,7 @@ std::string read_command_name() {
 class FileDumper : public Dumper {
 public:
     FileDumper(const std::string& filename, butil::StringPiece s/*prefix*/)
-        : _filename(filename), _fp(NULL) {
+        : _filename(filename), _fp(nullptr) {
         // setting prefix.
         // remove trailing spaces.
         const char* p = s.data() + s.size();
@@ -584,11 +738,13 @@ public:
     void close() {
         if (_fp) {
             fclose(_fp);
-            _fp = NULL;
+            _fp = nullptr;
         }
     }
-    bool dump(const std::string& name, const butil::StringPiece& desc) {
-        if (_fp == NULL) {
+
+protected:
+    bool dump_impl(const std::string& name, const butil::StringPiece& desc, const std::string& separator) {
+        if (_fp == nullptr) {
             butil::File::Error error;
             butil::FilePath dir = butil::FilePath(_filename).DirName();
             if (!butil::CreateDirectoryAndGetError(dir, &error)) {
@@ -597,14 +753,15 @@ public:
                 return false;
             }
             _fp = fopen(_filename.c_str(), "w");
-            if (NULL == _fp) {
+            if (nullptr == _fp) {
                 LOG(ERROR) << "Fail to open " << _filename;
                 return false;
             }
         }
-        if (fprintf(_fp, "%.*s%.*s : %.*s\r\n",
+        if (fprintf(_fp, "%.*s%.*s %.*s %.*s\r\n",
                     (int)_prefix.size(), _prefix.data(),
                     (int)name.size(), name.data(),
+                    (int)separator.size(), separator.data(),
                     (int)desc.size(), desc.data()) < 0) {
             PLOG(ERROR) << "Fail to write into " << _filename;
             return false;
@@ -612,10 +769,44 @@ public:
         return true;
     }
 private:
-
     std::string _filename;
     FILE* _fp;
     std::string _prefix;
+};
+
+class CommonFileDumper : public FileDumper {
+public:
+    CommonFileDumper(const std::string& filename, butil::StringPiece prefix)
+        : FileDumper(filename, prefix)
+        , _separator(":") {}
+    bool dump(const std::string& name, const butil::StringPiece& desc) override {
+        return dump_impl(name, desc, _separator);
+    }
+    // -mbvar_dump is turned on to get the multiple dimension vars out, so the
+    // labels a sample carries in its name are what the file is there for.
+    bool dump_mvar(const std::string& name,
+                   const butil::StringPiece& desc) override {
+        return dump_impl(name, desc, _separator);
+    }
+private:
+    std::string _separator;
+};
+
+class PrometheusFileDumper : public FileDumper {
+public:
+    PrometheusFileDumper(const std::string& filename, butil::StringPiece prefix)
+        : FileDumper(filename, prefix)
+        , _separator(" ") {}
+    bool dump(const std::string& name, const butil::StringPiece& desc) override {
+        return dump_impl(name, desc, _separator);
+    }
+    // `name{label="value"} 3` is the prometheus text format this file holds.
+    bool dump_mvar(const std::string& name,
+                   const butil::StringPiece& desc) override {
+        return dump_impl(name, desc, _separator);
+    }
+private:
+    std::string _separator;
 };
 
 class FileDumperGroup : public Dumper {
@@ -627,22 +818,20 @@ public:
             // .data will be appended later
             path = path.RemoveFinalExtension();
         }
-        butil::StringPairs pairs;
-        pairs.reserve(8);
-        butil::SplitStringIntoKeyValuePairs(tabs, '=', ';', &pairs);
-        dumpers.reserve(pairs.size() + 1);
-        //matchers.reserve(pairs.size());
-        for (size_t i = 0; i < pairs.size(); ++i) {
-            FileDumper *f = new FileDumper(
-                    path.AddExtension(pairs[i].first).AddExtension("data").value(), s);
-            WildcardMatcher *m = new WildcardMatcher(pairs[i].second, '?', true);
-            dumpers.push_back(std::make_pair(f, m));
+
+        for (butil::KeyValuePairsSplitter sp(tabs, ';', '='); sp; ++sp) {
+            std::string key = sp.key().as_string();
+            std::string value = sp.value().as_string();
+            FileDumper *f = new CommonFileDumper(
+                    path.AddExtension(key).AddExtension("data").value(), s);
+            WildcardMatcher *m = new WildcardMatcher(value, '?', true);
+            dumpers.emplace_back(f, m);
         }
-        dumpers.push_back(std::make_pair(
-                    new FileDumper(path.AddExtension("data").value(), s), 
-                    (WildcardMatcher *)NULL));
+        dumpers.emplace_back(
+                    new CommonFileDumper(path.AddExtension("data").value(), s), 
+                    (WildcardMatcher *)nullptr);
     }
-    ~FileDumperGroup() {
+    ~FileDumperGroup() override {
         for (size_t i = 0; i < dumpers.size(); ++i) {
             delete dumpers[i].first;
             delete dumpers[i].second;
@@ -650,7 +839,7 @@ public:
         dumpers.clear();
     }
 
-    bool dump(const std::string& name, const butil::StringPiece& desc) {
+    bool dump(const std::string& name, const butil::StringPiece& desc) override {
         for (size_t i = 0; i < dumpers.size() - 1; ++i) {
             if (dumpers[i].second->match(name)) {
                 return dumpers[i].first->dump(name, desc);
@@ -658,6 +847,14 @@ public:
         }
         // dump to default file
         return dumpers.back().first->dump(name, desc);
+    }
+
+    // The samples of a Histogram belong in the dump file as much as any other
+    // value. They route by the same wildcards, which see the whole name
+    // including the labels.
+    bool dump_mvar(const std::string& name,
+                   const butil::StringPiece& desc) override {
+        return dump(name, desc);
     }
 private:
     std::vector<std::pair<FileDumper *, WildcardMatcher*> > dumpers;
@@ -667,23 +864,6 @@ static pthread_once_t dumping_thread_once = PTHREAD_ONCE_INIT;
 static bool created_dumping_thread = false;
 static pthread_mutex_t dump_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dump_cond = PTHREAD_COND_INITIALIZER;
-
-DEFINE_bool(bvar_dump, false,
-            "Create a background thread dumping all bvar periodically, "
-            "all bvar_dump_* flags are not effective when this flag is off");
-DEFINE_int32(bvar_dump_interval, 10, "Seconds between consecutive dump");
-DEFINE_string(bvar_dump_file, "monitor/bvar.<app>.data", "Dump bvar into this file");
-DEFINE_string(bvar_dump_include, "", "Dump bvar matching these wildcards, "
-              "separated by semicolon(;), empty means including all");
-DEFINE_string(bvar_dump_exclude, "", "Dump bvar excluded from these wildcards, "
-              "separated by semicolon(;), empty means no exclusion");
-DEFINE_string(bvar_dump_prefix, "<app>", "Every dumped name starts with this prefix");
-DEFINE_string(bvar_dump_tabs, "latency=*_latency*"
-                              "; qps=*_qps*"
-                              "; error=*_error*"
-                              "; system=*process_*,*malloc_*,*kernel_*",
-              "Dump bvar into different tabs according to the filters (seperated by semicolon), "
-              "format: *(tab_name=wildcards;)");
 
 #if !defined(BVAR_NOT_LINK_DEFAULT_VARIABLES)
 // Expose bvar-releated gflags so that they're collected by noah.
@@ -695,35 +875,54 @@ static GFlag s_gflag_bvar_dump_interval("bvar_dump_interval");
 static void* dumping_thread(void*) {
     // NOTE: this variable was declared as static <= r34381, which was
     // destructed when program exits and caused coredumps.
+    butil::PlatformThread::SetNameSimple("bvar_dumper");
     const std::string command_name = read_command_name();
     std::string last_filename;
+    std::string mbvar_last_filename;
     while (1) {
         // We can't access string flags directly because it's thread-unsafe.
         std::string filename;
         DumpOptions options;
         std::string prefix;
         std::string tabs;
-        if (!GFLAGS_NS::GetCommandLineOption("bvar_dump_file", &filename)) {
+        std::string mbvar_filename;
+        std::string mbvar_prefix;
+        std::string mbvar_format;
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_file", &filename)) {
             LOG(ERROR) << "Fail to get gflag bvar_dump_file";
-            return NULL;
+            return nullptr;
         }
-        if (!GFLAGS_NS::GetCommandLineOption("bvar_dump_include",
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_include",
                                           &options.white_wildcards)) {
             LOG(ERROR) << "Fail to get gflag bvar_dump_include";
-            return NULL;
+            return nullptr;
         }
-        if (!GFLAGS_NS::GetCommandLineOption("bvar_dump_exclude",
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_exclude",
                                           &options.black_wildcards)) {
             LOG(ERROR) << "Fail to get gflag bvar_dump_exclude";
-            return NULL;
+            return nullptr;
         }
-        if (!GFLAGS_NS::GetCommandLineOption("bvar_dump_prefix", &prefix)) {
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_prefix", &prefix)) {
             LOG(ERROR) << "Fail to get gflag bvar_dump_prefix";
-            return NULL;
+            return nullptr;
         }
-        if (!GFLAGS_NS::GetCommandLineOption("bvar_dump_tabs", &tabs)) {
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_tabs", &tabs)) {
             LOG(ERROR) << "Fail to get gflags bvar_dump_tabs";
-            return NULL;
+            return nullptr;
+        }
+
+        // We can't access string flags directly because it's thread-unsafe.
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump_file", &mbvar_filename)) {
+            LOG(ERROR) << "Fail to get gflag mbvar_dump_file";
+            return nullptr;
+        }
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump_prefix", &mbvar_prefix)) {
+            LOG(ERROR) << "Fail to get gflag mbvar_dump_prefix";
+            return nullptr;
+        }
+        if (!GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump_format", &mbvar_format)) {
+            LOG(ERROR) << "Fail to get gflag mbvar_dump_format";
+            return nullptr;
         }
 
         if (FLAGS_bvar_dump && !filename.empty()) {
@@ -752,6 +951,41 @@ static void* dumping_thread(void*) {
             }
         }
 
+        // Dump multi dimension bvar
+        if (FLAGS_mbvar_dump && !mbvar_filename.empty()) {
+            // Replace first <app> in filename with program name. We can't use
+            // pid because a same binary should write the data to the same 
+            // place, otherwise restarting of app may confuse noah with a lot 
+            // of *.data. noah takes 1.5 days to figure out that some data is
+            // outdated and to be removed.
+            const size_t pos = mbvar_filename.find("<app>");
+            if (pos != std::string::npos) {
+                mbvar_filename.replace(pos, 5/*<app>*/, command_name);
+            }
+            if (mbvar_last_filename != mbvar_filename) {
+                mbvar_last_filename = mbvar_filename;
+                LOG(INFO) << "Write all mbvar to " << mbvar_filename << " every "
+                << FLAGS_bvar_dump_interval << " seconds.";
+            }
+            const size_t pos2 = mbvar_prefix.find("<app>");
+            if (pos2 != std::string::npos) {
+                mbvar_prefix.replace(pos2, 5/*<app>*/, command_name);
+            }
+
+            Dumper* dumper = nullptr;
+            if ("common" == mbvar_format) {
+                dumper = new CommonFileDumper(mbvar_filename, mbvar_prefix);
+            } else if ("prometheus" == mbvar_format) {
+                dumper = new PrometheusFileDumper(mbvar_filename, mbvar_prefix);
+            }
+            int nline = MVariableBase::dump_exposed(dumper, &options);
+            if (nline < 0) {
+                LOG(ERROR) << "Fail to dump mvars into " << filename;
+            }
+            delete dumper;
+            dumper = nullptr;
+        }
+
         // We need to separate the sleeping into a long interruptible sleep
         // and a short uninterruptible sleep. Doing this because we wake up
         // this thread in gflag validators. If this thread dumps just after
@@ -772,7 +1006,7 @@ static void* dumping_thread(void*) {
 
 static void launch_dumping_thread() {
     pthread_t thread_id;
-    int rc = pthread_create(&thread_id, NULL, dumping_thread, NULL);
+    int rc = pthread_create(&thread_id, nullptr, dumping_thread, nullptr);
     if (rc != 0) {
         LOG(FATAL) << "Fail to launch dumping thread: " << berror(rc);
         return;
@@ -794,8 +1028,7 @@ static bool validate_bvar_dump(const char*, bool enabled) {
     }
     return true;
 }
-const bool ALLOW_UNUSED dummy_bvar_dump = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_dump, validate_bvar_dump);
+BUTIL_VALIDATE_GFLAG(bvar_dump, validate_bvar_dump);
 
 // validators (to make these gflags reloadable in brpc)
 static bool validate_bvar_dump_interval(const char*, int32_t v) {
@@ -809,12 +1042,7 @@ static bool validate_bvar_dump_interval(const char*, int32_t v) {
     }
     return true;
 }
-const bool ALLOW_UNUSED dummy_bvar_dump_interval = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_dump_interval, validate_bvar_dump_interval);
-
-static bool validate_bvar_log_dumpped(const char *, bool) { return true; }
-const bool ALLOW_UNUSED dummy_bvar_log_dumpped = ::GFLAGS_NS::RegisterFlagValidator(
-        &FLAGS_bvar_log_dumpped, validate_bvar_log_dumpped);
+BUTIL_VALIDATE_GFLAG(bvar_dump_interval, validate_bvar_dump_interval);
 
 static bool wakeup_dumping_thread(const char*, const std::string&) {
     // We're modifying a flag, wake up dumping_thread to generate
@@ -823,16 +1051,32 @@ static bool wakeup_dumping_thread(const char*, const std::string&) {
     return true;
 }
 
-const bool ALLOW_UNUSED dummy_bvar_dump_file = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_dump_file, wakeup_dumping_thread);
-const bool ALLOW_UNUSED dummy_bvar_dump_filter = ::GFLAGS_NS::RegisterFlagValidator(
+const bool ALLOW_UNUSED dummy_bvar_dump_filter = GFLAGS_NAMESPACE::RegisterFlagValidator(
     &FLAGS_bvar_dump_include, wakeup_dumping_thread);
-const bool ALLOW_UNUSED dummy_bvar_dump_exclude = ::GFLAGS_NS::RegisterFlagValidator(
+const bool ALLOW_UNUSED dummy_bvar_dump_exclude = GFLAGS_NAMESPACE::RegisterFlagValidator(
     &FLAGS_bvar_dump_exclude, wakeup_dumping_thread);
-const bool ALLOW_UNUSED dummy_bvar_dump_prefix = ::GFLAGS_NS::RegisterFlagValidator(
+const bool ALLOW_UNUSED dummy_bvar_dump_prefix = GFLAGS_NAMESPACE::RegisterFlagValidator(
     &FLAGS_bvar_dump_prefix, wakeup_dumping_thread);
-const bool ALLOW_UNUSED dummy_bvar_dump_tabs = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_dump_tabs, wakeup_dumping_thread);
+
+BUTIL_VALIDATE_GFLAG(mbvar_dump, validate_bvar_dump);
+const bool ALLOW_UNUSED dummy_mbvar_dump_prefix = GFLAGS_NAMESPACE::RegisterFlagValidator(
+    &FLAGS_mbvar_dump_prefix, wakeup_dumping_thread);
+
+static bool validate_mbvar_dump_format(const char*, const std::string& format) {
+    if (format != "common"
+        && format != "prometheus") {
+        LOG(ERROR) << "Invalid mbvar_dump_format=" << format;
+        return false;
+    }
+
+    // We're modifying a flag, wake up dumping_thread to generate
+    // a new file soon.
+    pthread_cond_signal(&dump_cond);
+    return true;
+}
+
+const bool ALLOW_UNUSED dummy_mbvar_dump_format = GFLAGS_NAMESPACE::RegisterFlagValidator(
+    &FLAGS_mbvar_dump_format, validate_mbvar_dump_format);
 
 void to_underscored_name(std::string* name, const butil::StringPiece& src) {
     name->reserve(name->size() + src.size() + 8/*just guess*/);

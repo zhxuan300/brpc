@@ -1,18 +1,20 @@
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2012-10-08 23:53:50
 
 // Merged chromium log and streaming log.
@@ -51,10 +53,27 @@
 #  define DPLOG_IF(...) DLOG_IF(__VA_ARGS__)
 #  define DPCHECK(...) DCHECK(__VA_ARGS__)
 #  define DVPLOG(...) DVLOG(__VA_ARGS__)
-# endif
+# endif // DCHECK_IS_ON()
+
+#ifndef LOG_BACKTRACE_IF
+#define LOG_BACKTRACE_IF(severity, condition) LOG_IF(severity, condition)
+#endif // LOG_BACKTRACE_IF
+
+#ifndef LOG_BACKTRACE_IF_ONCE
+#define LOG_BACKTRACE_IF_ONCE(severity, condition) LOG_IF_ONCE(severity, condition)
+#endif // LOG_BACKTRACE_IF_ONCE
+
+#ifndef LOG_BACKTRACE_FIRST_N
+#define LOG_BACKTRACE_FIRST_N(severity, N) LOG_FIRST_N(severity, N)
+#endif // LOG_BACKTRACE_FIRST_N
+
+#ifndef LOG_BACKTRACE_IF_FIRST_N
+#define LOG_BACKTRACE_IF_FIRST_N(severity, condition, N) LOG_IF_FIRST_N(severity, condition, N)
+#endif // LOG_BACKTRACE_IF_FIRST_N
+
 
 #define LOG_AT(severity, file, line)                                    \
-    google::LogMessage(file, line, google::severity).stream()
+    ::google::LogMessage(file, line, ::google::severity).stream()
 
 #else
 
@@ -99,7 +118,7 @@
 // parsing.
 //
 // The code for DebugMessage.exe is only one line. In WinMain, do:
-//   MessageBox(NULL, GetCommandLineW(), L"Fatal Error", 0);
+//   MessageBox(nullptr, GetCommandLineW(), L"Fatal Error", 0);
 //
 // If DebugMessage.exe is not found, the logging code will use a normal
 // MessageBox, potentially causing the problems discussed above.
@@ -202,15 +221,15 @@ namespace logging {
 
 // TODO(avi): do we want to do a unification of character types here?
 #if defined(OS_WIN)
-typedef wchar_t PathChar;
+typedef wchar_t LogChar;
 #else
-typedef char PathChar;
+typedef char LogChar;
 #endif
 
 // Where to record logging output? A flat file and/or system debug log
 // via OutputDebugString.
 enum LoggingDestination {
-    LOG_NONE                = 0,
+    LOG_TO_NONE             = 0,
     LOG_TO_FILE             = 1 << 0,
     LOG_TO_SYSTEM_DEBUG_LOG = 1 << 1,
 
@@ -243,7 +262,7 @@ struct BUTIL_EXPORT LoggingSettings {
     // The defaults values are:
     //
     //  logging_dest: LOG_DEFAULT
-    //  log_file:     NULL
+    //  log_file:     nullptr
     //  lock_log:     LOCK_LOG_FILE
     //  delete_old:   APPEND_TO_OLD_LOG_FILE
     LoggingSettings();
@@ -252,7 +271,7 @@ struct BUTIL_EXPORT LoggingSettings {
 
     // The three settings below have an effect only when LOG_TO_FILE is
     // set in |logging_dest|.
-    const PathChar* log_file;
+    const LogChar* log_file;
     LogLockingState lock_log;
     OldFileDeletionState delete_old;
 };
@@ -306,6 +325,11 @@ public:
     // Returns true to stop further processing.
     virtual bool OnLogMessage(int severity, const char* file, int line,
                               const butil::StringPiece& log_content) = 0;
+    virtual bool OnLogMessage(int severity, const char* file,
+                              int line, const char* /*func*/,
+                              const butil::StringPiece& log_content) {
+        return OnLogMessage(severity, file, line, log_content);
+    }
 private:
     DISALLOW_COPY_AND_ASSIGN(LogSink);
 };
@@ -317,11 +341,24 @@ private:
 // Returns previous sink.
 BUTIL_EXPORT LogSink* SetLogSink(LogSink* sink);
 
+// Print |content| with other info into |os|.
+void PrintLog(std::ostream& os,
+              int severity, const char* file, int line,
+              const butil::StringPiece& content);
+
+void PrintLog(std::ostream& os,
+              int severity, const char* file, int line,
+              const char* func, const butil::StringPiece& content);
+
 // The LogSink mainly for unit-testing. Logs will be appended to it.
 class StringSink : public LogSink, public std::string {
 public:
     bool OnLogMessage(int severity, const char* file, int line,
-                 const butil::StringPiece& log_content);
+                      const butil::StringPiece& log_content) override;
+
+    bool OnLogMessage(int severity, const char* file,
+                      int line, const char* func,
+                      const butil::StringPiece& log_content) override;
 private:
     butil::Lock _lock;
 };
@@ -358,7 +395,7 @@ const LogSeverity BLOG_DFATAL = BLOG_ERROR;
 // by LOG() and LOG_IF, etc. Since these are used all over our code, it's
 // better to have compact code for these operations.
 #define BAIDU_COMPACT_LOG_EX(severity, ClassName, ...)  \
-    ::logging::ClassName(__FILE__, __LINE__,            \
+    ::logging::ClassName(__FILE__, __LINE__,  __func__, \
     ::logging::BLOG_##severity, ##__VA_ARGS__)
 
 #define BAIDU_COMPACK_LOG(severity)             \
@@ -380,7 +417,7 @@ const LogSeverity BLOG_0 = BLOG_ERROR;
 // LOG_IS_ON(DFATAL) always holds in debug mode. In particular, CHECK()s will
 // always fire if they fail.
 #define LOG_IS_ON(severity)                                     \
-    (logging::BLOG_##severity >= ::logging::GetMinLogLevel())
+    (::logging::BLOG_##severity >= ::logging::GetMinLogLevel())
 
 #if defined(__GNUC__)
 // We emit an anonymous static int* variable at every VLOG_IS_ON(n) site.
@@ -411,8 +448,8 @@ DECLARE_int32(v);
 extern const int VLOG_UNINITIALIZED;
 
 // Called to initialize a VLOG callsite.
-bool add_vlog_site(const int** v, const PathChar* filename, int line_no,
-                   int required_v);
+bool add_vlog_site(const int** v, const LogChar* filename,
+                   int line_no, int required_v);
 
 class VLogSitePrinter {
 public:
@@ -448,6 +485,10 @@ void print_vlog_sites(VLogSitePrinter*);
     BAIDU_LAZY_STREAM(LOG_STREAM(severity), LOG_IS_ON(severity))
 #define LOG_IF(severity, condition)                                     \
     BAIDU_LAZY_STREAM(LOG_STREAM(severity), LOG_IS_ON(severity) && (condition))
+#ifndef LOG_BACKTRACE_IF
+#define LOG_BACKTRACE_IF(severity, condition)                               \
+    BAIDU_LAZY_STREAM(LOG_STREAM(severity).SetBacktrace(), LOG_IS_ON(severity) && (condition))
+#endif // LOG_BACKTRACE_IF
 
 // FIXME(gejun): Should always crash.
 #define LOG_ASSERT(condition)                                           \
@@ -469,15 +510,24 @@ void print_vlog_sites(VLogSitePrinter*);
 
 // file/line can be specified at running-time. This is useful for printing
 // logs with known file/line inside a LogSink or LogMessageHandler
-#define LOG_AT_STREAM(severity, file, line)                             \
-    ::logging::LogMessage(file, line, ::logging::BLOG_##severity).stream()
+#define LOG_AT_SELECTOR(_1, _2, _3, _4, NAME, ...) NAME
 
-#define LOG_AT(severity, file, line)                                    \
+#define LOG_AT_STREAM1(severity, file, line)                                 \
+    ::logging::LogMessage(file, line, ::logging::BLOG_##severity).stream()
+#define LOG_AT_STREAM2(severity, file, line, func)                           \
+    ::logging::LogMessage(file, line, func, ::logging::BLOG_##severity).stream()
+#define LOG_AT_STREAM(...) LOG_AT_SELECTOR(__VA_ARGS__, LOG_AT_STREAM2, LOG_AT_STREAM1)(__VA_ARGS__)
+
+#define LOG_AT1(severity, file, line)                                        \
     BAIDU_LAZY_STREAM(LOG_AT_STREAM(severity, file, line), LOG_IS_ON(severity))
+#define LOG_AT2(severity, file, line, func)                                   \
+    BAIDU_LAZY_STREAM(LOG_AT_STREAM(severity, file, line, func), LOG_IS_ON(severity))
+#define LOG_AT(...) LOG_AT_SELECTOR(__VA_ARGS__, LOG_AT2, LOG_AT1)(__VA_ARGS__)
+
 
 // The VLOG macros log with negative verbosities.
 #define VLOG_STREAM(verbose_level)                                      \
-    ::logging::LogMessage(__FILE__, __LINE__, -(verbose_level)).stream()
+    ::logging::LogMessage(__FILE__, __LINE__, __func__, -(verbose_level)).stream()
 
 #define VLOG(verbose_level)                                             \
     BAIDU_LAZY_STREAM(VLOG_STREAM(verbose_level), VLOG_IS_ON(verbose_level))
@@ -505,11 +555,11 @@ void print_vlog_sites(VLogSitePrinter*);
 
 #if defined (OS_WIN)
 #define VPLOG_STREAM(verbose_level)                                     \
-     ::logging::Win32ErrorLogMessage(__FILE__, __LINE__, -verbose_level, \
+     ::logging::Win32ErrorLogMessage(__FILE__, __LINE__, __func__, -verbose_level, \
                                      ::logging::GetLastSystemErrorCode()).stream()
 #elif defined(OS_POSIX)
 #define VPLOG_STREAM(verbose_level)                                     \
-    ::logging::ErrnoLogMessage(__FILE__, __LINE__, -verbose_level,      \
+    ::logging::ErrnoLogMessage(__FILE__, __LINE__, __func__, -verbose_level,      \
                                ::logging::GetLastSystemErrorCode()).stream()
 #endif
 
@@ -580,7 +630,7 @@ void print_vlog_sites(VLogSitePrinter*);
     if (std::string* _result =                                          \
         ::logging::Check##name##Impl((val1), (val2),                    \
                                      #val1 " " #op " " #val2))          \
-        ::logging::LogMessage(__FILE__, __LINE__, _result).stream().SetCheck()
+        ::logging::LogMessage(__FILE__, __LINE__, __func__, _result).stream().SetCheck()
 
 #endif
 
@@ -624,11 +674,11 @@ std::string* MakeCheckOpString<std::string, std::string>(
     template <class t1, class t2>                                       \
     inline std::string* Check##name##Impl(const t1& v1, const t2& v2,   \
                                           const char* names) {          \
-        if (v1 op v2) return NULL;                                      \
+        if (v1 op v2) return nullptr;                                      \
         else return MakeCheckOpString(v1, v2, names);                   \
     }                                                                   \
     inline std::string* Check##name##Impl(int v1, int v2, const char* names) { \
-        if (v1 op v2) return NULL;                                      \
+        if (v1 op v2) return nullptr;                                      \
         else return MakeCheckOpString(v1, v2, names);                   \
     }
 BAIDU_DEFINE_CHECK_OP_IMPL(EQ, ==)
@@ -808,7 +858,8 @@ const LogSeverity BLOG_DCHECK = BLOG_INFO;
             ::logging::Check##name##Impl((val1), (val2),                \
                                          #val1 " " #op " " #val2))      \
             ::logging::LogMessage(                                      \
-                __FILE__, __LINE__, ::logging::BLOG_DCHECK,             \
+                __FILE__, __LINE__, __func__,                           \
+                ::logging::BLOG_DCHECK,                                 \
                 _result).stream()
 
 // Equality/Inequality checks - compare two values, and log a
@@ -854,11 +905,11 @@ BUTIL_EXPORT std::string SystemErrorCodeToString(SystemErrorCode error_code);
 // creation of std::string which allocates memory internally.
 class CharArrayStreamBuf : public std::streambuf {
 public:
-    explicit CharArrayStreamBuf() : _data(NULL), _size(0) {}
-    ~CharArrayStreamBuf();
+    explicit CharArrayStreamBuf() : _data(nullptr), _size(0) {}
+    ~CharArrayStreamBuf() override;
 
-    virtual int overflow(int ch);
-    virtual int sync();
+    int overflow(int ch) override;
+    int sync() override;
     void reset();
 
 private:
@@ -872,8 +923,8 @@ class LogStream : virtual private CharArrayStreamBuf, public std::ostream {
 friend void DestroyLogStream(LogStream*);
 public:
     LogStream()
-        : std::ostream(this), _file("-"), _line(0), _severity(0)
-        , _noflush(false), _is_check(false) {
+        : std::ostream(this), _file("-"), _line(0), _func("-")
+        , _severity(0) , _noflush(false), _is_check(false), _backtrace(false) {
     }
 
     ~LogStream() {
@@ -896,7 +947,10 @@ public:
     }
 
     // Reset the log prefix: "I0711 15:14:01.830110 12735 server.cpp:93] "
-    LogStream& SetPosition(const PathChar* file, int line, LogSeverity);
+    LogStream& SetPosition(const LogChar* file, int line, LogSeverity);
+
+    // Reset the log prefix: "E0711 15:14:01.830110 12735 server.cpp:752 StartInternal] "
+    LogStream& SetPosition(const LogChar* file, int line, const LogChar* func, LogSeverity);
 
     // Make FlushIfNeed() no-op once.
     LogStream& DontFlushOnce() {
@@ -909,6 +963,11 @@ public:
         return *this;
     }
 
+    LogStream& SetBacktrace() {
+        _backtrace = true;
+        return *this;
+    }
+
     bool empty() const { return pbase() == pptr(); }
 
     butil::StringPiece content() const
@@ -917,8 +976,9 @@ public:
     std::string content_str() const
     { return std::string(pbase(), pptr() - pbase()); }
 
-    const PathChar* file() const { return _file; }
+    const LogChar* file() const { return _file; }
     int line() const { return _line; }
+    const LogChar* func() const { return _func; }
     LogSeverity severity() const { return _severity; }
 
 private:
@@ -938,14 +998,17 @@ private:
             clear();
             SetLastSystemErrorCode(err);
             _is_check = false;
+            _backtrace = false;
         }
     }
 
-    const PathChar* _file;
+    const LogChar* _file;
     int _line;
+    const LogChar* _func;
     LogSeverity _severity;
     bool _noflush;
     bool _is_check;
+    bool _backtrace;
 };
 
 // This class more or less represents a particular log message.  You
@@ -961,14 +1024,20 @@ class BUTIL_EXPORT LogMessage {
 public:
     // Used for LOG(severity).
     LogMessage(const char* file, int line, LogSeverity severity);
+    LogMessage(const char* file, int line, const char* func,
+               LogSeverity severity);
 
     // Used for CHECK_EQ(), etc. Takes ownership of the given string.
     // Implied severity = BLOG_FATAL.
     LogMessage(const char* file, int line, std::string* result);
+    LogMessage(const char* file, int line, const char* func,
+               std::string* result);
 
     // Used for DCHECK_EQ(), etc. Takes ownership of the given string.
     LogMessage(const char* file, int line, LogSeverity severity,
                std::string* result);
+    LogMessage(const char* file, int line, const char* func,
+               LogSeverity severity, std::string* result);
 
     ~LogMessage();
 
@@ -984,7 +1053,8 @@ private:
 // A non-macro interface to the log facility; (useful
 // when the logging level is not a compile-time constant).
 inline void LogAtLevel(int const log_level, const butil::StringPiece &msg) {
-    LogMessage(__FILE__, __LINE__, log_level).stream() << msg;
+    LogMessage(__FILE__, __LINE__, __func__,
+               log_level).stream() << msg;
 }
 
 // This class is used to explicitly ignore values in the conditional
@@ -1007,6 +1077,12 @@ public:
                          LogSeverity severity,
                          SystemErrorCode err);
 
+    Win32ErrorLogMessage(const char* file,
+                         int line,
+                         const char* func,
+                         LogSeverity severity,
+                         SystemErrorCode err);
+
     // Appends the error message before destructing the encapsulated class.
     ~Win32ErrorLogMessage();
 
@@ -1024,6 +1100,12 @@ class BUTIL_EXPORT ErrnoLogMessage {
 public:
     ErrnoLogMessage(const char* file,
                     int line,
+                    LogSeverity severity,
+                    SystemErrorCode err);
+
+    ErrnoLogMessage(const char* file,
+                    int line,
+                    const char* func,
                     LogSeverity severity,
                     SystemErrorCode err);
 
@@ -1105,7 +1187,7 @@ inline std::ostream& operator<<(std::ostream& out, const std::wstring& wstr) {
 // Select default policy: LOG(ERROR)
 #define NOTIMPLEMENTED_POLICY 4
 #endif
-#endif
+#endif // NOTIMPLEMENTED_POLICY
 
 #if defined(COMPILER_GCC)
 // On Linux, with GCC, we can use __PRETTY_FUNCTION__ to get the demangled name
@@ -1177,8 +1259,13 @@ inline std::ostream& operator<<(std::ostream& out, const std::wstring& wstr) {
 // Almost zero overhead when the log was printed.
 #ifndef LOG_ONCE
 # define LOG_ONCE(severity) LOG_FIRST_N(severity, 1)
+# define LOG_BACKTRACE_ONCE(severity) LOG_BACKTRACE_FIRST_N(severity, 1)
 # define LOG_IF_ONCE(severity, condition) LOG_IF_FIRST_N(severity, condition, 1)
-#endif
+#ifndef LOG_BACKTRACE_IF_ONCE
+# define LOG_BACKTRACE_IF_ONCE(severity, condition) \
+    LOG_BACKTRACE_IF_FIRST_N(severity, condition, 1)
+#endif // LOG_BACKTRACE_IF_ONCE
+#endif // LOG_ONCE
 
 // Print a log after every N calls. First call always prints.
 // Each call to this macro has a cost of relaxed atomic increment.
@@ -1188,7 +1275,7 @@ inline std::ostream& operator<<(std::ostream& out, const std::wstring& wstr) {
      BAIDU_LOG_IF_EVERY_N_IMPL(LOG_IF, severity, true, N)
 # define LOG_IF_EVERY_N(severity, condition, N)                  \
      BAIDU_LOG_IF_EVERY_N_IMPL(LOG_IF, severity, condition, N)
-#endif
+#endif // LOG_EVERY_N
 
 // Print logs for first N calls.
 // Almost zero overhead when the log was printed for N times
@@ -1196,9 +1283,17 @@ inline std::ostream& operator<<(std::ostream& out, const std::wstring& wstr) {
 #ifndef LOG_FIRST_N
 # define LOG_FIRST_N(severity, N)                                \
      BAIDU_LOG_IF_FIRST_N_IMPL(LOG_IF, severity, true, N)
+#ifndef LOG_BACKTRACE_FIRST_N
+# define LOG_BACKTRACE_FIRST_N(severity, N)                          \
+     BAIDU_LOG_IF_FIRST_N_IMPL(LOG_BACKTRACE_IF, severity, true, N)
+#endif // LOG_BACKTRACE_FIRST_N
 # define LOG_IF_FIRST_N(severity, condition, N)                  \
      BAIDU_LOG_IF_FIRST_N_IMPL(LOG_IF, severity, condition, N)
-#endif
+#ifndef LOG_BACKTRACE_IF_FIRST_N
+# define LOG_BACKTRACE_IF_FIRST_N(severity, condition, N)            \
+     BAIDU_LOG_IF_FIRST_N_IMPL(LOG_BACKTRACE_IF, severity, condition, N)
+#endif // LOG_BACKTRACE_IF_FIRST_N
+#endif // LOG_FIRST_N
 
 // Print a log every second. (not present in glog). First call always prints.
 // Each call to this macro has a cost of calling gettimeofday.
@@ -1207,33 +1302,33 @@ inline std::ostream& operator<<(std::ostream& out, const std::wstring& wstr) {
      BAIDU_LOG_IF_EVERY_SECOND_IMPL(LOG_IF, severity, true)
 # define LOG_IF_EVERY_SECOND(severity, condition)                \
      BAIDU_LOG_IF_EVERY_SECOND_IMPL(LOG_IF, severity, condition)
-#endif
+#endif // LOG_EVERY_SECOND
 
 #ifndef PLOG_EVERY_N
 # define PLOG_EVERY_N(severity, N)                               \
      BAIDU_LOG_IF_EVERY_N_IMPL(PLOG_IF, severity, true, N)
 # define PLOG_IF_EVERY_N(severity, condition, N)                 \
      BAIDU_LOG_IF_EVERY_N_IMPL(PLOG_IF, severity, condition, N)
-#endif
+#endif // PLOG_EVERY_N
 
 #ifndef PLOG_FIRST_N
 # define PLOG_FIRST_N(severity, N)                               \
      BAIDU_LOG_IF_FIRST_N_IMPL(PLOG_IF, severity, true, N)
 # define PLOG_IF_FIRST_N(severity, condition, N)                 \
      BAIDU_LOG_IF_FIRST_N_IMPL(PLOG_IF, severity, condition, N)
-#endif
+#endif // PLOG_FIRST_N
 
 #ifndef PLOG_ONCE
 # define PLOG_ONCE(severity) PLOG_FIRST_N(severity, 1)
 # define PLOG_IF_ONCE(severity, condition) PLOG_IF_FIRST_N(severity, condition, 1)
-#endif
+#endif // PLOG_ONCE
 
 #ifndef PLOG_EVERY_SECOND
 # define PLOG_EVERY_SECOND(severity)                             \
      BAIDU_LOG_IF_EVERY_SECOND_IMPL(PLOG_IF, severity, true)
 # define PLOG_IF_EVERY_SECOND(severity, condition)                       \
      BAIDU_LOG_IF_EVERY_SECOND_IMPL(PLOG_IF, severity, condition)
-#endif
+#endif // PLOG_EVERY_SECOND
 
 // DEBUG_MODE is for uses like
 //   if (DEBUG_MODE) foo.CheckThatFoo();

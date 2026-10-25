@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Jiashun Zhu(zhujiashun@baidu.com)
 
 #ifndef BAIDU_RPC_POLICY_HTTP2_RPC_PROTOCOL_H
 #define BAIDU_RPC_POLICY_HTTP2_RPC_PROTOCOL_H
@@ -37,7 +38,7 @@ class H2StreamContext;
 class H2ParseResult {
 public:
     explicit H2ParseResult(H2Error err, int stream_id)
-        : _msg(NULL), _err(err), _stream_id(stream_id) {}
+        : _msg(nullptr), _err(err), _stream_id(stream_id) {}
     explicit H2ParseResult(H2StreamContext* msg)
         : _msg(msg), _err(H2_NO_ERROR), _stream_id(0) {}
     
@@ -47,7 +48,7 @@ public:
     bool is_ok() const { return error() == H2_NO_ERROR; }
     int stream_id() const { return _stream_id; }
 
-    // definitely NULL when result is failed.
+    // definitely nullptr when result is failed.
     H2StreamContext* message() const { return _msg; }
  
 private:
@@ -164,20 +165,8 @@ private:
     void push(const std::string& name, const std::string& value)
     { new (&_list[_size++]) HPacker::Header(name, value); }
 
-    H2UnsentRequest(Controller* c)
-        : _nref(1)
-        , _size(0)
-        , _stream_id(0)
-        , _cntl(c) {
-#ifndef NDEBUG
-        get_h2_bvars()->h2_unsent_request_count << 1;
-#endif
-    }
-    ~H2UnsentRequest() {
-#ifndef NDEBUG
-        get_h2_bvars()->h2_unsent_request_count << -1;
-#endif
-    }
+    H2UnsentRequest(Controller* c);
+    ~H2UnsentRequest();
     H2UnsentRequest(const H2UnsentRequest&);
     void operator=(const H2UnsentRequest&);
     void Destroy();
@@ -233,7 +222,9 @@ public:
 
     // Decode headers in HPACK from *it and set into this->header(). The input
     // does not need to complete.
-    // Returns 0 on success, -1 otherwise.
+    // Returns 0 on success, -1 on a connection-level error. A message that is
+    // merely malformed or unacceptable does not fail here, it sets
+    // `_rejected_error` instead, see the comment on that field.
     int ConsumeHeaders(butil::IOBufBytesIterator& it);
     H2ParseResult OnEndStream();
 
@@ -243,6 +234,10 @@ public:
                           uint32_t frag_size, uint8_t pad_length);
     H2ParseResult OnContinuation(butil::IOBufBytesIterator&, const H2FrameHead&);
     H2ParseResult OnResetStream(H2Error h2_error, const H2FrameHead&);
+
+    // True if the accumulated HEADERS/CONTINUATION fragment has grown past the
+    // local max_header_list_size. Bound every place the fragment is appended.
+    bool HeaderFragmentTooLarge() const;
     
     uint64_t correlation_id() const { return _correlation_id; }
     void set_correlation_id(uint64_t cid) { _correlation_id = cid; }
@@ -256,8 +251,6 @@ public:
         }
         return _deferred_window_update.exchange(0, butil::memory_order_relaxed);
     }
-
-    bool ConsumeWindowSize(int64_t size);
 
 #if defined(BRPC_H2_STREAM_STATE)
     H2StreamState state() const { return _state; }
@@ -274,7 +267,27 @@ friend class H2Context;
     butil::atomic<int64_t> _remote_window_left;
     butil::atomic<int64_t> _deferred_window_update;
     uint64_t _correlation_id;
+    // Cumulative decoded size of the header list of this stream
+    // (name + value + 32 per field, RFC 7540 section 10.5.1), checked
+    // against the local max_header_list_size in ConsumeHeaders().
+    uint64_t _decoded_header_list_size;
+    // Set when this message must be refused although the connection itself is
+    // still healthy: it is malformed (invalid or unknown pseudo-header, RFC
+    // 9113 section 8.1.1 mandates a stream error of type PROTOCOL_ERROR) or it
+    // violates a local limit (too many headers, too many query parameters in
+    // :path). Only the stream is reset so that the other streams keep working,
+    // but the error cannot be raised where it is detected: HPACK keeps a
+    // dynamic table per connection, so leaving the rest of the block undecoded
+    // would desynchronize it from the encoding table of the peer and corrupt
+    // every header block that follows. RFC 9113 section 10.5.1: "The field
+    // block MUST be processed to ensure a consistent connection state, unless
+    // the connection is closed." Hence the rejection is remembered here and
+    // turned into a RST_STREAM once END_HEADERS is reached.
+    H2Error _rejected_error;
     butil::IOBuf _remaining_header_fragment;
+    // Request body which cannot be sent yet due to remote flow control.
+    // Accessed under H2Context::_stream_mutex.
+    butil::IOBuf _pending_data;
 };
 
 StreamCreator* get_h2_global_stream_creator();
@@ -316,9 +329,9 @@ public:
         butil::IOBufBytesIterator&, const H2FrameHead&);
 
     // main_socket: the socket owns this object as parsing_context
-    // server: NULL means client-side
+    // server: nullptr means client-side
     H2Context(Socket* main_socket, const Server* server);
-    ~H2Context();
+    ~H2Context() override;
     // Must be called before usage.
     int Init();
 
@@ -334,12 +347,16 @@ public:
     int AllocateClientStreamId();
     bool RunOutStreams() const;
     // Try to map stream_id to ctx if stream_id does not exist before
-    // Returns 0 on success, -1 on exist, 1 on goaway.
+    // Returns 0 on success, -1 on exist, 1 on goaway, 2 on exceeding
+    // the local max_concurrent_streams limit (server side).
     int TryToInsertStream(int stream_id, H2StreamContext* ctx);
-    size_t VolatilePendingStreamSize() const { return _pending_streams.size(); }
+    size_t VolatilePendingStreamSize() const;
+    bool PendingDataOvercrowded() const;
 
     HPacker& hpacker() { return _hpacker; }
-    const H2Settings& remote_settings() const { return _remote_settings; }
+    // Return a consistent snapshot because SETTINGS may be processed by the
+    // socket reader while a request is being packed by a writer.
+    H2Settings remote_settings() const;
     const H2Settings& local_settings() const { return _local_settings; }
 
     bool is_client_side() const { return _socket->CreatedByConnect(); }
@@ -369,11 +386,19 @@ friend void InitFrameHandlers();
     H2ParseResult OnWindowUpdate(butil::IOBufBytesIterator&, const H2FrameHead&);
     H2ParseResult OnContinuation(butil::IOBufBytesIterator&, const H2FrameHead&);
 
-    H2StreamContext* RemoveStream(int stream_id);
+    H2StreamContext* RemoveStreamAndDeferWU(int stream_id);
     void RemoveGoAwayStreams(int goaway_stream_id, std::vector<H2StreamContext*>* out_streams);
 
     H2StreamContext* FindStream(int stream_id);
-    void ClearAbandonedStreamsImpl();
+    // Atomically checks stream and pending-DATA limits, inserts the client
+    // stream, and appends DATA allowed by the current remote windows. On
+    // success, ownership of sctx is transferred to this context. On failure,
+    // no stream, window, or pending-DATA state is changed.
+    butil::Status TryToInsertClientStream(
+        int stream_id, H2StreamContext*, const butil::IOBuf&, butil::IOBuf*);
+    void AppendPendingDataLocked(H2StreamContext*, butil::IOBuf*);
+    void ClearPendingData(int stream_id);
+    bool FlushPendingData(int stream_id);
 
     // True if the connection is established by client, otherwise it's
     // accepted by server.
@@ -384,6 +409,7 @@ friend void InitFrameHandlers();
     uint32_t _last_sent_stream_id;
     int _goaway_stream_id;
     H2Settings _remote_settings;
+    bool _remote_settings_received;
     H2Settings _local_settings;
     H2Settings _unack_local_settings;
     HPacker _hpacker;
@@ -392,6 +418,9 @@ friend void InitFrameHandlers();
     typedef butil::FlatMap<int, H2StreamContext*> StreamMap;
     mutable butil::Mutex _stream_mutex;
     StreamMap _pending_streams;
+    // Total bytes retained in H2StreamContext::_pending_data on this
+    // connection. Accessed under _stream_mutex.
+    size_t _pending_data_size;
     butil::atomic<int64_t> _deferred_window_update;
 };
 

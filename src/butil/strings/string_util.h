@@ -11,6 +11,8 @@
 #include <stdarg.h>   // va_list
 
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "butil/base_export.h"
@@ -202,15 +204,24 @@ enum TrimPositions {
 BUTIL_EXPORT TrimPositions TrimWhitespace(const string16& input,
                                          TrimPositions positions,
                                          butil::string16* output);
+BUTIL_EXPORT TrimPositions TrimWhitespace(const butil::StringPiece16& input,
+                                         TrimPositions positions,
+                                         butil::StringPiece16* output);
 BUTIL_EXPORT TrimPositions TrimWhitespaceASCII(const std::string& input,
                                               TrimPositions positions,
                                               std::string* output);
+BUTIL_EXPORT TrimPositions TrimWhitespaceASCII(const butil::StringPiece& input,
+                                              TrimPositions positions,
+                                              butil::StringPiece* output);
 
 // Deprecated. This function is only for backward compatibility and calls
 // TrimWhitespaceASCII().
 BUTIL_EXPORT TrimPositions TrimWhitespace(const std::string& input,
                                          TrimPositions positions,
                                          std::string* output);
+BUTIL_EXPORT TrimPositions TrimWhitespace(const butil::StringPiece& input,
+                                         TrimPositions positions,
+                                         butil::StringPiece* output);
 
 // Searches  for CR or LF characters.  Removes all contiguous whitespace
 // strings that contain them.  This is useful when trying to deal with text
@@ -245,9 +256,27 @@ BUTIL_EXPORT bool ContainsOnlyChars(const StringPiece16& input,
 // to have the maximum 'discriminating' power from other encodings. If
 // there's a use case for just checking the structural validity, we have to
 // add a new function for that.
-BUTIL_EXPORT bool IsStringUTF8(const std::string& str);
+BUTIL_EXPORT bool IsStringUTF8(const StringPiece& str);
 BUTIL_EXPORT bool IsStringASCII(const StringPiece& str);
 BUTIL_EXPORT bool IsStringASCII(const string16& str);
+
+inline std::string EnsureString(const std::string& s) {
+    return s;
+}
+
+inline std::string EnsureString(std::string&& s) {
+    return std::move(s);
+}
+
+inline std::string EnsureString(const char* s) {
+    return s ? std::string(s) : std::string();
+}
+
+// Enabled only when std::string is constructible from T.
+template <typename T, typename = typename std::enable_if<std::is_constructible<std::string, T>::value>::type>
+inline std::string EnsureString(T&& v) {
+    return std::string(std::forward<T>(v));
+}
 
 }  // namespace butil
 
@@ -365,7 +394,11 @@ inline Char HexDigitToInt(Char c) {
 
 // Returns true if it's a whitespace character.
 inline bool IsWhitespace(wchar_t c) {
-  return wcschr(butil::kWhitespaceWide, c) != NULL;
+  return wcschr(butil::kWhitespaceWide, c) != nullptr;
+}
+
+inline bool IsBlankString(const butil::StringPiece &s) {
+    return butil::ContainsOnlyChars(s, " \r\n\t");
 }
 
 // Return a byte string in human-readable format with a unit suffix. Not
@@ -464,7 +497,7 @@ BUTIL_EXPORT butil::string16 JoinString(
 // Replace $1-$2-$3..$9 in the format string with |a|-|b|-|c|..|i| respectively.
 // Additionally, any number of consecutive '$' characters is replaced by that
 // number less one. Eg $$->$, $$$->$$, etc. The offsets parameter here can be
-// NULL. This only allows you to use up to nine replacements.
+// nullptr. This only allows you to use up to nine replacements.
 BUTIL_EXPORT butil::string16 ReplaceStringPlaceholders(
     const butil::string16& format_string,
     const std::vector<butil::string16>& subst,
@@ -475,7 +508,7 @@ BUTIL_EXPORT std::string ReplaceStringPlaceholders(
     const std::vector<std::string>& subst,
     std::vector<size_t>* offsets);
 
-// Single-string shortcut for ReplaceStringHolders. |offset| may be NULL.
+// Single-string shortcut for ReplaceStringHolders. |offset| may be nullptr.
 BUTIL_EXPORT butil::string16 ReplaceStringPlaceholders(
     const butil::string16& format_string,
     const butil::string16& a,

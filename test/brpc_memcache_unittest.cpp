@@ -1,15 +1,36 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Date: Thu Jun 11 14:30:07 CST 2015
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <iostream>
 #include "butil/time.h"
 #include "butil/logging.h"
 #include <brpc/memcache.h>
 #include <brpc/channel.h>
+#include <brpc/policy/memcache_binary_header.h>
+#include <brpc/policy/memcache_binary_protocol.h>
+#include <brpc/socket.h>
+#include <butil/iobuf.h>
+#include <butil/sys_byteorder.h>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 namespace brpc {
 DECLARE_int32(idle_timeout_second);
+DECLARE_uint64(max_body_size);
 } 
 
 int main(int argc, char* argv[]) {
@@ -19,6 +40,96 @@ int main(int argc, char* argv[]) {
 }
 
 namespace {
+
+TEST(MemcacheParserTest, RejectOversizedResponseBeforeBufferingBody) {
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 1024;
+
+    brpc::SocketId id;
+    brpc::SocketOptions options;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr socket;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &socket));
+
+    brpc::policy::MemcacheResponseHeader header = {};
+    header.magic = brpc::policy::MC_MAGIC_RESPONSE;
+    header.total_body_length = butil::HostToNet32(1025);
+    butil::IOBuf buf;
+    buf.append(&header, sizeof(header));
+    EXPECT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA,
+              brpc::policy::ParseMemcacheMessage(
+                  &buf, socket.get(), false, nullptr).error());
+
+}
+
+TEST(MemcacheParserTest, PopStoreRejectsNegativeValueSize) {
+    // A STORE error response whose extras_length + key_length exceeds
+    // total_body_length makes value_size negative. PopStore used to pass that
+    // straight to cutn(&_err, value_size); the negative value became a huge
+    // size_t and drained the rest of the (pipelined) buffer into the error
+    // string. The sibling parsers PopGet/PopCounter/PopVersion already guard
+    // value_size < 0; PopStore must do the same.
+    brpc::policy::MemcacheResponseHeader header = {};
+    header.magic = brpc::policy::MC_MAGIC_RESPONSE;
+    header.command = brpc::policy::MC_BINARY_SET;
+    header.status = 1;                 // non-zero: error response
+    header.extras_length = 1;          // claims extras...
+    header.key_length = 0;
+    header.total_body_length = 0;      // ...but body carries none -> value_size = -1
+
+    brpc::MemcacheResponse response;
+    response.raw_buffer().append(&header, sizeof(header));
+    // Bytes of a following pipelined response that must not leak into _err.
+    const char next_response[] = "SECRET-NEXT-RESPONSE";
+    response.raw_buffer().append(next_response, sizeof(next_response) - 1);
+
+    uint64_t cas_value = 0;
+    ASSERT_FALSE(response.PopSet(&cas_value));
+    ASSERT_EQ("value_size=-1 is negative", response.LastError());
+    ASSERT_EQ(std::string::npos, response.LastError().find("RESPONSE"));
+    // Only the declared message (header + total_body_length) is dropped, so the
+    // following pipelined response is still intact at the head of the buffer.
+    ASSERT_EQ(sizeof(next_response) - 1, response.raw_buffer().size());
+    ASSERT_EQ(next_response, response.raw_buffer().to_string());
+}
+
+TEST(MemcacheParserTest, SaslAuthDoesNotReadHeaderAfterPop) {
+    // ParseMemcacheMessage fetched the 24-byte response header (a pointer into
+    // source's front block), popped those bytes with source->pop_front(), and
+    // then still dereferenced header->command / header->status on the SASL_AUTH
+    // path. Once the header sat alone in the front block, pop_front released it
+    // and the two reads became a use-after-free. Put the header in a heap block
+    // that is freed the moment its bytes are popped so the stale read is a
+    // definite UAF (ASAN heap-use-after-free on the unpatched tree); the fix
+    // reads the already byte-swapped local_header instead.
+    brpc::SocketId id;
+    brpc::SocketOptions options;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr socket;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &socket));
+
+    // PopPipelinedInfo() must succeed to reach the SASL_AUTH branch.
+    brpc::PipelinedInfo pi;
+    pi.count = 1;
+    socket->PushPipelinedInfo(pi);
+
+    brpc::policy::MemcacheResponseHeader* header =
+        (brpc::policy::MemcacheResponseHeader*)malloc(sizeof(*header));
+    ASSERT_TRUE(header != NULL);
+    memset(header, 0, sizeof(*header));
+    header->magic = brpc::policy::MC_MAGIC_RESPONSE;
+    header->command = brpc::policy::MC_BINARY_SASL_AUTH;
+    header->status = butil::HostToNet16(1);  // non-zero: auth failure
+    header->total_body_length = 0;           // no body: header is the whole front block
+
+    butil::IOBuf buf;
+    buf.append_user_data(header, sizeof(*header), [](void* p) { free(p); });
+
+    brpc::ParseResult r = brpc::policy::ParseMemcacheMessage(
+        &buf, socket.get(), false, nullptr);
+    ASSERT_EQ(brpc::PARSE_ERROR_NO_RESOURCE, r.error());
+}
+
 static pthread_once_t download_memcached_once = PTHREAD_ONCE_INIT;
 static pid_t g_mc_pid = -1;
 
@@ -62,8 +173,8 @@ static void RunMemcached() {
     } else if (g_mc_pid == 0) {
         puts("[Starting memcached]");
         char* const argv[] = { (char*)MEMCACHED_BIN,
-                               (char*)"--port", (char*)MEMCACHED_PORT,
-                               NULL };
+                               (char*)"-p", (char*)MEMCACHED_PORT,
+                               nullptr };
         if (execvp(MEMCACHED_BIN, argv) < 0) {
             puts("Fail to run " MEMCACHED_BIN);
             exit(1);
@@ -99,14 +210,14 @@ TEST_F(MemcacheTest, sanity) {
     // Clear all contents in MC which is still holding older data after
     // restarting in Ubuntu 18.04 (mc=1.5.6)
     request.Flush(0);
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_TRUE(response.PopFlush());
 
     cntl.Reset();
     request.Clear();
     request.Get("hello");
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     std::string value;
     uint32_t flags = 0;
@@ -117,7 +228,7 @@ TEST_F(MemcacheTest, sanity) {
     cntl.Reset();
     request.Clear();
     request.Set("hello", "world", 0xdeadbeef, 10, 0);
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_TRUE(response.PopSet(&cas_value)) << response.LastError();
     ASSERT_EQ("", response.LastError());
@@ -125,7 +236,7 @@ TEST_F(MemcacheTest, sanity) {
     cntl.Reset();
     request.Clear();
     request.Get("hello");
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed());
     ASSERT_TRUE(response.PopGet(&value, &flags, &cas_value));
     ASSERT_EQ("", response.LastError());
@@ -137,7 +248,7 @@ TEST_F(MemcacheTest, sanity) {
     request.Clear();
     request.Set("hello", "world2", 0xdeadbeef, 10,
                 cas_value/*intended match*/);
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     uint64_t cas_value2 = 0;
     ASSERT_TRUE(response.PopSet(&cas_value2)) << response.LastError();
@@ -146,7 +257,7 @@ TEST_F(MemcacheTest, sanity) {
     request.Clear();
     request.Set("hello", "world3", 0xdeadbeef, 10,
                 cas_value2 + 1/*intended unmatch*/);
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     uint64_t cas_value3 = ~0;
     ASSERT_FALSE(response.PopSet(&cas_value3));
@@ -169,7 +280,7 @@ TEST_F(MemcacheTest, incr_and_decr) {
     request.Increment("counter1", 2, 10, 10);
     request.Decrement("counter1", 1, 10, 10);
     request.Increment("counter1", 3, 10, 10);
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     uint64_t new_value1 = 0;
     uint64_t cas_value1 = 0;
@@ -202,7 +313,7 @@ TEST_F(MemcacheTest, version) {
     brpc::MemcacheResponse response;
     brpc::Controller cntl;
     request.Version();
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     std::string version;
     ASSERT_TRUE(response.PopVersion(&version)) << response.LastError();

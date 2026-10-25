@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include "info_thread.h"
 
@@ -19,8 +22,8 @@ namespace brpc {
 InfoThread::InfoThread()
     : _stop(false)
     , _tid(0) {
-    pthread_mutex_init(&_mutex, NULL);
-    pthread_cond_init(&_cond, NULL);
+    pthread_mutex_init(&_mutex, nullptr);
+    pthread_cond_init(&_cond, nullptr);
 }
 
 InfoThread::~InfoThread() {
@@ -33,18 +36,18 @@ void InfoThread::run() {
     int64_t last_sent_count = 0;
     int64_t last_succ_count = 0;
     int64_t last_error_count = 0;
-    int64_t start_time = butil::gettimeofday_us();
+    int64_t start_time = butil::cpuwide_time_us();
     while (!_stop) {
         int64_t end_time = 0;
         while (!_stop &&
-               (end_time = butil::gettimeofday_us()) < start_time + 1000000L) {
+               (end_time = butil::cpuwide_time_us()) < start_time + 1000000L) {
             BAIDU_SCOPED_LOCK(_mutex);
             if (!_stop) {
                 timespec ts = butil::microseconds_to_timespec(end_time);
                 pthread_cond_timedwait(&_cond, &_mutex, &ts);
             }
         }
-        start_time = butil::gettimeofday_us();
+        start_time = butil::cpuwide_time_us();
         char buf[64];
         const time_t tm_s = start_time / 1000000L;
         struct tm lt;
@@ -93,19 +96,19 @@ void InfoThread::run() {
 
 static void* run_info_thread(void* arg) {
     ((InfoThread*)arg)->run();
-    return NULL;
+    return nullptr;
 }
 
 bool InfoThread::start(const InfoThreadOptions& options) {
-    if (options.latency_recorder == NULL ||
-        options.error_count == NULL ||
-        options.sent_count == NULL) {
+    if (options.latency_recorder == nullptr ||
+        options.error_count == nullptr ||
+        options.sent_count == nullptr) {
         LOG(ERROR) << "Some required options are NULL";
         return false;
     }
     _options = options;
     _stop = false;
-    if (pthread_create(&_tid, NULL, run_info_thread, this) != 0) {
+    if (pthread_create(&_tid, nullptr, run_info_thread, this) != 0) {
         LOG(ERROR) << "Fail to create info_thread";
         return false;
     }
@@ -121,7 +124,7 @@ void InfoThread::stop() {
         _stop = true;
         pthread_cond_signal(&_cond);
     }
-    pthread_join(_tid, NULL);
+    pthread_join(_tid, nullptr);
 }
 
 } // brpc

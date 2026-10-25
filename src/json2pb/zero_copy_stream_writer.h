@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
-// Date: 2014/10/29 16:44:42
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef  BRPC_JSON2PB_ZERO_COPY_STREAM_WRITER_H
 #define  BRPC_JSON2PB_ZERO_COPY_STREAM_WRITER_H
@@ -16,7 +29,7 @@
 //    // Interfaces of ZeroCopyOutputStream
 //    bool Next(void** data, int* size);
 //    void BackUp(int count);
-//    google::protobuf::int64 ByteCount() const;
+//    int64_t ByteCount() const;
 //
 //private:
 //    IOBuf* _buf;
@@ -29,14 +42,14 @@ class ZeroCopyStreamWriter {
 public:
     typedef char Ch;
     ZeroCopyStreamWriter(google::protobuf::io::ZeroCopyOutputStream *stream)
-        : _stream(stream), _data(NULL), 
-          _cursor(NULL), _data_size(0) {
+        : _stream(stream), _data(nullptr), 
+          _cursor(nullptr), _data_size(0) {
     }
     ~ZeroCopyStreamWriter() {
         if (_stream && _data) {
             _stream->BackUp(RemainSize());
         }
-        _stream = NULL;
+        _stream = nullptr;
     }
 
     void Put(char c) {
@@ -71,14 +84,14 @@ public:
     char Peek() { return 0; }
     char Take() { return 0; }
     size_t Tell() { return 0; }
-    char *PutBegin() { return NULL; }
+    char *PutBegin() { return nullptr; }
     size_t PutEnd(char *) { return 0; }
 private:
     bool AcquireNextBuf() {
         if (__builtin_expect(!_stream, 0)) {
             return false;
         }
-        if (_data == NULL || _cursor == _data + _data_size) {
+        if (_data == nullptr || _cursor == _data + _data_size) {
             if (!_stream->Next((void **)&_data, &_data_size)) {
                 return false;
             } 

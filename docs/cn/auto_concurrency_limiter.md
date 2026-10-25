@@ -4,7 +4,7 @@
 
 如果服务持续过载，会导致越来越多的请求积压，最终所有的请求都必须等待较长时间才能被处理，从而使整个服务处于瘫痪状态。
 
-与之相对的，如果直接拒绝掉一部分请求，反而能够让服务能够"及时"处理更多的请求。对应的方法就是[设置最大并发](https://github.com/brpc/brpc/blob/master/docs/cn/server.md#%E9%99%90%E5%88%B6%E6%9C%80%E5%A4%A7%E5%B9%B6%E5%8F%91)。
+与之相对的，如果直接拒绝掉一部分请求，反而能够让服务能够"及时"处理更多的请求。对应的方法就是[设置最大并发](https://github.com/apache/brpc/blob/master/docs/cn/server.md#%E9%99%90%E5%88%B6%E6%9C%80%E5%A4%A7%E5%B9%B6%E5%8F%91)。
 
 自适应限流能动态调整服务的最大并发，在保证服务不过载的前提下，让服务尽可能多的处理请求。
 
@@ -72,6 +72,9 @@ max_qps是最近一段时间测量到的qps的极大值。
 
 min_latency是最近一段时间测量到的latency较小值的ema，是noload_latency的估算值。
 
+注意：当计算出来的 max_concurrency 和当前的 max_concurrency 的值不同时，每次对 max_concurrency 的调整的比例有一个上限，让 max_concurrency
+的[变化更为平滑](https://github.com/apache/brpc/blob/master/src/brpc/policy/auto_concurrency_limiter.cpp#L249)。
+
 当服务处于低负载时，min_latency约等于noload_latency，此时计算出来的max_concurrency会高于concurrency，但低于best_max_concurrency，给流量上涨留探索空间。而当服务过载时，服务的qps约等于max_qps，同时latency开始明显超过min_latency，此时max_concurrency则会接近concurrency，并通过定期衰减避免远离best_max_concurrency，保证服务不会过载。
 
 
@@ -110,7 +113,7 @@ min_latency是最近一段时间测量到的latency较小值的ema，是noload_l
 为了减少个别窗口的抖动对限流算法的影响，同时尽量降低计算开销，计算min_latency时会通过使用[EMA](https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average)来进行平滑处理：
 
 ```
-if latency > min_latency:
+if latency < min_latency:
     min_latency = latency * ema_alpha  + (1 - ema_alpha) * min_latency
 else:
     do_nothing
@@ -151,3 +154,21 @@ netflix中的gradient算法公式为：max_concurrency = min_latency / latency *
 * gradient算法中的max_concurrency / latency从概念上和qps有关联（根据little's law)，但可能严重脱节。比如在重测
 min_latency前，若所有latency都小于min_latency，那么max_concurrency会不断下降甚至到0；但按照本算法，max_qps和min_latency仍然是稳定的，它们计算出的max_concurrency也不会剧烈变动。究其本质，gradient算法在迭代max_concurrency时，latency并不能代表实际并发为max_concurrency时的延时，两者是脱节的，所以max_concurrency / latency的实际物理含义不明，与qps可能差异甚大，最后导致了很大的偏差。
 * gradient算法的queue_size推荐为sqrt(max_concurrency)，这是不合理的。netflix对queue_size的理解大概是代表各种不可控环节的缓存，比如socket里的，和max_concurrency存在一定的正向关系情有可原。但在我们的理解中，这部分queue_size作用微乎其微，没有或用常量即可。我们关注的queue_size是给concurrency上升留出的探索空间: max_concurrency的更新是有延迟的，在并发从低到高的增长过程中，queue_size的作用就是在max_concurrency更新前不限制qps上升。而当concurrency高时，服务可能已经过载了，queue_size就应该小一点，防止进一步恶化延时。这里的queue_size和并发是反向关系。
+
+## 错误率惩罚阈值
+
+`auto_cl_error_rate_punish_threshold`用于设置错误率"死区"，低于该阈值的错误率不会产生惩罚，避免少量错误请求对max_concurrency的过度影响。
+
+| GFlag | 默认值 | 有效范围 | 说明 |
+|-------|--------|----------|------|
+| auto_cl_error_rate_punish_threshold | 0 | [0, 1) | 错误率惩罚阈值，0表示禁用 |
+
+- **默认值为0**：禁用该功能，保持原有行为
+- **设置为有效值（如0.1）**：错误率 ≤ 阈值时惩罚为0；错误率 > 阈值时惩罚线性增长
+- **无效值处理**：≥1 的值会被忽略，等同于0
+
+**示例**：
+```
+# 错误率低于10%时不惩罚，高于10%时线性增加惩罚
+--auto_cl_error_rate_punish_threshold=0.1
+```

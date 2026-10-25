@@ -92,13 +92,13 @@ bool BeingDebugged() {
   size_t info_size = sizeof(info);
 
 #if defined(OS_OPENBSD)
-  if (sysctl(mib, arraysize(mib), NULL, &info_size, NULL, 0) < 0)
+  if (sysctl(mib, arraysize(mib), nullptr, &info_size, nullptr, 0) < 0)
     return -1;
 
   mib[5] = (info_size / sizeof(struct kinfo_proc));
 #endif
 
-  int sysctl_result = sysctl(mib, arraysize(mib), &info, &info_size, NULL, 0);
+  int sysctl_result = sysctl(mib, arraysize(mib), &info, &info_size, nullptr, 0);
   DCHECK_EQ(sysctl_result, 0);
   if (sysctl_result != 0) {
     is_set = true;
@@ -185,6 +185,8 @@ bool BeingDebugged() {
 #define DEBUG_BREAK_ASM() asm("bkpt 0")
 #elif defined(ARCH_CPU_ARM64)
 #define DEBUG_BREAK_ASM() asm("brk 0")
+#elif defined(ARCH_CPU_LOONGARCH64_FAMILY)
+#define DEBUG_BREAK_ASM() asm("break 0")
 #elif defined(ARCH_CPU_MIPS_FAMILY)
 #define DEBUG_BREAK_ASM() asm("break 2")
 #elif defined(ARCH_CPU_X86_FAMILY)

@@ -1,16 +1,19 @@
-// Copyright (c) 2016 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
@@ -64,14 +67,14 @@ void SerializeEspRequest(
         Controller* cntl,
         const google::protobuf::Message* req_base) {
 
-    if (req_base == NULL) {
+    if (req_base == nullptr) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
     ControllerPrivateAccessor accessor(cntl);
     if (req_base->GetDescriptor() != EspMessage::descriptor()) {
         return cntl->SetFailed(EINVAL, "Type of request must be EspMessage");
     }
-    if (cntl->response() != NULL &&
+    if (cntl->response() != nullptr &&
         cntl->response()->GetDescriptor() != EspMessage::descriptor()) {
         return cntl->SetFailed(EINVAL, "Type of response must be EspMessage");
     }
@@ -98,12 +101,11 @@ void PackEspRequest(butil::IOBuf* packet_buf,
     }
 
     accessor.get_sending_socket()->set_correlation_id(correlation_id);
-    Span* span = accessor.span();
-    if (span) {
+        if (auto span = accessor.span()) {
         span->set_request_size(request.length());
     }
     
-    if (auth != NULL) {
+    if (auth != nullptr) {
         std::string auth_str;
         auth->GenerateCredential(&auth_str);
         //means first request in this connect, need to special head
@@ -119,7 +121,7 @@ void ProcessEspResponse(InputMessageBase* msg_base) {
     
     // Fetch correlation id that we saved before in `PackEspRequest'
     const CallId cid = { static_cast<uint64_t>(msg->socket()->correlation_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -128,8 +130,7 @@ void ProcessEspResponse(InputMessageBase* msg_base) {
     }
 
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+        if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->payload.length());
@@ -139,7 +140,7 @@ void ProcessEspResponse(InputMessageBase* msg_base) {
     EspMessage* response = (EspMessage*)cntl->response();
     const int saved_error = cntl->ErrorCode();
 
-    if (response != NULL) {
+    if (response != nullptr) {
         msg->meta.copy_to(&response->head, sizeof(EspHead));
         msg->payload.swap(response->body);
         if (response->head.msg != 0) {
@@ -151,7 +152,7 @@ void ProcessEspResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 

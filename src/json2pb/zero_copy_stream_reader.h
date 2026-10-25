@@ -1,7 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// File: iobuf_read_stream.h
-// Author: Zhangyi Chen (chenzhangyi01@baidu.com)
-// Date: 2014/10/29 15:01:09
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef  BRPC_JSON2PB_ZERO_COPY_STREAM_READER_H
 #define  BRPC_JSON2PB_ZERO_COPY_STREAM_READER_H
@@ -14,7 +26,7 @@ class ZeroCopyStreamReader {
 public:
     typedef char Ch;
     ZeroCopyStreamReader(google::protobuf::io::ZeroCopyInputStream *stream)
-            : _data(NULL), _data_size(0), _nread(0), _stream(stream) {
+            : _data(nullptr), _data_size(0), _nread(0), _stream(stream) {
     }
     //Take a charactor and return its address.
     const char* PeekAddr() { 
@@ -26,7 +38,7 @@ public:
                 return _data;
             }
         }
-        return NULL;
+        return nullptr;
     }
     const char* TakeWithAddr() {
         const char* c = PeekAddr();
@@ -35,7 +47,7 @@ public:
             --_data_size;
             return _data++;
         }
-        return NULL;
+        return nullptr;
     }
     char Take() {
         const char* c = PeekAddr();
@@ -59,7 +71,7 @@ public:
     size_t Tell() { return _nread; }
     void Put(char) {}
     void Flush() {}
-    char *PutBegin() { return NULL; }
+    char *PutBegin() { return nullptr; }
     size_t PutEnd(char *) { return 0; }
 private:
     const char *_data;

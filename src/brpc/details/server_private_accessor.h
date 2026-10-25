@@ -1,16 +1,19 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BRPC_SERVER_PRIVATE_ACCESSOR_H
 #define BRPC_SERVER_PRIVATE_ACCESSOR_H
@@ -21,7 +24,6 @@
 #include "brpc/details/method_status.h"
 #include "brpc/builtin/bad_method_service.h"
 #include "brpc/restful.h"
-
 
 namespace brpc {
 
@@ -97,10 +99,71 @@ public:
 
     RestfulMap* global_restful_map() const
     { return _server->_global_restful_map; }
-    
+
 private:
     const Server* _server;
 };
+
+inline bool IsBuiltinOrTabbed(const Server::MethodProperty* mp) {
+    return nullptr != mp && (mp->is_builtin_service || mp->params.is_tabbed);
+}
+
+// True if `local_side' is ServerOptions.internal_port.
+inline bool IsInternalPort(const Server& server,
+                           const butil::EndPoint& local_side) {
+    return server.options().internal_port >= 0 &&
+           local_side.port == server.options().internal_port;
+}
+
+// Reject accesses to builtin services when the server is in security mode,
+// in which case they are only reachable from ServerOptions.internal_port.
+// Returns true if the access was rejected, in which case `cntl` was already
+// SetFailed() and the caller must not let the request reach the service's
+// normal processing. nshead hands the failed Controller to NsheadService
+// instead, as it does for the other pre-checks, see nshead_protocol.cpp.
+// NOTE: Call this after ControllerPrivateAccessor::set_security_mode() and
+// before the method is counted by MethodStatus::OnRequested(), so that
+// rejected accesses do not pollute the stats of the method. `mp` may point
+// to BadMethodService which is builtin as well and lists the methods of the
+// requested service, so protocols dispatching to BadMethodService must call
+// this beforehand, or make sure the listing is hidden in security mode.
+inline bool RejectBuiltinAccess(Controller* cntl, const Server& server,
+                                const Server::MethodProperty* mp) {
+    if (!cntl->is_security_mode() || !IsBuiltinOrTabbed(mp)) {
+        return false;
+    }
+    cntl->SetFailed(EPERM, "Not allowed to access builtin and Tabbed services, try "
+                           "ServerOptions.internal_port=%d instead if you're in internal network",
+                    server.options().internal_port);
+    return true;
+}
+
+// Reject accesses to non-builtin services arriving at ServerOptions.internal_port,
+// which exposes builtin services away from the public listener, it is not a second
+// entrance to the ordinary services of the server.
+// NOTE: Same return contract and placement rules as RejectBuiltinAccess().
+// This overload is for the protocols dispatching to a service that is never
+// builtin (NsheadService, ThriftService), hence has no MethodProperty.
+inline bool RejectNonBuiltinAccessFromInternalPort(Controller* cntl,
+                                                   const Server& server) {
+    if (!IsInternalPort(server, cntl->local_side())) {
+        return false;
+    }
+    cntl->SetFailed(EPERM, "Only builtin and Tabbed services are accessible on "
+                           "ServerOptions.internal_port=%d, send the request to the port "
+                           "passed to Server::Start() instead",
+                    server.options().internal_port);
+    return true;
+}
+
+// Same as above, but lets builtin and Tabbed methods through.
+inline bool RejectNonBuiltinAccessFromInternalPort(
+    Controller* cntl, const Server& server, const Server::MethodProperty* mp) {
+    if (IsBuiltinOrTabbed(mp)) {
+        return false;
+    }
+    return RejectNonBuiltinAccessFromInternalPort(cntl, server);
+}
 
 // Count one error if release() is not called before destruction of this object.
 class ScopedNonServiceError {
@@ -109,12 +172,12 @@ public:
     ~ScopedNonServiceError() {
         if (_server) {
             ServerPrivateAccessor(_server).AddError();
-            _server = NULL;
+            _server = nullptr;
         }
     }
     const Server* release() {
         const Server* tmp = _server;
-        _server = NULL;
+        _server = nullptr;
         return tmp;
     }
 private:

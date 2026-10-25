@@ -1,41 +1,67 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2014/09/22 11:57:43
 
 #include <gflags/gflags.h>
 #include "butil/unique_ptr.h"
+#include "butil/reloadable_flags.h"
+#include "butil/memory/scope_guard.h"
+#include "butil/strings/string_number_conversions.h" // butil::Int64ToString
 #include "bvar/latency_recorder.h"
 
 namespace bvar {
 
-// Reloading following gflags does not change names of the corresponding bvars.
-// Avoid reloading in practice.
-DEFINE_int32(bvar_latency_p1, 80, "First latency percentile");
-DEFINE_int32(bvar_latency_p2, 90, "Second latency percentile");
-DEFINE_int32(bvar_latency_p3, 99, "Third latency percentile");
+DEFINE_uint64(latency_scale_factor, 1, "latency scale factor, used by method status, etc., "
+                                       "latency_us = latency * latency_scale_factor");
+
+#if !WITH_BABYLON_COUNTER
+// Verify how ReducerSampler picks its data source, using the very hosts that
+// LatencyRecorder is made of.
+// Hosts keeping their data in a shared combiner are sampled through that carrier,
+// so sampling reads valid memory even if the host is destructed before the sampler
+// is recycled.
+// PassiveStatus keeps its data in a user callback instead, hence it is still sampled
+// through the host pointer.
+static_assert(detail::HasShareCombiner<IntRecorder>::value,
+              "IntRecorder should be sampled through its shared combiner");
+static_assert(detail::HasShareCombiner<Maxer<int64_t>::Base>::value,
+              "Reducer should be sampled through its shared combiner");
+static_assert(detail::HasShareCombiner<detail::Percentile>::value,
+              "Percentile should be sampled through its shared combiner");
+static_assert(!detail::HasShareCombiner<PassiveStatus<int64_t> >::value,
+              "PassiveStatus has no shared carrier, it must keep being sampled"
+              " through the host pointer");
+#endif // !WITH_BABYLON_COUNTER
 
 static bool valid_percentile(const char*, int32_t v) {
     return v > 0 && v < 100;
 }
-const bool ALLOW_UNUSED dummy_bvar_latency_p1 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p1, valid_percentile);
-const bool ALLOW_UNUSED dummy_bvar_latency_p2 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p2, valid_percentile);
-const bool ALLOW_UNUSED dummy_bvar_latency_p3 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p3, valid_percentile);
+
+// Reloading following gflags does not change names of the corresponding bvars.
+// Avoid reloading in practice.
+DEFINE_int32(bvar_latency_p1, 80, "First latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p1, valid_percentile);
+
+DEFINE_int32(bvar_latency_p2, 90, "Second latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p2, valid_percentile);
+
+DEFINE_int32(bvar_latency_p3, 99, "Third latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p3, valid_percentile);
 
 namespace detail {
 
@@ -53,7 +79,7 @@ void CDF::describe(std::ostream& os, bool) const {
 
 int CDF::describe_series(
     std::ostream& os, const SeriesOptions& options) const {
-    if (_w == NULL) {
+    if (_w == nullptr) {
         return 1;
     }
     if (options.test_only) {
@@ -87,14 +113,23 @@ int CDF::describe_series(
     return 0;
 }
 
+// Return random int value with expectation = `dval'
+static int64_t double_to_random_int(double dval) {
+    int64_t ival = static_cast<int64_t>(dval);
+    if (dval > ival + butil::fast_rand_double()) {
+        ival += 1;
+    }
+    return ival;
+}
+
 static int64_t get_window_recorder_qps(void* arg) {
-    detail::Sample<Stat> s;
-    static_cast<RecorderWindow*>(arg)->get_span(1, &s);
+    Sample<Stat> s;
+    static_cast<RecorderWindow*>(arg)->get_span(&s);
     // Use floating point to avoid overflow.
     if (s.time_us <= 0) {
         return 0;
     }
-    return static_cast<int64_t>(round(s.data.num * 1000000.0 / s.time_us));
+    return double_to_random_int(s.data.num * 1000000.0 / s.time_us);
 }
 
 static int64_t get_recorder_count(void* arg) {
@@ -174,7 +209,7 @@ int64_t LatencyRecorder::qps(time_t window_size) const {
     if (s.time_us <= 0) {
         return 0;
     }
-    return static_cast<int64_t>(round(s.data.num * 1000000.0 / s.time_us));
+    return detail::double_to_random_int(s.data.num * 1000000.0 / s.time_us);
 }
 
 int LatencyRecorder::expose(const butil::StringPiece& prefix1,
@@ -204,6 +239,18 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
     // set debug names for printing helpful error log.
     _latency.set_debug_name(prefix);
     _latency_percentile.set_debug_name(prefix);
+
+    // Exposing a LatencyRecorder is all-or-nothing: the prometheus exporter
+    // folds the sub-bvars below back into one summary and swallows each of
+    // them on the way. A half exposed recorder therefore does not show fewer
+    // metrics, it shows none of them, the incomplete summary is skipped and
+    // the sub-bvars that did make it were already consumed.
+    bool expose_succeeded = false;
+    BUTIL_SCOPE_EXIT {
+        if (!expose_succeeded) {
+            hide();
+        }
+    };
 
     if (_latency_window.expose_as(prefix, "latency") != 0) {
         return -1;
@@ -242,10 +289,13 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
     if (_latency_percentiles.expose_as(prefix, "latency_percentiles", DISPLAY_ON_HTML) != 0) {
         return -1;
     }
-    snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
-             (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
-             (int)FLAGS_bvar_latency_p3);
-    CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    if (FLAGS_save_series) {
+        snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
+                 (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
+                 (int)FLAGS_bvar_latency_p3);
+        CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    }
+    expose_succeeded = true;
     return 0;
 }
 
@@ -270,10 +320,83 @@ void LatencyRecorder::hide() {
 }
 
 LatencyRecorder& LatencyRecorder::operator<<(int64_t latency) {
+    latency = latency / FLAGS_latency_scale_factor;
     _latency << latency;
     _max_latency << latency;
     _latency_percentile << latency;
     return *this;
+}
+
+const std::vector<MetricFamily>& LatencyRecorder::list_metric_families() {
+    // Deliberately leaked, see Histogram::list_metric_families() for why.
+    static auto families = new std::vector<MetricFamily>{
+        {"_latency", "gauge", {"quantile"}},
+        {"_avg_latency", "gauge", {}},
+        {"_max_latency", "gauge", {}},
+        {"_qps", "gauge", {}},
+        {"_count", "counter", {}},
+    };
+    return *families;
+}
+
+// `name` + the labels in braces, omitting the braces when there are none, plus
+// a `quantile` label of its own when `quantile` is positive.
+static bool dump_labeled(Dumper* dumper, const std::string& name,
+                         butil::StringPiece labels,
+                         double quantile, int64_t value) {
+    std::string key(name);
+    if (!labels.empty() || quantile > 0) {
+        key.push_back('{');
+        key.append(labels.data(), labels.size());
+        if (quantile > 0) {
+            if (!labels.empty()) {
+                key.push_back(',');
+            }
+            key.append("quantile=\"");
+            key.append(detail::prometheus_double_to_string(quantile));
+            key.push_back('"');
+        }
+        key.push_back('}');
+    }
+    return dumper->dump_mvar(key, butil::Int64ToString(value));
+}
+
+bool LatencyRecorder::dump_samples(Dumper* dumper, size_t family_index,
+                                   const std::string& name,
+                                   butil::StringPiece labels) const {
+    switch (family_index) {
+    case 0: {
+        // p1/p2/p3 are configurable, 0.999 and 0.9999 are not. These are the
+        // very ratios the server side summary writes, see
+        // PrometheusMetricsDumper::DumpLatencyRecorderSuffix().
+        double ratios[] = {
+            FLAGS_bvar_latency_p1 / 100.0,
+            FLAGS_bvar_latency_p2 / 100.0,
+            FLAGS_bvar_latency_p3 / 100.0,
+            0.999,
+            0.9999,
+        };
+        for (double ratio : ratios) {
+            if (!dump_labeled(dumper, name, labels, ratio,
+                              latency_percentile(ratio))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+    case 1:
+        return dump_labeled(dumper, name, labels, 0, latency());
+    case 2:
+        return dump_labeled(dumper, name, labels, 0, max_latency());
+    case 3:
+        return dump_labeled(dumper, name, labels, 0, qps());
+    case 4:
+        return dump_labeled(dumper, name, labels, 0, count());
+    default:
+        LOG(ERROR) << "Unexpected family_index=" << family_index;
+        return false;
+    }
 }
 
 std::ostream& operator<<(std::ostream& os, const LatencyRecorder& rec) {

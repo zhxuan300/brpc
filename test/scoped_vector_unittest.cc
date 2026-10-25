@@ -66,7 +66,7 @@ class LifeCycleWatcher : public LifeCycleObject::Observer {
   // LifeCycleWatcher.
   virtual void OnLifeCycleConstruct(LifeCycleObject* object) OVERRIDE {
     ASSERT_EQ(LC_INITIAL, life_cycle_state_);
-    ASSERT_EQ(NULL, constructed_life_cycle_object_.get());
+    ASSERT_EQ(nullptr, constructed_life_cycle_object_.get());
     life_cycle_state_ = LC_CONSTRUCTED;
     constructed_life_cycle_object_.reset(object);
   }
@@ -197,6 +197,17 @@ TEST(ScopedVectorTest, Scope) {
   {
     butil::ScopedVector<LifeCycleObject> scoped_vector;
     scoped_vector.push_back(watcher.NewLifeCycleObject());
+    EXPECT_EQ(LC_CONSTRUCTED, watcher.life_cycle_state());
+    EXPECT_TRUE(watcher.IsWatching(scoped_vector.back()));
+  }
+  EXPECT_EQ(LC_DESTROYED, watcher.life_cycle_state());
+}
+
+TEST(ScopedVectorTest, Scope2) {
+  LifeCycleWatcher watcher;
+  EXPECT_EQ(LC_INITIAL, watcher.life_cycle_state());
+  {
+    butil::ScopedVector<LifeCycleObject> scoped_vector{ watcher.NewLifeCycleObject() };
     EXPECT_EQ(LC_CONSTRUCTED, watcher.life_cycle_state());
     EXPECT_TRUE(watcher.IsWatching(scoped_vector.back()));
   }

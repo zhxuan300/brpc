@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A client sending requests to server in parallel by multiple threads.
 
@@ -62,9 +65,9 @@ static void* sender(void* arg) {
             cntl.request_attachment().append(g_attachment);
         }
 
-        // Because `done'(last parameter) is NULL, this function waits until
+        // Because `done'(last parameter) is nullptr, this function waits until
         // the response comes back or error occurs(including timedout).
-        stub.Echo(&cntl, &request, &response, NULL);
+        stub.Echo(&cntl, &request, &response, nullptr);
         const int64_t elp = cntl.latency_us();
         if (!cntl.Failed()) {
             g_latency_recorder << cntl.latency_us();
@@ -78,12 +81,12 @@ static void* sender(void* arg) {
             bthread_usleep(50000);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // A Channel represents a communication line to a Server. Notice that 
     // Channel is thread-safe and can be shared by all threads in your program.
@@ -141,7 +144,7 @@ int main(int argc, char* argv[]) {
             LOG(ERROR) << "Fail to init sub channel[" << i << "] of pchan";
             return -1;
         }
-        if (sub_channel2->AddChannel(c, brpc::OWNS_CHANNEL, NULL, NULL) != 0) {
+        if (sub_channel2->AddChannel(c, brpc::OWNS_CHANNEL, nullptr, nullptr) != 0) {
             LOG(ERROR) << "Fail to add sub channel[" << i << "] into pchan";
             return -1;
         }
@@ -150,7 +153,7 @@ int main(int argc, char* argv[]) {
 
     // Add another selective channel with default options.
     brpc::SelectiveChannel* sub_channel3 = new brpc::SelectiveChannel;
-    if (sub_channel3->Init(FLAGS_load_balancer.c_str(), NULL) != 0) {
+    if (sub_channel3->Init(FLAGS_load_balancer.c_str(), nullptr) != 0) {
         LOG(ERROR) << "Fail to init schan";
         return -1;
     }
@@ -173,7 +176,7 @@ int main(int argc, char* argv[]) {
                 return -1;
             }
         }
-        if (sub_channel3->AddChannel(c, NULL)) {
+        if (sub_channel3->AddChannel(c, nullptr)) {
             LOG(ERROR) << "Fail to add sub channel[" << i << "] into schan";
             return -1;
         }
@@ -183,7 +186,7 @@ int main(int argc, char* argv[]) {
     // Add all sub channels into schan.
     for (size_t i = 0; i < sub_channels.size(); ++i) {
         // note: we don't need the handle for channel removal;
-        if (channel.AddChannel(sub_channels[i], NULL/*note*/) != 0) {
+        if (channel.AddChannel(sub_channels[i], nullptr/*note*/) != 0) {
             LOG(ERROR) << "Fail to add sub_channel[" << i << "]";
             return -1;
         }
@@ -202,7 +205,7 @@ int main(int argc, char* argv[]) {
     if (!FLAGS_use_bthread) {
         pids.resize(FLAGS_thread_num);
         for (int i = 0; i < FLAGS_thread_num; ++i) {
-            if (pthread_create(&pids[i], NULL, sender, &channel) != 0) {
+            if (pthread_create(&pids[i], nullptr, sender, &channel) != 0) {
                 LOG(ERROR) << "Fail to create pthread";
                 return -1;
             }
@@ -211,7 +214,7 @@ int main(int argc, char* argv[]) {
         bids.resize(FLAGS_thread_num);
         for (int i = 0; i < FLAGS_thread_num; ++i) {
             if (bthread_start_background(
-                    &bids[i], NULL, sender, &channel) != 0) {
+                    &bids[i], nullptr, sender, &channel) != 0) {
                 LOG(ERROR) << "Fail to create bthread";
                 return -1;
             }
@@ -227,9 +230,9 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "EchoClient is going to quit";
     for (int i = 0; i < FLAGS_thread_num; ++i) {
         if (!FLAGS_use_bthread) {
-            pthread_join(pids[i], NULL);
+            pthread_join(pids[i], nullptr);
         } else {
-            bthread_join(bids[i], NULL);
+            bthread_join(bids[i], nullptr);
         }
     }
 

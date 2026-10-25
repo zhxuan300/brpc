@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Jul 13 15:04:18 CST 2014
 
 #ifndef BUTIL_RESOURCE_POOL_INL_H
@@ -22,10 +25,11 @@
 #include <iostream>                      // std::ostream
 #include <pthread.h>                     // pthread_mutex_t
 #include <algorithm>                     // std::max, std::min
-#include "butil/atomicops.h"              // butil::atomic
-#include "butil/macros.h"                 // BAIDU_CACHELINE_ALIGNMENT
-#include "butil/scoped_lock.h"            // BAIDU_SCOPED_LOCK
-#include "butil/thread_local.h"           // thread_atexit
+#include "butil/atomicops.h"             // butil::atomic
+#include "butil/macros.h"                // BAIDU_CACHELINE_ALIGNMENT
+#include "butil/scoped_lock.h"           // BAIDU_SCOPED_LOCK
+#include "butil/thread_local.h"          // thread_atexit
+#include "butil/memory/aligned_memory.h" // butil::AlignedMemory
 #include <vector>
 
 #ifdef BUTIL_RESOURCE_POOL_NEED_FREE_ITEM_NUM
@@ -106,12 +110,16 @@ public:
     typedef ResourcePoolFreeChunk<T, FREE_CHUNK_NITEM>      FreeChunk;
     typedef ResourcePoolFreeChunk<T, 0> DynamicFreeChunk;
 
+    typedef AlignedMemory<sizeof(T), __alignof__(T)> BlockItem;
     // When a thread needs memory, it allocates a Block. To improve locality,
     // items in the Block are only used by the thread.
     // To support cache-aligned objects, align Block.items by cacheline.
     struct BAIDU_CACHELINE_ALIGNMENT Block {
-        char items[sizeof(T) * BLOCK_NITEM];
-        size_t nitem;
+        BlockItem items[BLOCK_NITEM];
+        // Written by the owning LocalPool and read by address_resource() from
+        // other threads. Publishing the increment after construction keeps the
+        // bounds check data-race-free.
+        butil::atomic<size_t> nitem;
 
         Block() : nitem(0) {}
     };
@@ -126,8 +134,8 @@ public:
         BlockGroup() : nblock(0) {
             // We fetch_add nblock in add_block() before setting the entry,
             // thus address_resource() may sees the unset entry. Initialize
-            // all entries to NULL makes such address_resource() return NULL.
-            memset(blocks, 0, sizeof(butil::atomic<Block*>) * RP_GROUP_NBLOCK);
+            // all entries to nullptr makes such address_resource() return nullptr.
+            memset(static_cast<void*>(blocks), 0, sizeof(butil::atomic<Block*>) * RP_GROUP_NBLOCK);
         }
     };
 
@@ -137,7 +145,7 @@ public:
     public:
         explicit LocalPool(ResourcePool* pool)
             : _pool(pool)
-            , _cur_block(NULL)
+            , _cur_block(nullptr)
             , _cur_block_index(0) {
             _cur_free.nfree = 0;
         }
@@ -159,62 +167,64 @@ public:
         // which may include parenthesis because when T is POD, "new T()"
         // and "new T" are different: former one sets all fields to 0 which
         // we don't want.
-#define BAIDU_RESOURCE_POOL_GET(CTOR_ARGS)                              \
-        /* Fetch local free id */                                       \
-        if (_cur_free.nfree) {                                          \
+#define BAIDU_RESOURCE_POOL_GET(CTOR_ARGS)                                  \
+        /* Fetch local free id */                                           \
+        if (_cur_free.nfree) {                                              \
             const ResourceId<T> free_id = _cur_free.ids[--_cur_free.nfree]; \
-            *id = free_id;                                              \
-            BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_SUB1;                   \
-            return unsafe_address_resource(free_id);                    \
-        }                                                               \
-        /* Fetch a FreeChunk from global.                               \
-           TODO: Popping from _free needs to copy a FreeChunk which is  \
-           costly, but hardly impacts amortized performance. */         \
-        if (_pool->pop_free_chunk(_cur_free)) {                         \
-            --_cur_free.nfree;                                          \
-            const ResourceId<T> free_id =  _cur_free.ids[_cur_free.nfree]; \
-            *id = free_id;                                              \
-            BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_SUB1;                   \
-            return unsafe_address_resource(free_id);                    \
-        }                                                               \
-        /* Fetch memory from local block */                             \
-        if (_cur_block && _cur_block->nitem < BLOCK_NITEM) {            \
-            id->value = _cur_block_index * BLOCK_NITEM + _cur_block->nitem; \
-            T* p = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
-            if (!ResourcePoolValidator<T>::validate(p)) {               \
-                p->~T();                                                \
-                return NULL;                                            \
-            }                                                           \
-            ++_cur_block->nitem;                                        \
-            return p;                                                   \
-        }                                                               \
-        /* Fetch a Block from global */                                 \
-        _cur_block = add_block(&_cur_block_index);                      \
-        if (_cur_block != NULL) {                                       \
-            id->value = _cur_block_index * BLOCK_NITEM + _cur_block->nitem; \
-            T* p = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
-            if (!ResourcePoolValidator<T>::validate(p)) {               \
-                p->~T();                                                \
-                return NULL;                                            \
-            }                                                           \
-            ++_cur_block->nitem;                                        \
-            return p;                                                   \
-        }                                                               \
-        return NULL;                                                    \
+            *id = free_id;                                                  \
+            BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_SUB1;                         \
+            return unsafe_address_resource(free_id);                        \
+        }                                                                   \
+        /* Fetch a FreeChunk from global.                                   \
+           TODO: Popping from _free needs to copy a FreeChunk which is      \
+           costly, but hardly impacts amortized performance. */             \
+        if (_pool->pop_free_chunk(_cur_free)) {                             \
+            --_cur_free.nfree;                                              \
+            const ResourceId<T> free_id =  _cur_free.ids[_cur_free.nfree];  \
+            *id = free_id;                                                  \
+            BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_SUB1;                         \
+            return unsafe_address_resource(free_id);                        \
+        }                                                                   \
+        T* p = nullptr;                                                        \
+        /* Fetch memory from local block */                                 \
+        if (_cur_block) {                                                    \
+            const size_t nitem = _cur_block->nitem.load(butil::memory_order_relaxed); \
+            if (nitem < BLOCK_NITEM) {                                      \
+                id->value = _cur_block_index * BLOCK_NITEM + nitem;         \
+                auto item = _cur_block->items + nitem;                      \
+                p = new (item->void_data()) T CTOR_ARGS;                    \
+                if (!ResourcePoolValidator<T>::validate(p)) {               \
+                    p->~T();                                                \
+                    return nullptr;                                         \
+                }                                                           \
+                _cur_block->nitem.store(nitem + 1, butil::memory_order_release); \
+                return p;                                                   \
+            }                                                               \
+        }                                                                   \
+        /* Fetch a Block from global */                                     \
+        _cur_block = add_block(&_cur_block_index);                          \
+        if (_cur_block != nullptr) {                                           \
+            const size_t nitem = _cur_block->nitem.load(butil::memory_order_relaxed); \
+            id->value = _cur_block_index * BLOCK_NITEM + nitem;             \
+            auto item = _cur_block->items + nitem;                          \
+            p = new (item->void_data()) T CTOR_ARGS;                        \
+            if (!ResourcePoolValidator<T>::validate(p)) {                   \
+                p->~T();                                                    \
+                return nullptr;                                                \
+            }                                                               \
+            _cur_block->nitem.store(nitem + 1, butil::memory_order_release); \
+            return p;                                                       \
+        }                                                                   \
+        return nullptr;                                                        \
  
 
         inline T* get(ResourceId<T>* id) {
             BAIDU_RESOURCE_POOL_GET();
         }
 
-        template <typename A1>
-        inline T* get(ResourceId<T>* id, const A1& a1) {
-            BAIDU_RESOURCE_POOL_GET((a1));
-        }
-
-        template <typename A1, typename A2>
-        inline T* get(ResourceId<T>* id, const A1& a1, const A2& a2) {
-            BAIDU_RESOURCE_POOL_GET((a1, a2));
+        template<typename... Args>
+        inline T* get(ResourceId<T>* id, Args&&... args) {
+            BAIDU_RESOURCE_POOL_GET((std::forward<Args>(args)...));
         }
 
 #undef BAIDU_RESOURCE_POOL_GET
@@ -259,50 +269,34 @@ public:
         if (__builtin_expect(group_index < RP_MAX_BLOCK_NGROUP, 1)) {
             BlockGroup* bg =
                 _block_groups[group_index].load(butil::memory_order_consume);
-            if (__builtin_expect(bg != NULL, 1)) {
+            if (__builtin_expect(bg != nullptr, 1)) {
                 Block* b = bg->blocks[block_index & (RP_GROUP_NBLOCK - 1)]
                            .load(butil::memory_order_consume);
-                if (__builtin_expect(b != NULL, 1)) {
+                if (__builtin_expect(b != nullptr, 1)) {
                     const size_t offset = id.value - block_index * BLOCK_NITEM;
-                    if (__builtin_expect(offset < b->nitem, 1)) {
+                    if (__builtin_expect(
+                            offset < b->nitem.load(butil::memory_order_acquire), 1)) {
                         return (T*)b->items + offset;
                     }
                 }
             }
         }
 
-        return NULL;
+        return nullptr;
     }
 
-    inline T* get_resource(ResourceId<T>* id) {
+    template<typename... Args>
+    inline T* get_resource(ResourceId<T>* id, Args&&... args) {
         LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get(id);
+        if (__builtin_expect(lp != nullptr, 1)) {
+            return lp->get(id, std::forward<Args>(args)...);
         }
-        return NULL;
-    }
-
-    template <typename A1>
-    inline T* get_resource(ResourceId<T>* id, const A1& arg1) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get(id, arg1);
-        }
-        return NULL;
-    }
-
-    template <typename A1, typename A2>
-    inline T* get_resource(ResourceId<T>* id, const A1& arg1, const A2& arg2) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
-            return lp->get(id, arg1, arg2);
-        }
-        return NULL;
+        return nullptr;
     }
 
     inline int return_resource(ResourceId<T> id) {
         LocalPool* lp = get_or_new_local_pool();
-        if (__builtin_expect(lp != NULL, 1)) {
+        if (__builtin_expect(lp != nullptr, 1)) {
             return lp->return_resource(id);
         }
         return -1;
@@ -311,7 +305,7 @@ public:
     void clear_resources() {
         LocalPool* lp = _local_pool;
         if (lp) {
-            _local_pool = NULL;
+            _local_pool = nullptr;
             butil::thread_atexit_cancel(LocalPool::delete_local_pool, lp);
             delete lp;
         }
@@ -320,6 +314,28 @@ public:
     static inline size_t free_chunk_nitem() {
         const size_t n = ResourcePoolFreeChunkMaxItem<T>::value();
         return n < FREE_CHUNK_NITEM ? n : FREE_CHUNK_NITEM;
+    }
+
+    template <typename F>
+    void for_each_resource(F const& f) {
+        for (size_t i = 0; i < _ngroup.load(butil::memory_order_acquire); ++i) {
+            BlockGroup* bg = _block_groups[i].load(butil::memory_order_consume);
+            if (nullptr == bg) {
+                break;
+            }
+            size_t nblock = std::min(bg->nblock.load(butil::memory_order_relaxed),
+                                     RP_GROUP_NBLOCK);
+            for (size_t j = 0; j < nblock; ++j) {
+                Block* b = bg->blocks[j].load(butil::memory_order_consume);
+                if (nullptr != b) {
+                    for (size_t k = 0; k < b->nitem; ++k) {
+                        auto item = b->items + k;
+                        T* obj = (T*)item->void_data();
+                        f(obj);
+                    }
+                }
+            }
+        }
     }
     
     // Number of all allocated objects, including being used and free.
@@ -337,7 +353,7 @@ public:
 
         for (size_t i = 0; i < info.block_group_num; ++i) {
             BlockGroup* bg = _block_groups[i].load(butil::memory_order_consume);
-            if (NULL == bg) {
+            if (nullptr == bg) {
                 break;
             }
             size_t nblock = std::min(bg->nblock.load(butil::memory_order_relaxed),
@@ -345,7 +361,7 @@ public:
             info.block_num += nblock;
             for (size_t j = 0; j < nblock; ++j) {
                 Block* b = bg->blocks[j].load(butil::memory_order_consume);
-                if (NULL != b) {
+                if (nullptr != b) {
                     info.item_num += b->nitem;
                 }
             }
@@ -372,7 +388,7 @@ public:
 private:
     ResourcePool() {
         _free_chunks.reserve(RP_INITIAL_FREE_LIST_SIZE);
-        pthread_mutex_init(&_free_chunks_mutex, NULL);
+        pthread_mutex_init(&_free_chunks_mutex, nullptr);
     }
 
     ~ResourcePool() {
@@ -381,9 +397,9 @@ private:
 
     // Create a Block and append it to right-most BlockGroup.
     static Block* add_block(size_t* index) {
-        Block* const new_block = new(std::nothrow) Block;
-        if (NULL == new_block) {
-            return NULL;
+        Block* const new_block = new (std::nothrow) Block;
+        if (nullptr == new_block) {
+            return nullptr;
         }
 
         size_t ngroup;
@@ -406,13 +422,13 @@ private:
 
         // Fail to add_block_group.
         delete new_block;
-        return NULL;
+        return nullptr;
     }
 
     // Create a BlockGroup and append it to _block_groups.
     // Shall be called infrequently because a BlockGroup is pretty big.
     static bool add_block_group(size_t old_ngroup) {
-        BlockGroup* bg = NULL;
+        BlockGroup* bg = nullptr;
         BAIDU_SCOPED_LOCK(_block_group_mutex);
         const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
         if (ngroup != old_ngroup) {
@@ -421,7 +437,7 @@ private:
         }
         if (ngroup < RP_MAX_BLOCK_NGROUP) {
             bg = new(std::nothrow) BlockGroup;
-            if (NULL != bg) {
+            if (nullptr != bg) {
                 // Release fence is paired with consume fence in address() and
                 // add_block() to avoid un-constructed bg to be seen by other
                 // threads.
@@ -429,20 +445,20 @@ private:
                 _ngroup.store(ngroup + 1, butil::memory_order_release);
             }
         }
-        return bg != NULL;
+        return bg != nullptr;
     }
 
     inline LocalPool* get_or_new_local_pool() {
-        LocalPool* lp = _local_pool;
-        if (lp != NULL) {
+	    LocalPool* lp = BAIDU_GET_VOLATILE_THREAD_LOCAL(_local_pool);
+        if (lp != nullptr) {
             return lp;
         }
         lp = new(std::nothrow) LocalPool(this);
-        if (NULL == lp) {
-            return NULL;
+        if (nullptr == lp) {
+            return nullptr;
         }
         BAIDU_SCOPED_LOCK(_change_thread_mutex); //avoid race with clear()
-        _local_pool = lp;
+	    BAIDU_SET_VOLATILE_THREAD_LOCAL(_local_pool, lp);
         butil::thread_atexit(LocalPool::delete_local_pool, lp);
         _nlocal.fetch_add(1, butil::memory_order_relaxed);
         return lp;
@@ -450,7 +466,7 @@ private:
 
     void clear_from_destructor_of_local_pool() {
         // Remove tls
-        _local_pool = NULL;
+        _local_pool = nullptr;
 
         if (_nlocal.fetch_sub(1, butil::memory_order_relaxed) != 1) {
             return;
@@ -478,14 +494,14 @@ private:
         const size_t ngroup = _ngroup.exchange(0, butil::memory_order_relaxed);
         for (size_t i = 0; i < ngroup; ++i) {
             BlockGroup* bg = _block_groups[i].load(butil::memory_order_relaxed);
-            if (NULL == bg) {
+            if (nullptr == bg) {
                 break;
             }
             size_t nblock = std::min(bg->nblock.load(butil::memory_order_relaxed),
                                      RP_GROUP_NBLOCK);
             for (size_t j = 0; j < nblock; ++j) {
                 Block* b = bg->blocks[j].load(butil::memory_order_relaxed);
-                if (NULL == b) {
+                if (nullptr == b) {
                     continue;
                 }
                 for (size_t k = 0; k < b->nitem; ++k) {
@@ -538,7 +554,7 @@ private:
     
     static butil::static_atomic<ResourcePool*> _singleton;
     static pthread_mutex_t _singleton_mutex;
-    static BAIDU_THREAD_LOCAL LocalPool* _local_pool;
+    STATIC_MEMBER_BAIDU_VOLATILE_THREAD_LOCAL(LocalPool*, _local_pool);
     static butil::static_atomic<long> _nlocal;
     static butil::static_atomic<size_t> _ngroup;
     static pthread_mutex_t _block_group_mutex;
@@ -560,11 +576,11 @@ const size_t ResourcePool<T>::FREE_CHUNK_NITEM;
 
 template <typename T>
 BAIDU_THREAD_LOCAL typename ResourcePool<T>::LocalPool*
-ResourcePool<T>::_local_pool = NULL;
+ResourcePool<T>::_local_pool = nullptr;
 
 template <typename T>
 butil::static_atomic<ResourcePool<T>*> ResourcePool<T>::_singleton =
-    BUTIL_STATIC_ATOMIC_INIT(NULL);
+    BUTIL_STATIC_ATOMIC_INIT(nullptr);
 
 template <typename T>
 pthread_mutex_t ResourcePool<T>::_singleton_mutex = PTHREAD_MUTEX_INITIALIZER;

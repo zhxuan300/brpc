@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Wed Jul 29 23:25:43 CST 2015
 
 #ifndef  BVAR_WINDOW_H
@@ -20,6 +22,8 @@
 
 #include <limits>                                 // std::numeric_limits
 #include <math.h>                                 // round
+#include <type_traits>                            // std::decay
+#include <utility>                                // std::declval
 #include <gflags/gflags_declare.h>
 #include "butil/logging.h"                         // LOG
 #include "bvar/detail/sampler.h"
@@ -43,20 +47,31 @@ public:
     typedef typename R::value_type value_type;
     typedef typename R::sampler_type sampler_type;
 
-    class SeriesSampler : public detail::Sampler {
+    // Type of the underlying var's operator, copied by value so that appending
+    // to the series never dereferences the var.
+    typedef typename std::decay<decltype(std::declval<R&>().op())>::type var_op_type;
+
+    class SeriesSampler : public Sampler {
     public:
+        // Holds a COPY of the underlying var's operator rather than a pointer to
+        // the var. The operators of bvar (AddTo/MaxTo/AddStat/...) are stateless
+        // functors, so copying is cheap and, more importantly, the sampling
+        // thread never touches the var -- which may already be destructed if the
+        // user let this Window outlive it.
         struct Op {
-            explicit Op(R* var) : _var(var) {}
+            explicit Op(const var_op_type& op) : _op(op) {}
             void operator()(value_type& v1, const value_type& v2) const {
-                _var->op()(v1, v2);
+                _op(v1, v2);
             }
         private:
-            R* _var;
+            var_op_type _op;
         };
-        SeriesSampler(WindowBase* owner, R* var)
-            : _owner(owner), _series(Op(var)) {}
-        ~SeriesSampler() {}
-        void take_sample() {
+
+        SeriesSampler(WindowBase* owner, const var_op_type& op)
+            : _owner(owner), _series(Op(op)) {}
+        ~SeriesSampler() override = default;
+
+        void take_sample() override {
             if (series_freq == SERIES_IN_SECOND) {
                 // Get one-second window value for PerSecond<>, otherwise the
                 // "smoother" plot may hide peaks.
@@ -68,38 +83,46 @@ public:
                 _series.append(_owner->get_value());
             }
         }
-        void describe(std::ostream& os) { _series.describe(os, NULL); }
+        void describe(std::ostream& os) { _series.describe(os, nullptr); }
     private:
         WindowBase* _owner;
-        detail::Series<value_type, Op> _series;
+        Series<value_type, Op> _series;
     };
     
     WindowBase(R* var, time_t window_size)
         : _var(var)
+        , _var_op(var->op())
         , _window_size(window_size > 0 ? window_size : FLAGS_bvar_dump_interval)
         , _sampler(var->get_sampler())
-        , _series_sampler(NULL) {
+        , _series_sampler(nullptr) {
+        // Tell the borrowed sampler about us, so that destructing `var` before
+        // this Window is detected and reported instead of silently leaving
+        // `_sampler' dangling. See Sampler::add_borrower().
+        _sampler->add_borrower();
         CHECK_EQ(0, _sampler->set_window_size(_window_size));
     }
     
-    ~WindowBase() {
+    ~WindowBase() override {
         hide();
         if (_series_sampler) {
             _series_sampler->destroy();
-            _series_sampler = NULL;
+            _series_sampler = nullptr;
         }
+        // Safe even if `var` was destructed first: in that case destroy() marked
+        // the sampler as leaked, so it was not deleted by the sampling thread.
+        _sampler->remove_borrower();
     }
 
-    bool get_span(time_t window_size, detail::Sample<value_type>* result) const {
+    bool get_span(time_t window_size, Sample<value_type>* result) const {
         return _sampler->get_value(window_size, result);
     }
 
-    bool get_span(detail::Sample<value_type>* result) const {
+    bool get_span(Sample<value_type>* result) const {
         return get_span(_window_size, result);
     }
 
     virtual value_type get_value(time_t window_size) const {
-        detail::Sample<value_type> tmp;
+        Sample<value_type> tmp;
         if (get_span(window_size, &tmp)) {
             return tmp.data;
         }
@@ -108,8 +131,7 @@ public:
 
     value_type get_value() const { return get_value(_window_size); }
     
-    // Implement Variable::describe() and Variable::get_value().
-    void describe(std::ostream& os, bool quote_string) const {
+    void describe(std::ostream& os, bool quote_string) const override {
         if (butil::is_same<value_type, std::string>::value && quote_string) {
             os << '"' << get_value() << '"';
         } else {
@@ -118,13 +140,13 @@ public:
     }
     
 #ifdef BAIDU_INTERNAL
-    void get_value(boost::any* value) const { *value = get_value(); }
+    void get_value(boost::any* value) const override { *value = get_value(); }
 #endif
 
     time_t window_size() const { return _window_size; }
 
-    int describe_series(std::ostream& os, const SeriesOptions& options) const {
-        if (_series_sampler == NULL) {
+    int describe_series(std::ostream& os, const SeriesOptions& options) const override {
+        if (_series_sampler == nullptr) {
             return 1;
         }
         if (!options.test_only) {
@@ -140,21 +162,25 @@ public:
     }
 
 protected:
-    // @Variable
     int expose_impl(const butil::StringPiece& prefix,
                     const butil::StringPiece& name,
-                    DisplayFilter display_filter) {
+                    DisplayFilter display_filter) override {
         const int rc = Variable::expose_impl(prefix, name, display_filter);
         if (rc == 0 &&
-            _series_sampler == NULL &&
+            HasPlottableSeries<value_type>::value &&
+            _series_sampler == nullptr &&
             FLAGS_save_series) {
-            _series_sampler = new SeriesSampler(this, _var);
+            _series_sampler = new SeriesSampler(this, _var_op);
             _series_sampler->schedule();
         }
         return rc;
     }
 
+    // NOTE: `_var` is only dereferenced in the ctor (get_sampler()/op()). Do NOT
+    // dereference it afterwards: the user may have destructed it already if this
+    // Window outlives it (see the contract in comments of Window below).
     R* _var;
+    var_op_type _var_op;
     time_t _window_size;
     sampler_type* _sampler;
     SeriesSampler* _series_sampler;
@@ -220,7 +246,7 @@ public:
         this->expose_as(prefix, name);
     }
 
-    virtual value_type get_value(time_t window_size) const {
+    value_type get_value(time_t window_size) const override {
         detail::Sample<value_type> s;
         this->get_span(window_size, &s);
         // We may test if the multiplication overflows and use integral ops
@@ -235,6 +261,124 @@ public:
         } else {
             return static_cast<value_type>(round(s.data * 1000000.0 / s.time_us));
         }
+    }
+
+    value_type get_value() const { return Base::get_value(); }
+};
+
+namespace adapter {
+
+template <typename R>
+class WindowExType {
+public:
+    typedef R var_type;
+    typedef bvar::Window<var_type > window_type;
+    typedef typename R::value_type value_type;
+    struct WindowExVar {
+        WindowExVar(time_t window_size) : window(&var, window_size) {}
+        var_type var;
+        window_type window;
+    };
+};
+
+template <typename R>
+class PerSecondExType {
+public:
+    typedef R var_type;
+    typedef bvar::PerSecond<var_type > window_type;
+    typedef typename R::value_type value_type;
+    struct WindowExVar {
+        WindowExVar(time_t window_size) : window(&var, window_size) {}
+        var_type var;
+        window_type window;
+    };
+};
+
+template <typename R, typename WindowType>
+class WindowExAdapter : public Variable{
+public:
+    typedef typename R::value_type value_type;
+    typedef typename WindowType::WindowExVar WindowExVar;
+
+    WindowExAdapter(time_t window_size)
+        : _window_size(window_size > 0 ? window_size : FLAGS_bvar_dump_interval)
+        , _window_ex_var(_window_size) {
+    }
+
+    value_type get_value() const {
+        return _window_ex_var.window.get_value();
+    }
+
+    template <typename ANT_TYPE>
+    WindowExAdapter& operator<<(ANT_TYPE value) {
+        _window_ex_var.var << value;
+        return *this;
+    }
+
+    void describe(std::ostream& os, bool quote_string) const override {
+        if (butil::is_same<value_type, std::string>::value && quote_string) {
+            os << '"' << get_value() << '"';
+        } else {
+            os << get_value();
+        }
+    }
+
+    ~WindowExAdapter() override {
+        hide();
+    }
+
+private:
+    time_t      _window_size;
+    WindowExVar _window_ex_var;
+};
+
+}  // namespace adapter
+
+// Get data within a time window.
+// The time unit is 1 second fixed.
+// Window not relies on other bvar.
+
+// R must:
+// - window_size must be a constant
+template <typename R, time_t window_size = 0>
+class WindowEx : public adapter::WindowExAdapter<R, adapter::WindowExType<R> > {
+public:
+    typedef adapter::WindowExAdapter<R, adapter::WindowExType<R> > Base;
+
+    WindowEx() : Base(window_size) {}
+
+    WindowEx(const butil::StringPiece& name) : Base(window_size) {
+        this->expose(name);
+    }
+
+    WindowEx(const butil::StringPiece& prefix,
+             const butil::StringPiece& name)
+        : Base(window_size) {
+        this->expose_as(prefix, name);
+    }
+};
+
+// Get data per second within a time window.
+// The only difference between PerSecondEx and WindowEx is that PerSecondEx divides
+// the data by time duration.
+
+// R must:
+// - window_size must be a constant
+template <typename R, time_t window_size = 0>
+class PerSecondEx : public adapter::WindowExAdapter<R, adapter::PerSecondExType<R> > {
+public:
+    typedef adapter::WindowExAdapter<R, adapter::PerSecondExType<R> > Base;
+
+    PerSecondEx() : Base(window_size) {}
+
+    PerSecondEx(const butil::StringPiece& name) : Base(window_size) {
+        this->expose(name);
+    }
+
+    PerSecondEx(const butil::StringPiece& prefix,
+                const butil::StringPiece& name)
+        : Base(window_size) {
+        this->expose_as(prefix, name);
     }
 };
 
